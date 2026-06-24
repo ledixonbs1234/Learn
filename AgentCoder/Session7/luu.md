@@ -1,0 +1,3 @@
+Khi bạn chạy song song 10 luồng sinh code:
+Nếu 1 trong 10 luồng bị lỗi (ví dụ: bị crash do lỗi API hoặc mạng), theo mặc định, toàn bộ Đồ thị LangGraph sẽ dừng lại và báo lỗi.
+Giải pháp thực tế: Ở các hệ thống lớn, người ta thường bọc thân hàm của các Node chạy song song bằng khối lệnh try - except. Nếu luồng con bị lỗi, nó sẽ không ném ra Exception làm sập luồng chính, mà trả về một Object lỗi có cấu trúc (ví dụ: {"status": "failed", "error": "..."}). Node Aggregator sau đó sẽ lọc ra các phần lỗi để yêu cầu Agent chạy lại (retry) riêng cho các phần đó mà không phải chạy lại toàn bộ 9 luồng đã thành công.

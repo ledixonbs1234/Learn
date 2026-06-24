@@ -4,7 +4,7 @@
         "."
     ],
     "graphs": {
-        "agent": "./AgentCoder/Sesson12/agent.py:builder"
+        "agent": "./Coder/agent.py:builder"
     },
     "env": ".env",
     "image_distro": "wolfi"

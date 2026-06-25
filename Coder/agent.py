@@ -1,3 +1,4 @@
+import operator
 import os
 import re
 import subprocess
@@ -11,6 +12,7 @@ from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, ToolMe
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, START, END, add_messages
 from langgraph.checkpoint.memory import MemorySaver  # Kích hoạt lưu trữ phiên làm việc
+from langgraph.types import Send
 
 # ==========================================
 # 1. CẤU HÌNH TRACING LANGSMITH
@@ -96,8 +98,11 @@ def sanitize_and_resolve_path(workspace: str, raw_target_path: str, create_paren
                 
     final_path = (workspace_path / target_path).resolve()
     
-    if not str(final_path).startswith(str(workspace_path)):
-        raise ValueError(f"Cảnh báo bảo mật: Đường dẫn nằm ngoài vùng an toàn.")
+    # Khắc phục lỗi bảo mật Path Traversal bằng phép so sánh logic phân cấp của pathlib
+    try:
+        final_path.relative_to(workspace_path)
+    except ValueError:
+        raise ValueError("Cảnh báo bảo mật: Đường dẫn nằm ngoài vùng an toàn.")
         
     if create_parent:
         final_path.parent.mkdir(parents=True, exist_ok=True)
@@ -112,12 +117,18 @@ class GitManager:
     def __init__(self, workspace_path: str):
         self.workspace = Path(workspace_path).resolve()
         
-    def _run_cmd(self, args: list) -> str:
+    def _run_cmd(self, args: list, ignore_error: bool = False) -> str:
         try:
             res = subprocess.run(args, cwd=str(self.workspace), capture_output=True, text=True, check=True)
             return res.stdout.strip()
         except subprocess.CalledProcessError as e:
-            return f"ERROR: {e.stderr.strip()}"
+            if ignore_error:
+                return f"ERROR: {e.stderr.strip()}"
+            raise RuntimeError(f"Lỗi thực thi lệnh Git {' '.join(args)}: {e.stderr.strip()}")
+        except FileNotFoundError:
+            if ignore_error:
+                return "ERROR: Lệnh Git không khả dụng hoặc chưa được cài đặt."
+            raise RuntimeError("Lỗi: Không tìm thấy hệ thống Git trong biến môi trường PATH.")
 
     def init_and_prepare_branch(self) -> str:
         git_dir = self.workspace / ".git"
@@ -125,11 +136,16 @@ class GitManager:
             self._run_cmd(["git", "init"])
             self._run_cmd(["git", "config", "user.name", "AI-Agent"])
             self._run_cmd(["git", "config", "user.email", "ai-agent@production.local"])
-            self._run_cmd(["git", "add", "."])
-            self._run_cmd(["git", "commit", "-m", "Initial commit from Agent Workspace Setup"])
+            
+            # Thực hiện add và commit ban đầu một cách an toàn
+            try:
+                self._run_cmd(["git", "add", "."])
+                self._run_cmd(["git", "commit", "-m", "Initial commit from Agent Workspace Setup"])
+            except Exception:
+                pass
             
         branch_name = "ai-development"
-        branches_str = self._run_cmd(["git", "branch"])
+        branches_str = self._run_cmd(["git", "branch"], ignore_error=True)
         
         if branch_name in branches_str:
             self._run_cmd(["git", "checkout", branch_name])
@@ -140,7 +156,7 @@ class GitManager:
 
     def commit_changes(self, message: str):
         self._run_cmd(["git", "add", "."])
-        status = self._run_cmd(["git", "status", "--porcelain"])
+        status = self._run_cmd(["git", "status", "--porcelain"], ignore_error=True)
         if status and not status.startswith("ERROR"):
             self._run_cmd(["git", "commit", "-m", message])
 
@@ -160,7 +176,6 @@ class WorkspaceTools:
         """
         Đọc nội dung của một hoặc nhiều tệp tin trong workspace cùng lúc.
         """
-        # Chuẩn hóa đầu vào thành danh sách nếu người dùng truyền một chuỗi đơn lẻ
         paths = [file_paths] if isinstance(file_paths, str) else file_paths
         if not paths:
             return "Lỗi: Danh sách đường dẫn tệp tin trống."
@@ -222,7 +237,6 @@ class WorkspaceTools:
                         results.append(f"{indent}📄 {item.name}")
                 return results
 
-            # Khởi động quét đệ quy từ thư mục chỉ định
             tree_lines = traverse(safe_path, depth=0, max_depth=4)
             if not tree_lines:
                 return f"Thư mục '{sub_dir}' trống hoặc toàn bộ các tệp tin bên trong đã bị loại bỏ theo cấu hình .gitignore."
@@ -264,6 +278,19 @@ class TaskPlan(BaseModel):
 # 6. TRẠNG THÁI HỆ THỐNG (STATE GRAPH)
 # ==========================================
 
+def reduce_findings(left: Union[List[str], None], right: Union[List[str], None]) -> List[str]:
+    """
+    Custom Reducer cho phép reset danh sách khi phát hiện cờ hiệu __RESET__.
+    """
+    left_list = left or []
+    right_list = right or []
+    if not right_list:
+        return left_list
+    if right_list[0] == "__RESET__":
+        return right_list[1:]
+    return left_list + right_list
+
+
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
     workspace_path: str
@@ -274,7 +301,7 @@ class AgentState(TypedDict):
     error_logs: str
     modified_files: List[str]
     attempts: int
-    step_findings: List[str]
+    step_findings: Annotated[List[str], reduce_findings]
 
 
 # ==========================================
@@ -289,7 +316,6 @@ model = ChatOpenAI(
 )
 
 def detect_workspace_node(state: AgentState) -> Dict[str, Any]:
-    # Lấy tin nhắn cuối cùng để tìm ra đường dẫn thư mục
     last_message = state["messages"][-1].content
     structured_llm = model.with_structured_output(WorkspaceDetection, method="function_calling")
     detected = structured_llm.invoke([
@@ -315,10 +341,6 @@ def git_setup_node(state: AgentState) -> Dict[str, Any]:
 
 
 def planner_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Node Lập kế hoạch: Tự động phân tích toàn bộ cuộc hội thoại hiện tại
-    để lập kế hoạch mới hoặc bổ sung các bước giải quyết yêu cầu mới ở Turn 2.
-    """
     ws = state["workspace_path"]
     conversation_history = state["messages"]
     existing_plan = state.get("plan", [])
@@ -336,7 +358,6 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
         "- Chọn 'development' nếu yêu cầu có can thiệp sửa đổi, cập nhật hoặc viết mới mã nguồn."
     )
     
-    # Gửi kèm toàn bộ lịch sử trò chuyện để Planner không bị mất dấu ngữ cảnh
     plan_output = structured_llm.invoke([
         {"role": "system", "content": system_prompt},
         *conversation_history
@@ -345,26 +366,22 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
     plan_steps = getattr(plan_output, "steps", [])
     task_type = getattr(plan_output, "task_type", "development")
     
-    # Khi bắt đầu một chu kỳ kế hoạch mới (đặc biệt là Turn 2), 
-    # ta reset các biến tạm thời để tránh việc mang rác của chu kỳ cũ sang
+    # Gửi tín hiệu __RESET__ tới custom reducer của step_findings để dọn sạch bộ nhớ của lượt chạy cũ
     return {
         "plan": plan_steps,
         "task_type": task_type,
         "current_step_idx": 0,
         "modified_files": [],
         "attempts": 0,
-        "step_findings": [],
+        "step_findings": ["__RESET__"],
         "messages": [AIMessage(content=f"Đã lập kế hoạch hành động (Loại: {task_type.upper()}):\n" + "\n".join([f"- {s}" for s in plan_steps]))]
     }
 
 
 # ==========================================
-# 7.1 NODE THỰC THI KHẢO SÁT (ANALYSIS EXECUTOR) - READ ONLY
+# 7.1 NODE THỰC THI KHẢO SÁT (ANALYSIS EXECUTOR) - READ ONLY TUẦN TỰ
 # ==========================================
 def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Node Khảo sát độc lập (Chỉ có quyền đọc, không cấp công cụ write_file để bảo vệ tệp tin).
-    """
     ws = state["workspace_path"]
     steps = state["plan"]
     current_idx = state["current_step_idx"]
@@ -388,6 +405,12 @@ def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
     tools = [read_files, list_directory]
     model_with_tools = model.bind_tools(tools)
     
+    # KẾ THỪA NGỮ CẢNH: Tích lũy toàn bộ phát hiện từ các bước khảo sát tuần tự trước đó
+    previous_findings_str = ""
+    existing_findings = state.get("step_findings", [])
+    if existing_findings:
+        previous_findings_str = "\n\n--- CÁC KẾT QUẢ KHẢO SÁT BẠN ĐÃ THU THẬP ĐƯỢC Ở CÁC BƯỚC TRƯỚC ---\n" + "\n\n".join(existing_findings)
+    
     system_prompt = (
         "Bạn là một kiến trúc sư chuyên khảo sát, đọc hiểu và phân tích cấu trúc mã nguồn (Read-Only Mode).\n"
         f"Nhiệm vụ: Bạn đang thực hiện bước khảo sát {current_idx + 1}/{len(steps)}: '{current_step}'.\n"
@@ -395,27 +418,39 @@ def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
         "Hãy sử dụng các công cụ `read_files` và `list_directory` để đọc hiểu cấu trúc hệ thống.\n"
         "YÊU CẦU QUAN TRỌNG:\n"
         "- Bạn chỉ có quyền ĐỌC dữ liệu, tuyệt đối không chỉnh sửa mã nguồn hoặc tự ý tạo tệp tin trong bước này.\n"
-        "- Trình bày chi tiết, chuyên nghiệp về kết quả phát hiện được của bạn ở tin nhắn phản hồi cuối cùng."
+        "- Trình bày chi tiết, chuyên nghiệp về kết quả phát hiện được của bạn ở tin nhắn phản hồi cuối cùng.\n"
+        "- Dựa trên ngữ cảnh khảo sát từ các bước trước (nếu có) để không thực hiện lại các thao tác tìm kiếm thừa."
     )
+    if previous_findings_str:
+        system_prompt += previous_findings_str
     
     react_messages = [SystemMessage(content=system_prompt), HumanMessage(content=f"Yêu cầu: Hãy khảo sát bước này: '{current_step}'")]
     
-    for _ in range(5):
-        response = model_with_tools.invoke(react_messages)
+    # Vòng lặp ReAct được gia cố để xử lý lỗi bất ngờ
+    for _ in range(10):
+        try:
+            response = model_with_tools.invoke(react_messages)
+        except Exception as e:
+            react_messages.append(AIMessage(content=f"Lỗi gọi mô hình: {str(e)}"))
+            break
+            
         react_messages.append(response)
         if not response.tool_calls:
             break
             
         for tool_call in response.tool_calls:
             tool_name = tool_call["name"]
-            tool_args = tool_call["args"]
+            tool_args = tool_call["args"] or {}
             
-            if tool_name == "read_files":
-                result = read_files.invoke(tool_args)
-            elif tool_name == "list_directory":
-                result = list_directory.invoke(tool_args)
-            else:
-                result = f"Lỗi: Không tìm thấy công cụ '{tool_name}'."
+            try:
+                if tool_name == "read_files":
+                    result = read_files.invoke(tool_args)
+                elif tool_name == "list_directory":
+                    result = list_directory.invoke(tool_args)
+                else:
+                    result = f"Lỗi: Không tìm thấy công cụ '{tool_name}'."
+            except Exception as tool_err:
+                result = f"Lỗi thực thi công cụ '{tool_name}': {str(tool_err)}"
                 
             react_messages.append(ToolMessage(content=str(result), name=tool_name, tool_call_id=tool_call["id"]))
             
@@ -426,13 +461,15 @@ def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
             break
             
     if not final_output:
-        summary_prompt = "Hãy viết một báo cáo tóm tắt chi tiết các kết quả khảo sát bạn đã thu được ở bước này."
-        react_messages.append(HumanMessage(content=summary_prompt))
-        forced_response = model.invoke(react_messages)
-        final_output = forced_response.content
+        try:
+            summary_prompt = "Hãy viết một báo cáo tóm tắt chi tiết các kết quả khảo sát bạn đã thu được ở bước này."
+            react_messages.append(HumanMessage(content=summary_prompt))
+            forced_response = model.invoke(react_messages)
+            final_output = forced_response.content
+        except Exception as e:
+            final_output = f"Lỗi xảy ra trong quá trình tổng kết: {str(e)}"
         
-    findings = list(state.get("step_findings", []))
-    findings.append(f"### Khảo sát bước '{current_step}':\n{final_output}")
+    findings = [f"### Khảo sát bước '{current_step}':\n{final_output}"]
     
     return {
         "messages": [AIMessage(content=f"**[Phân tích] Thực thi bước '{current_step}':**\n\n{final_output}")],
@@ -445,9 +482,6 @@ def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
 # 7.2 NODE THỰC THI PHÁT TRIỂN (DEVELOPMENT EXECUTOR) - FULL ACCESS
 # ==========================================
 def development_executor_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Node Lập trình phát triển (Toàn quyền đọc/ghi mã nguồn, được cấu hình độc lập hoàn toàn).
-    """
     ws = state["workspace_path"]
     steps = state["plan"]
     current_idx = state["current_step_idx"]
@@ -459,7 +493,6 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
     current_step = steps[current_idx]
     tools_mgr = WorkspaceTools(ws)
     
-    # Khai báo các công cụ cục bộ tương tác động dựa trên thư mục hiện tại của Thread
     @tool(args_schema=ReadFilesSchema)
     def read_files(file_paths: Union[str, List[str]]) -> str:
         """Đọc nội dung của một hoặc nhiều tệp tin trong workspace cùng lúc."""
@@ -475,11 +508,9 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
         """Liệt kê các tệp và thư mục con trong thư mục chỉ định đệ quy."""
         return tools_mgr.list_directory(sub_dir)
     
-    # Liên kết các công cụ với mô hình ngôn ngữ lớn
     tools = [read_files, write_file, list_directory]
     model_with_tools = model.bind_tools(tools)
     
-    # Thiết lập chuỗi hội thoại ReAct nhỏ bên trong node để thực thi bước hiện tại
     system_prompt = (
         "Bạn là một kỹ sư phần mềm thực thi chuyên nghiệp chuyên sửa lỗi và viết mới mã nguồn (Write-Access Mode).\n"
         f"Nhiệm vụ: Bạn đang thực hiện bước phát triển {current_idx + 1}/{len(steps)}: '{current_step}'.\n"
@@ -492,39 +523,48 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
     
     react_messages = [SystemMessage(content=system_prompt)]
     if error_logs:
-        react_messages.append(HumanMessage(content=f"LƯU Ý SỬA LỖI TỪ LƯỢT CHẠY TRƯỚC (TESTER BÁO LỖI):\n{error_logs}")) # type: ignore
-    react_messages.append(HumanMessage(content=f"Yêu cầu: Hãy thực hiện phát triển bước này: '{current_step}'")) # type: ignore
+        react_messages.append(HumanMessage(content=f"LƯU Ý SỬA LỖI TỪ LƯỢT CHẠY TRƯỚC (TESTER BÁO LỖI):\n{error_logs}"))
+    react_messages.append(HumanMessage(content=f"Yêu cầu: Hãy thực hiện phát triển bước này: '{current_step}'"))
     
     modified_files = list(state.get("modified_files", []))
     
-    # Vòng lặp ReAct tối đa 5 bước gọi công cụ để đảm bảo hoàn thành nhiệm vụ
-    for _ in range(5):
-        response = model_with_tools.invoke(react_messages)
-        react_messages.append(response) # type: ignore
+    # Vòng lặp ReAct được bảo vệ chống sập chương trình
+    for _ in range(10):
+        try:
+            response = model_with_tools.invoke(react_messages)
+        except Exception as e:
+            react_messages.append(AIMessage(content=f"Lỗi gọi mô hình: {str(e)}"))
+            break
+            
+        react_messages.append(response)
         
         if not response.tool_calls:
             break
             
         for tool_call in response.tool_calls:
             tool_name = tool_call["name"]
-            tool_args = tool_call["args"]
+            tool_args = tool_call["args"] or {}
             
-            # Thực thi công cụ thực tế
-            if tool_name == "read_files":
-                result = read_files.invoke(tool_args)
-            elif tool_name == "write_file":
-                result = write_file.invoke(tool_args)
-                try:
-                    # Ghi nhận tệp tin đã bị sửa đổi để tiến hành kiểm thử cú pháp sau này
-                    safe_path = sanitize_and_resolve_path(ws, tool_args["file_path"], create_parent=True)
-                    if str(safe_path) not in modified_files:
-                        modified_files.append(str(safe_path))
-                except Exception:
-                    pass
-            elif tool_name == "list_directory":
-                result = list_directory.invoke(tool_args)
-            else:
-                result = f"Lỗi: Không tìm thấy công cụ '{tool_name}'."
+            try:
+                if tool_name == "read_files":
+                    result = read_files.invoke(tool_args)
+                elif tool_name == "write_file":
+                    file_path = tool_args.get("file_path")
+                    if not file_path:
+                        raise ValueError("Thiếu tham số 'file_path' bắt buộc trong lệnh gọi write_file.")
+                    result = write_file.invoke(tool_args)
+                    try:
+                        safe_path = sanitize_and_resolve_path(ws, file_path, create_parent=True)
+                        if str(safe_path) not in modified_files:
+                            modified_files.append(str(safe_path))
+                    except Exception:
+                        pass
+                elif tool_name == "list_directory":
+                    result = list_directory.invoke(tool_args)
+                else:
+                    result = f"Lỗi: Không tìm thấy công cụ '{tool_name}'."
+            except Exception as tool_err:
+                result = f"Lỗi thực thi công cụ '{tool_name}': {str(tool_err)}"
                 
             react_messages.append(ToolMessage(content=str(result), name=tool_name, tool_call_id=tool_call["id"]))
             
@@ -535,10 +575,13 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
             break
             
     if not final_output:
-        summary_prompt = "Hãy viết một tóm tắt chi tiết về mã nguồn bạn đã chỉnh sửa hoặc tạo mới trong bước này."
-        react_messages.append(HumanMessage(content=summary_prompt))
-        forced_response = model.invoke(react_messages)
-        final_output = forced_response.content
+        try:
+            summary_prompt = "Hãy viết một tóm tắt chi tiết về mã nguồn bạn đã chỉnh sửa hoặc tạo mới trong bước này."
+            react_messages.append(HumanMessage(content=summary_prompt))
+            forced_response = model.invoke(react_messages)
+            final_output = forced_response.content
+        except Exception as e:
+            final_output = f"Lỗi xảy ra khi cố gắng tóm tắt mã nguồn: {str(e)}"
         
     return {
         "messages": [AIMessage(content=f"**[Phát triển] Thực thi bước '{current_step}':**\n\n{final_output}")],
@@ -586,9 +629,13 @@ def synthesis_node(state: AgentState) -> Dict[str, Any]:
         
     compiled_data = "\n\n---\n\n".join(findings)
     
+    # Gia cố prompt tổng hợp tài liệu dựa trên đầu vào tuần tự lũy tiến
     synthesis_prompt = (
         "Bạn là một Kiến trúc sư Hệ thống cao cấp chuyên biên soạn tài liệu kỹ thuật.\n"
-        "Nhiệm vụ của bạn là đọc toàn bộ thông tin khảo sát thô bên dưới và tổng hợp thành một tài liệu 'THONGTIN.md' duy nhất.\n\n"
+        "Nhiệm vụ của bạn là đọc toàn bộ lịch sử khảo sát TUẦN TỰ bên dưới và tổng hợp thành một tài liệu 'THONGTIN.md' duy nhất.\n\n"
+        "LƯU Ý QUAN TRỌNG: Do quá trình khảo sát diễn ra tuần tự, các bước phân tích sau có khả năng mở rộng, sửa chữa "
+        "hoặc làm rõ thêm các nhận định của các bước phân tích trước đó. Hãy liên kết, đối chiếu logic một cách thống nhất, "
+        "tránh lặp thông tin hoặc tạo ra mâu thuẫn trong báo cáo cuối cùng.\n\n"
         "⚠️ YÊU CẦU CỰC KỲ QUAN TRỌNG ĐỂ TRÁNH LỖI TRÀN TOKEN ĐẦU RA (OUTPUT TRUNCATION):\n"
         "- Hãy viết tài liệu thật SÚC TÍCH, CÔ ĐỌNG, tập trung vào cấu trúc, kiến trúc hệ thống và dependencies.\n"
         "- TUYỆT ĐỐI KHÔNG sao chép hay chèn các đoạn mã nguồn dài dòng (ví dụ: các định nghĩa models, controllers, scrapers).\n"
@@ -605,7 +652,7 @@ def synthesis_node(state: AgentState) -> Dict[str, Any]:
     try:
         response = model.invoke([
             SystemMessage(content=synthesis_prompt),
-            HumanMessage(content=f"Dưới đây là toàn bộ thông tin thô đã khảo sát được:\n\n{compiled_data}\n\nHãy tạo tệp 'THONGTIN.md' hoàn chỉnh.")
+            HumanMessage(content=f"Dưới đây là toàn bộ thông tin thu thập tuần tự từ hệ thống:\n\n{compiled_data}\n\nHãy tạo tệp 'THONGTIN.md' hoàn chỉnh.")
         ])
         
         md_content = response.content
@@ -623,10 +670,10 @@ def synthesis_node(state: AgentState) -> Dict[str, Any]:
             tools_mgr.write_file("THONGTIN.md", cleaned_md)
             
             git_manager = GitManager(ws)
-            git_manager._run_cmd(["git", "add", "THONGTIN.md"])
+            git_manager._run_cmd(["git", "add", "THONGTIN.md"], ignore_error=True)
             
             return {
-                "messages": [AIMessage(content="**Tổng hợp tài liệu hoàn tất:** Hệ thống đã thu thập tri thức của toàn bộ các bước khảo sát và biên dịch thành tệp `THONGTIN.md` thành công tại thư mục gốc của dự án.")]
+                "messages": [AIMessage(content="**Tổng hợp tài liệu hoàn tất:** Hệ thống đã thu thập tri thức của toàn bộ các bước khảo sát tuần tự và biên dịch thành tệp `THONGTIN.md` thành công tại thư mục gốc của dự án.")]
             }
     except Exception as e:
         return {
@@ -640,7 +687,7 @@ def commit_node(state: AgentState) -> Dict[str, Any]:
     task_type = state.get("task_type", "development")
     git_manager = GitManager(ws)
     
-    status = git_manager._run_cmd(["git", "status", "--porcelain"])
+    status = git_manager._run_cmd(["git", "status", "--porcelain"], ignore_error=True)
     
     if status and not status.startswith("ERROR"):
         commit_msg = f"feat(ai): automatic execution ({task_type}) \n\nSteps:\n" + "\n".join(state["plan"])
@@ -659,25 +706,26 @@ def commit_node(state: AgentState) -> Dict[str, Any]:
 # ==========================================
 
 def start_router(state: AgentState) -> Literal["detect_workspace", "planner"]:
-    """
-    Router quyết định điểm vào đồ thị:
-    - Nếu là Turn 1 (chưa có workspace_path): Đi qua quy trình dò tìm thư mục và dựng git.
-    - Nếu là Turn 2+ (đã tồn tại workspace_path): Đi thẳng tới Planner để cập nhật kế hoạch từ hội thoại mới.
-    """
     if not state.get("workspace_path"):
         return "detect_workspace"
     return "planner"
 
 
-# Router định tuyến sau Node Planner để chuyển hướng trực tiếp vào 2 phân nhánh độc lập
+# Router định tuyến sau Node Planner để chuyển hướng trực tiếp vào các phân nhánh độc lập
 def planner_router(state: AgentState) -> Literal["analysis_executor", "development_executor"]:
     task_type = state.get("task_type", "development")
+    
+    # CHẾ ĐỘ 1: PHÂN TÍCH (ANALYSIS) -> Chuyển sang TUẦN TỰ (Sequential)
     if task_type == "analysis":
+        print("--> Kích hoạt khảo sát TUẦN TỰ để tối ưu hóa ngữ cảnh và tính liên kết giữa các bước.")
         return "analysis_executor"
+        
+    # CHẾ ĐỘ 2: PHÁT TRIỂN (DEVELOPMENT) -> Chuyển sang TUẦN TỰ (Sequential)
+    print("--> Kích hoạt phát triển TUẦN TỰ để tránh xung đột ghi đè.")
     return "development_executor"
 
 
-# Router cho phân nhánh Khảo sát (Analysis)
+# Router cho phân nhánh Khảo sát (Analysis) tuần tự
 def analysis_router(state: AgentState) -> Literal["analysis_executor", "synthesis"]:
     current_idx = state["current_step_idx"]
     plan = state["plan"]
@@ -686,7 +734,7 @@ def analysis_router(state: AgentState) -> Literal["analysis_executor", "synthesi
     return "synthesis"
 
 
-# Router cho phân nhánh Phát triển (Development)
+# Router cho phân nhánh Phát triển (Development) tuần tự
 def development_router(state: AgentState) -> Literal["development_executor", "tester"]:
     current_idx = state["current_step_idx"]
     plan = state["plan"]
@@ -707,75 +755,67 @@ def tester_router(state: AgentState) -> Literal["development_executor", "commit"
 # ==========================================
 # 9. KẾT NỐI ĐỒ THỊ LANGGRAPH VỚI CHECKPOINTER
 # ==========================================
-
 builder = StateGraph(AgentState)
 
 # Đăng ký các Nodes
 builder.add_node("detect_workspace", detect_workspace_node)
 builder.add_node("git_setup", git_setup_node)
 builder.add_node("planner", planner_node)
-builder.add_node("analysis_executor", analysis_executor_node)       # Node Khảo sát mới
-builder.add_node("development_executor", development_executor_node) # Node Phát triển mới
+builder.add_node("analysis_executor", analysis_executor_node)       # Node phân tích (Tuần tự)
+builder.add_node("development_executor", development_executor_node) # Node lập trình (Tuần tự)
 builder.add_node("tester", tester_node)
 builder.add_node("synthesis", synthesis_node)
 builder.add_node("commit", commit_node)
 
-# Định tuyến ĐỘNG khi bắt đầu khởi động đồ thị (START Router)
-builder.add_conditional_edges(
-    START,
-    start_router,
-    {
-        "detect_workspace": "detect_workspace",
-        "planner": "planner"
-    }
-)
+# --- THIẾT LẬP CẠNH NỐI LAI ---
 
-# Sơ đồ kết nối tuyến tính ban đầu (chỉ kích hoạt ở Turn 1)
+# 1. Bắt đầu đồ thị tuần tự
+builder.add_conditional_edges(START, start_router, {"detect_workspace": "detect_workspace", "planner": "planner"})
 builder.add_edge("detect_workspace", "git_setup")
 builder.add_edge("git_setup", "planner")
 
-# Rẽ nhánh ĐỘNG ngay sau node Planner dựa trên task_type
+# 2. Phân luồng từ Planner Router
 builder.add_conditional_edges(
     "planner",
     planner_router,
     {
-        "analysis_executor": "analysis_executor",
-        "development_executor": "development_executor"
+        "analysis_executor": "analysis_executor",      # Điểm bắt đầu của nhánh Tuần tự (Khảo sát)
+        "development_executor": "development_executor" # Điểm bắt đầu của nhánh Tuần tự (Phát triển)
     }
 )
 
-# [Vòng lặp nhánh Khảo sát] 
+# 3. Kịch bản NHÁNH TUẦN TỰ (Khảo sát)
 builder.add_conditional_edges(
     "analysis_executor",
     analysis_router,
     {
-        "analysis_executor": "analysis_executor",
-        "synthesis": "synthesis"
+        "analysis_executor": "analysis_executor", # Quay lại bước khảo sát tiếp theo
+        "synthesis": "synthesis"                  # Chuyển sang tổng hợp khi hoàn tất tất cả các bước
     }
 )
+builder.add_edge("synthesis", "commit")
 
-# [Vòng lặp nhánh Phát triển]
+# 4. Kịch bản NHÁNH TUẦN TỰ (Sửa Code & Biên dịch thử)
 builder.add_conditional_edges(
     "development_executor",
     development_router,
     {
-        "development_executor": "development_executor",
-        "tester": "tester"
+        "development_executor": "development_executor", # Quay lại sửa tiếp bước sau
+        "tester": "tester"                              # Chuyển qua test khi xong tất cả
     }
 )
 
-# [Vòng lặp tự động sửa lỗi của nhánh Phát triển]
+# Vòng lặp sửa lỗi tự động của nhánh Phát triển
 builder.add_conditional_edges(
     "tester",
     tester_router,
     {
-        "development_executor": "development_executor",
-        "commit": "commit"
+        "development_executor": "development_executor", # Quay lại sửa nếu kiểm thử lỗi
+        "commit": "commit"                              # Tiến hành commit nếu thành công
     }
 )
 
-# Kết nối các đầu ra của các nhánh về node commit và END
-builder.add_edge("synthesis", "commit")
+# Kết thúc luồng
 builder.add_edge("commit", END)
 
 # Sử dụng MemorySaver để kích hoạt tính năng lưu giữ trạng thái đồ thị qua nhiều lượt chat

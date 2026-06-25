@@ -1,7 +1,8 @@
 # state.py
 from typing import List, Dict, Any, Literal, Sequence, TypedDict, Annotated, Union
 from pydantic import BaseModel, Field
-from langchain_core.messages import BaseMessage, add_messages
+from langchain_core.messages import BaseMessage
+from langgraph.graph.message import add_messages
 
 # ==========================================
 # CẤU TRÚC ĐẦU RA MONG MUỐN (STRUCTURED OUTPUT)

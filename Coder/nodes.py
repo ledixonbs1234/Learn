@@ -10,7 +10,7 @@ from config import model, sanitize_and_resolve_path
 from state import AgentState, WorkspaceDetection, TaskPlan
 from tools import (
     GitManager, WorkspaceTools, 
-    ReadFilesSchema, WriteFileSchema, ListDirSchema, RunTerminalSchema
+    ReadFilesTool, WriteFileTool, ListDirectoryTool, RunTerminalTool
 )
 
 def detect_workspace_node(state: AgentState) -> Dict[str, Any]:
@@ -50,7 +50,7 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
         "Bạn là một Kiến trúc sư phần mềm cấp cao. Hãy lập hoặc cập nhật kế hoạch thực hiện "
         f"cho dự án nằm trong thư mục '{ws}'.\n"
         f"Kế hoạch hiện hành của hệ thống trước đó: {existing_plan} (Đang ở bước: {existing_idx}).\n"
-        "Hãy phân tích kỹ lường toàn bộ lịch sử trò chuyện của người dùng để sinh ra kế hoạch hành động tiếp theo thích hợp nhất.\n"
+        "Hãy phân tích kỹ lưỡng toàn bộ lịch sử trò chuyện của người dùng để sinh ra kế hoạch hành động tiếp theo thích hợp nhất.\n"
         "Đặc biệt lưu ý phân loại trường `task_type` chính xác:\n"
         "- Chọn 'analysis' nếu yêu cầu chỉ là đọc, khảo sát cấu trúc dự án hoặc viết báo cáo.\n"
         "- Chọn 'development' nếu yêu cầu có can thiệp sửa đổi, cập nhật hoặc viết mới mã nguồn."
@@ -84,17 +84,10 @@ def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
          return {"messages": [AIMessage(content="Đã hoàn thành khảo sát toàn bộ các bước.")]}
          
     current_step = steps[current_idx]
-    tools_mgr = WorkspaceTools(ws)
     
-    @tool(args_schema=ReadFilesSchema)
-    def read_files(file_paths: Union[str, List[str]]) -> str:
-        """Đọc nội dung của một hoặc nhiều tệp tin trong workspace cùng lúc."""
-        return tools_mgr.read_files(file_paths)
-
-    @tool(args_schema=ListDirSchema)
-    def list_directory(sub_dir: str = ".") -> str:
-        """Liệt kê các tệp và thư mục con trong thư mục chỉ định đệ quy."""
-        return tools_mgr.list_directory(sub_dir)
+    # Khởi tạo công cụ tĩnh một cách tối ưu
+    read_files = ReadFilesTool(workspace_path=ws)
+    list_directory = ListDirectoryTool(workspace_path=ws)
     
     tools = [read_files, list_directory]
     model_with_tools = model.bind_tools(tools)
@@ -180,29 +173,13 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
          return {"messages": [AIMessage(content="Đã hoàn thành toàn bộ các bước phát triển.")]}
          
     current_step = steps[current_idx]
-    tools_mgr = WorkspaceTools(ws)
     
-    @tool(args_schema=ReadFilesSchema)
-    def read_files(file_paths: Union[str, List[str]]) -> str:
-        """Đọc nội dung của một hoặc nhiều tệp tin trong workspace cùng lúc."""
-        return tools_mgr.read_files(file_paths)
-
-    @tool(args_schema=WriteFileSchema)
-    def write_file(file_path: str, content: str) -> str:
-        """Ghi mới hoặc cập nhật nội dung chi tiết của một tệp tin trong workspace."""
-        return tools_mgr.write_file(file_path, content)
-
-    @tool(args_schema=ListDirSchema)
-    def list_directory(sub_dir: str = ".") -> str:
-        """Liệt kê các tệp và thư mục con trong thư mục chỉ định đệ quy."""
-        return tools_mgr.list_directory(sub_dir)
-
-    @tool(args_schema=RunTerminalSchema)
-    def run_terminal_command(command: str) -> str:
-        """Thực thi một lệnh terminal hệ điều hành trực tiếp trong thư mục gốc của workspace."""
-        return tools_mgr.run_terminal(command, timeout=60)
+    # Khởi tạo công cụ tĩnh
+    read_files = ReadFilesTool(workspace_path=ws)
+    write_file = WriteFileTool(workspace_path=ws)
+    list_directory = ListDirectoryTool(workspace_path=ws)
+    run_terminal_command = RunTerminalTool(workspace_path=ws)
     
-    # Đưa công cụ run_terminal_command vào bộ công cụ của mô hình phát triển [2]
     tools = [read_files, write_file, list_directory, run_terminal_command]
     model_with_tools = model.bind_tools(tools)
     
@@ -219,9 +196,10 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
     
     react_messages = [SystemMessage(content=system_prompt)]
     if error_logs:
-        react_messages.append(HumanMessage(content=f"LƯU Ý SỬA LỖI TỪ LƯỢT CHẠY TRƯỚC (TESTER BÁO LỖI):\n{error_logs}"))
+        react_messages.append(HumanMessage(content=f"LƯU Ý SỬA LỖI TỪ LƯỢT CHẠY TRƯỚC (HỆ THỐNG KIỂM TRA BÁO LỖI):\n{error_logs}\nHãy tập trung khắc phục lỗi này triệt để."))
     react_messages.append(HumanMessage(content=f"Yêu cầu: Hãy thực hiện phát triển bước này: '{current_step}'"))
     
+    # Tạo bản sao cục bộ để tránh mutate trực tiếp State List
     modified_files = list(state.get("modified_files", []))
     
     for _ in range(5):
@@ -280,19 +258,21 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
         except Exception as e:
             final_output = f"Lỗi xảy ra khi cố gắng tóm tắt mã nguồn: {str(e)}"
         
+    # LƯU Ý: Không tự ý cộng `current_step_idx` tại đây nữa. 
+    # Việc quản lý chuyển tiếp bước tiếp theo sẽ do `tester_node` xử lý sau khi kiểm tra xong.
     return {
         "messages": [AIMessage(content=f"**[Phát triển] Thực thi bước '{current_step}':**\n\n{final_output}")],
-        "modified_files": modified_files,
-        "error_logs": "",
-        "current_step_idx": current_idx + 1
+        "modified_files": modified_files
     }
 
 
 def tester_node(state: AgentState) -> Dict[str, Any]:
     modified_files = state.get("modified_files", [])
     attempts = state.get("attempts", 0)
+    current_idx = state["current_step_idx"]
     errors = []
     
+    # 1. Kiểm tra biên dịch mã nguồn Python
     for file_path in modified_files:
         if file_path.endswith(".py"):
             res = subprocess.run(["python", "-m", "py_compile", file_path], capture_output=True, text=True)
@@ -301,16 +281,28 @@ def tester_node(state: AgentState) -> Dict[str, Any]:
                 
     if errors:
         combined_error = "\n".join(errors)
-        return {
-            "error_logs": combined_error,
-            "attempts": attempts + 1,
-            "messages": [AIMessage(content=f"Phát hiện lỗi kiểm tra:\n{combined_error}")]
-        }
-        
+        # Nếu gặp lỗi và chưa vượt quá 3 lần sửa lỗi liên tục cho bước này:
+        if attempts < 2:  # Lần 0, 1 -> Tổng cộng tối đa 3 lần thực thi (1 lần gốc + 2 lần sửa lỗi)
+            return {
+                "error_logs": combined_error,
+                "attempts": attempts + 1,
+                "messages": [AIMessage(content=f"⚠️ Phát hiện lỗi kiểm tra tại bước {current_idx + 1}:\n{combined_error}\nHệ thống chuẩn bị quay lại sửa lỗi.")]
+            }
+        else:
+            # Quá giới hạn sửa lỗi cho bước này. Bắt buộc bỏ qua để chuyển sang bước tiếp theo
+            return {
+                "error_logs": "",
+                "attempts": 0,
+                "current_step_idx": current_idx + 1,
+                "messages": [AIMessage(content=f"❌ Đã vượt quá 3 lần tự động sửa lỗi tại bước {current_idx + 1}. Bỏ qua bước này để tiếp tục thực hiện các bước khác.")]
+            }
+            
+    # 2. Vượt qua kiểm thử thành công: Reset lỗi, tăng chỉ mục bước, chuẩn bị cho bước tiếp theo
     return {
         "error_logs": "",
-        "attempts": attempts,
-        "messages": [AIMessage(content="Tất cả các tệp tin đã vượt qua vòng kiểm tra thành công.")]
+        "attempts": 0,
+        "current_step_idx": current_idx + 1,
+        "messages": [AIMessage(content=f"✅ Bước {current_idx + 1} đã vượt qua vòng kiểm tra thành công. Tiến hành lưu vết.")]
     }
 
 
@@ -331,12 +323,12 @@ def synthesis_node(state: AgentState) -> Dict[str, Any]:
         "tránh lặp thông tin hoặc tạo ra mâu thuẫn trong báo cáo cuối cùng.\n\n"
         "⚠️ YÊU CẦU CỰC KỲ QUAN TRỌNG ĐỂ TRÁNH LỖI TRÀN TOKEN ĐẦU RA (OUTPUT TRUNCATION):\n"
         "- Hãy viết tài liệu thật SÚC TÍCH, CÔ ĐỌNG, tập trung vào cấu trúc, kiến trúc hệ thống và dependencies.\n"
-        "- TUYỆT ĐỐI KHÔNG sao chép hay chèn các đoạn mã nguồn dài dòng (ví dụ: các định nghĩa models, controllers, scrapers).\n"
-        "- KHÔNG chia nhỏ tài liệu thành các phần rác như 'Phần 1/3', không chèn các chú thích hứa hẹn 'Xem tiếp ở phần sau'. Tài liệu phải hoàn chỉnh trong lượt sinh này.\n"
+        "- TUYỆT ĐỐI KHÔNG sao chép hay chèn các đoạn mã nguồn dài dòng.\n"
+        "- KHÔNG chia nhỏ tài liệu thành các phần rác như 'Phần 1/3'. Tài liệu phải hoàn chỉnh trong lượt sinh này.\n"
         "- Sử dụng bảng biểu súc tích thay vì viết các đoạn mô tả dài dòng.\n\n"
         "Tài liệu phải bao gồm các mục tiêu chuẩn:\n"
         "1. Tổng quan & Môi trường phát triển.\n"
-        "2. Cấu trúc thư mục chính (tóm tắt súc tích cấu trúc `lib/`).\n"
+        "2. Cấu trúc thư mục chính.\n"
         "3. Danh sách Dependencies chính và vai trò.\n"
         "4. Mô tả các Module chính, Scrapers & Services.\n"
         "5. Đánh giá nhanh (Điểm mạnh, điểm yếu, đề xuất nâng cấp)."

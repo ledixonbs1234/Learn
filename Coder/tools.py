@@ -1,9 +1,72 @@
 # tools.py
 import subprocess
 from pathlib import Path
-from typing import List, Union
+from typing import List, Union, Type
 from pydantic import BaseModel, Field
+from langchain_core.tools import BaseTool
 from config import GitIgnoreMatcher, sanitize_and_resolve_path
+
+# ==========================================
+# SCHEMAS PHỤC VỤ TOOL CALLING
+# ==========================================
+class ReadFilesSchema(BaseModel):
+    file_paths: Union[str, List[str]] = Field(description="Đường dẫn tương đối hoặc danh sách đường dẫn tương đối của các tệp tin.")
+
+class WriteFileSchema(BaseModel):
+    file_path: str = Field(description="Đường dẫn tương đối của tệp tin trong workspace cần ghi hoặc cập nhật.")
+    content: str = Field(description="Toàn bộ nội dung tệp tin chi tiết cần lưu xuống đĩa.")
+
+class ListDirSchema(BaseModel):
+    sub_dir: str = Field(default=".", description="Đường dẫn tương đối của thư mục cần xem.")
+
+class RunTerminalSchema(BaseModel):
+    command: str = Field(description="Lệnh terminal hệ điều hành cần thực thi trực tiếp tại thư mục gốc của workspace.")
+
+# ==========================================
+# CÁC LỚP CÔNG CỤ CHUẨN HOÁ (BASE TOOL)
+# ==========================================
+class ReadFilesTool(BaseTool):
+    name: str = "read_files"
+    description: str = "Đọc nội dung của một hoặc nhiều tệp tin trong workspace cùng lúc."
+    args_schema: Type[BaseModel] = ReadFilesSchema
+    workspace_path: str
+
+    def _run(self, file_paths: Union[str, List[str]]) -> str:
+        tools_mgr = WorkspaceTools(self.workspace_path)
+        return tools_mgr.read_files(file_paths)
+
+
+class WriteFileTool(BaseTool):
+    name: str = "write_file"
+    description: str = "Ghi mới hoặc cập nhật nội dung chi tiết của một tệp tin trong workspace."
+    args_schema: Type[BaseModel] = WriteFileSchema
+    workspace_path: str
+
+    def _run(self, file_path: str, content: str) -> str:
+        tools_mgr = WorkspaceTools(self.workspace_path)
+        return tools_mgr.write_file(file_path, content)
+
+
+class ListDirectoryTool(BaseTool):
+    name: str = "list_directory"
+    description: str = "Liệt kê các tệp và thư mục con trong thư mục chỉ định đệ quy."
+    args_schema: Type[BaseModel] = ListDirSchema
+    workspace_path: str
+
+    def _run(self, sub_dir: str = ".") -> str:
+        tools_mgr = WorkspaceTools(self.workspace_path)
+        return tools_mgr.list_directory(sub_dir)
+
+
+class RunTerminalTool(BaseTool):
+    name: str = "run_terminal_command"
+    description: str = "Thực thi một lệnh terminal hệ điều hành trực tiếp trong thư mục gốc của workspace."
+    args_schema: Type[BaseModel] = RunTerminalSchema
+    workspace_path: str
+
+    def _run(self, command: str) -> str:
+        tools_mgr = WorkspaceTools(self.workspace_path)
+        return tools_mgr.run_terminal(command)
 
 # ==========================================
 # CÁC LỚP TIỆN ÍCH NGHIỆP VỤ
@@ -154,19 +217,3 @@ class WorkspaceTools:
             return f"Lỗi: Lệnh bị buộc dừng do vượt quá thời gian chờ (timeout) {timeout} giây."
         except Exception as e:
             return f"Lỗi thực thi lệnh terminal: {str(e)}"
-
-# ==========================================
-# SCHEMAS PHỤC VỤ TOOL CALLING
-# ==========================================
-class ReadFilesSchema(BaseModel):
-    file_paths: Union[str, List[str]] = Field(description="Đường dẫn tương đối hoặc danh sách đường dẫn tương đối của các tệp tin.")
-
-class WriteFileSchema(BaseModel):
-    file_path: str = Field(description="Đường dẫn tương đối của tệp tin trong workspace cần ghi hoặc cập nhật.")
-    content: str = Field(description="Toàn bộ nội dung tệp tin chi tiết cần lưu xuống đĩa.")
-
-class ListDirSchema(BaseModel):
-    sub_dir: str = Field(default=".", description="Đường dẫn tương đối của thư mục cần xem.")
-
-class RunTerminalSchema(BaseModel):
-    command: str = Field(description="Lệnh terminal hệ điều hành cần thực thi trực tiếp tại thư mục gốc của workspace (ví dụ: 'flutter pub get', 'pytest', 'python main.py').")

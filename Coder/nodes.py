@@ -10,7 +10,7 @@ from config import model, sanitize_and_resolve_path
 from state import AgentState, WorkspaceDetection, TaskPlan, TaskTriage
 from tools import (
     GitManager, WorkspaceTools, 
-    ReadFilesTool, WriteFileTool, ApplyPatchTool,  # <--- THÊM APPLYPATCHTOOL Ở ĐÂY
+    ReadFilesTool, WriteFileTool, ApplyPatchTool, 
     ListDirectoryTool, RunTerminalTool
 )
 
@@ -22,7 +22,6 @@ def detect_workspace_node(state: AgentState) -> Dict[str, Any]:
             "messages": [AIMessage(content=f"Sử dụng workspace sẵn có: `{resolved_ws}`")]
         }
 
-    # BẢO VỆ ĐẦU VÀO: Tìm kiếm chính xác HumanMessage gần nhất từ người dùng
     messages = state["messages"]
     user_msg = None
     for msg in reversed(messages):
@@ -60,8 +59,6 @@ def git_setup_node(state: AgentState) -> Dict[str, Any]:
 def context_loader_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
     
-    # BẢO VỆ ĐẦU VÀO: Tìm kiếm chính xác HumanMessage gần nhất từ người dùng
-    # Loại bỏ hoàn toàn sự can thiệp của các AIMessage kỹ thuật từ detect_workspace hay git_setup
     messages = state["messages"]
     user_msg = None
     for msg in reversed(messages):
@@ -70,11 +67,10 @@ def context_loader_node(state: AgentState) -> Dict[str, Any]:
             break
             
     if not user_msg:
-        user_msg = messages[0] # Fallback về phần tử đầu tiên nếu không lọc được
+        user_msg = messages[0]
         
     user_query = user_msg.content
     
-    # 1. Đọc file THONGTIN.md nếu tồn tại
     workspace_context = ""
     thongtin_path = Path(ws) / "THONGTIN.md"
     if thongtin_path.exists():
@@ -83,7 +79,6 @@ def context_loader_node(state: AgentState) -> Dict[str, Any]:
         except Exception as e:
             workspace_context = f"Lỗi khi đọc file THONGTIN.md: {str(e)}"
             
-    # 2. Phân loại nhanh độ phức tạp (Triage) dựa trên câu hỏi CHUẨN của người dùng
     structured_llm = model.with_structured_output(TaskTriage, method="function_calling")
     
     system_prompt = (
@@ -97,7 +92,7 @@ def context_loader_node(state: AgentState) -> Dict[str, Any]:
     try:
         triage_output = structured_llm.invoke([
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_query}  # <--- GỬI ĐÚNG YÊU CẦU CỦA NGƯỜI DÙNG
+            {"role": "user", "content": user_query}
         ])
         is_simple = getattr(triage_output, "is_simple", False)
         task_type = getattr(triage_output, "task_type", "development")
@@ -110,7 +105,7 @@ def context_loader_node(state: AgentState) -> Dict[str, Any]:
     
     if is_simple:
         plan_steps = [f"Xử lý trực tiếp yêu cầu của người dùng: {user_query}"]
-        messages_to_append.append(AIMessage(content="📋 Đã tải ngữ cảnh `THONGTIN.md`. Kích hoạt chế độ **Fast-Track (Nhiệm vụ đơn giản)**. Bỏ qua bước lập kế hoạch chi tiết."))
+        messages_to_append.append(AIMessage(content=f"📋 Đã tải ngữ cảnh `THONGTIN.md`. Kích hoạt chế độ **Fast-Track (Nhiệm vụ đơn giản)**. Bỏ qua bước lập kế hoạch chi tiết."))
     else:
         messages_to_append.append(AIMessage(content="📋 Đã tải ngữ cảnh `THONGTIN.md`. Nhận diện tác vụ phức tạp, chuyển tiếp tới Planner để thiết kế kế hoạch."))
         
@@ -178,20 +173,13 @@ def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
     workspace_context = state.get("workspace_context", "")
     messages = list(state["messages"])
     
-    # Nếu tin nhắn cuối cùng của lượt trước là tin nhắn thường không gọi tool,
-    # tức là bước hiện tại đã kết thúc, ta tăng chỉ mục lên để thực hiện bước tiếp theo.
-    if messages and isinstance(messages[-1], AIMessage) and not messages[-1].tool_calls:
-        current_idx += 1
-        
     if current_idx >= len(steps):
          return {
-             "current_step_idx": current_idx,
              "messages": [AIMessage(content="Đã hoàn thành khảo sát toàn bộ các bước.")]
          }
          
     current_step = steps[current_idx]
     
-    # Chỉ định cấu hình tools để LLM tùy chọn, không gọi .invoke() thủ công nữa
     read_files = ReadFilesTool(workspace_path=ws)
     list_directory = ListDirectoryTool(workspace_path=ws)
     tools = [read_files, list_directory]
@@ -222,15 +210,20 @@ def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
     
     response = model_with_tools.invoke([SystemMessage(content=system_prompt)] + messages)
     
-    findings = []
-    if not response.tool_calls and response.content:
-        findings = [f"### Khảo sát bước '{current_step}':\n{response.content}"]
-        
-    return {
-        "current_step_idx": current_idx,
-        "messages": [response],
-        "step_findings": findings
-    }
+    # CHUYỂN DỊCH THỜI ĐIỂM TĂNG CHỈ MỤC: Tăng index ngay khi không còn yêu cầu gọi công cụ
+    if not response.tool_calls:
+        findings = []
+        if response.content:
+            findings = [f"### Khảo sát bước '{current_step}':\n{response.content}"]
+        return {
+            "messages": [response],
+            "current_step_idx": current_idx + 1,  # <--- Tăng trực tiếp tại đây
+            "step_findings": findings
+        }
+    else:
+        return {
+            "messages": [response]
+        }
 
 
 def development_executor_node(state: AgentState) -> Dict[str, Any]:
@@ -240,14 +233,9 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
     error_logs = state.get("error_logs", "")
     workspace_context = state.get("workspace_context", "")
     messages = list(state["messages"])
-    
-    # Tăng chỉ mục nếu bước trước đó vừa hoàn tất
-    if messages and isinstance(messages[-1], AIMessage) and not messages[-1].tool_calls:
-        current_idx += 1
         
     if current_idx >= len(steps):
          return {
-             "current_step_idx": current_idx,
              "messages": [AIMessage(content="Đã hoàn thành toàn bộ các bước phát triển.")]
          }
          
@@ -255,11 +243,10 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
     
     read_files = ReadFilesTool(workspace_path=ws)
     write_file = WriteFileTool(workspace_path=ws)
-    apply_patch = ApplyPatchTool(workspace_path=ws)  # <--- KHỞI TẠO CÔNG CỤ APY PATCH TOOL
+    apply_patch = ApplyPatchTool(workspace_path=ws)
     list_directory = ListDirectoryTool(workspace_path=ws)
     run_terminal_command = RunTerminalTool(workspace_path=ws)
     
-    # RÀNG BUỘC CÔNG CỤ: Bổ sung apply_patch vào danh sách tools của Agent
     tools = [read_files, write_file, apply_patch, list_directory, run_terminal_command]
     model_with_tools = model.bind_tools(tools)
     
@@ -271,7 +258,6 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
     if workspace_context:
         system_prompt += f"\n--- NGỮ CẢNH HỆ THỐNG HIỆN TẠI (THONGTIN.md) ---\n{workspace_context}\n"
         
-    # CẬP NHẬT SYSTEM PROMPT ĐỂ RÀNG BUỘC QUY TẮC PHÁT TRIỂN TRÊN FILE > 300 DÒNG
     system_prompt += (
         "\nHãy sử dụng các công cụ `read_files`, `write_file`, `apply_search_replace_patch`, `list_directory` và `run_terminal_command` để giải quyết nhiệm vụ.\n"
         "\n⚠️ QUY TẮC QUAN TRỌNG VỀ SỬA ĐỔI FILE (BẮT BUỘC TUÂN THỦ):\n"
@@ -296,28 +282,32 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
         
     response = model_with_tools.invoke(input_messages + messages)
     
-    return {
-        "current_step_idx": current_idx,
-        "messages": [response]
-    }
+    # CHUYỂN DỊCH THỜI ĐIỂM TĂNG CHỈ MỤC: Tăng index ngay khi không còn yêu cầu gọi công cụ
+    if not response.tool_calls:
+        return {
+            "messages": [response],
+            "current_step_idx": current_idx + 1,  # <--- Tăng trực tiếp tại đây
+            "attempts": 0,                        # Reset số lần thử sửa lỗi cho bước cũ
+            "error_logs": ""                      # Xóa vết log lỗi của bước cũ
+        }
+    else:
+        return {
+            "messages": [response]
+        }
 
 
 def tool_node(state: AgentState) -> Dict[str, Any]:
-    """
-    NODE MỚI: Nhận các yêu cầu gọi công cụ từ tin nhắn AI gần nhất,
-    khởi tạo công cụ động dựa trên đường dẫn workspace hiện tại và thực thi.
-    """
     ws = state["workspace_path"]
     read_files = ReadFilesTool(workspace_path=ws)
     write_file = WriteFileTool(workspace_path=ws)
-    apply_patch = ApplyPatchTool(workspace_path=ws)  # <--- KHỞI TẠO CÔNG CỤ APY PATCH TOOL
+    apply_patch = ApplyPatchTool(workspace_path=ws)
     list_directory = ListDirectoryTool(workspace_path=ws)
     run_terminal_command = RunTerminalTool(workspace_path=ws)
     
     tools_map = {
         "read_files": read_files,
         "write_file": write_file,
-        "apply_search_replace_patch": apply_patch,  # <--- ĐĂNG KÝ CÔNG CỤ APY PATCH TOOL VÀO BẢN ĐỒ
+        "apply_search_replace_patch": apply_patch,
         "list_directory": list_directory,
         "run_terminal_command": run_terminal_command
     }
@@ -340,7 +330,6 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         else:
             try:
                 result = tool_instance.invoke(tool_args)
-                # ĐỒNG BỘ: Theo dõi file sửa đổi cho cả write_file và apply_search_replace_patch
                 if tool_name in ["write_file", "apply_search_replace_patch"]:
                     file_path = tool_args.get("file_path")
                     if file_path:
@@ -364,7 +353,7 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
 def tester_node(state: AgentState) -> Dict[str, Any]:
     modified_files = state.get("modified_files", [])
     attempts = state.get("attempts", 0)
-    current_idx = state["current_step_idx"]
+    current_idx = state["current_step_idx"]  # Đã là (idx + 1) do executor tự động tăng khi hoàn thành
     errors = []
     
     for file_path in modified_files:
@@ -373,28 +362,31 @@ def tester_node(state: AgentState) -> Dict[str, Any]:
             if res.returncode != 0:
                 errors.append(f"Lỗi cú pháp tại {Path(file_path).name}:\n{res.stderr.strip()}")
                 
-    if errors:
-        combined_error = "\n".join(errors)
-        if attempts < 2:
-            return {
-                "error_logs": combined_error,
-                "attempts": attempts + 1,
-                "messages": [AIMessage(content=f"⚠️ Phát hiện lỗi kiểm tra tại bước {current_idx + 1}:\n{combined_error}\nHệ thống chuẩn bị quay lại sửa lỗi.")]
-            }
-        else:
-            return {
-                "error_logs": "",
-                "attempts": 0,
-                "current_step_idx": current_idx + 1,
-                "messages": [AIMessage(content=f"❌ Đã vượt quá 3 lần tự động sửa lỗi tại bước {current_idx + 1}. Bỏ qua bước này để tiếp tục thực hiện các bước khác.")]
-            }
-            
-    return {
-        "error_logs": "",
-        "attempts": 0,
-        "current_step_idx": current_idx + 1,
-        "messages": [AIMessage(content=f"✅ Bước {current_idx + 1} đã vượt qua vòng kiểm tra thành công. Tiến hành lưu vết.")]
-    }
+        if errors:
+            combined_error = "\n".join(errors)
+            if attempts < 2:
+                # Do lỗi kiểm thử thất bại, ta kéo lùi current_step_idx về bước đang sửa lỗi (current_idx - 1)
+                # để chuẩn bị cho lượt sửa đổi tái hiện tại executor node
+                return {
+                    "error_logs": combined_error,
+                    "attempts": attempts + 1,
+                    "current_step_idx": current_idx - 1,  # <--- Đưa lùi chỉ mục về bước đang sửa lỗi
+                    "messages": [AIMessage(content=f"⚠️ Phát hiện lỗi kiểm tra tại bước {current_idx}:\n{combined_error}\nHệ thống chuẩn bị quay lại sửa lỗi.")]
+                }
+            else:
+                return {
+                    "error_logs": "",
+                    "attempts": 0,
+                    # Giữ nguyên current_idx (đã tăng sẵn) vì chúng ta chấp nhận bỏ qua lỗi và đi tiếp sang bước kế tiếp/commit
+                    "messages": [AIMessage(content=f"❌ Đã vượt quá 3 lần tự động sửa lỗi tại bước {current_idx}. Bỏ qua lỗi này để tiếp tục.")]
+                }
+                
+        return {
+            "error_logs": "",
+            "attempts": 0,
+            # Giữ nguyên current_idx (đã tăng sẵn) vì kiểm thử thành công
+            "messages": [AIMessage(content=f"✅ Bước {current_idx} đã vượt qua vòng kiểm tra thành công. Tiến hành lưu vết.")]
+        }
 
 
 def synthesis_node(state: AgentState) -> Dict[str, Any]:

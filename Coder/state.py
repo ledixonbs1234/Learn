@@ -17,6 +17,14 @@ class TaskPlan(BaseModel):
         description="Phân loại yêu cầu: 'analysis' nếu chỉ đọc/khảo sát/báo cáo thông tin, 'development' nếu có viết/sửa/nâng cấp mã nguồn."
     )
 
+class TaskTriage(BaseModel):
+    is_simple: bool = Field(
+        description="True nếu yêu cầu của người dùng cực kỳ đơn giản (chỉ cần sửa đổi 1-2 file, thêm tính năng nhỏ, sửa lỗi cú pháp). False nếu yêu cầu phức tạp cần khảo sát sâu hoặc thiết kế nhiều bước."
+    )
+    task_type: Literal["analysis", "development"] = Field(
+        description="Phân loại hướng xử lý của yêu cầu."
+    )
+
 # ==========================================
 # CUSTOM REDUCERS VÀ STATE GRAPH
 # ==========================================
@@ -33,6 +41,7 @@ def reduce_findings(left: Union[List[str], None], right: Union[List[str], None])
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
     workspace_path: str
+    workspace_context: str  # <--- THÊM: Lưu trữ nội dung file THONGTIN.md
     plan: List[str]
     task_type: Literal["analysis", "development"]
     current_step_idx: int

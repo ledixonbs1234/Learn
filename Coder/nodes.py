@@ -7,13 +7,20 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langchain_core.tools import tool
 
 from config import model, sanitize_and_resolve_path
-from state import AgentState, WorkspaceDetection, TaskPlan
+from state import AgentState, WorkspaceDetection, TaskPlan, TaskTriage
 from tools import (
     GitManager, WorkspaceTools, 
     ReadFilesTool, WriteFileTool, ListDirectoryTool, RunTerminalTool
 )
 
 def detect_workspace_node(state: AgentState) -> Dict[str, Any]:
+    if state.get("workspace_path"):
+        resolved_ws = str(Path(state["workspace_path"]).resolve())
+        return {
+            "workspace_path": resolved_ws,
+            "messages": [AIMessage(content=f"Sử dụng workspace sẵn có: `{resolved_ws}`")]
+        }
+
     last_message = state["messages"][-1].content
     structured_llm = model.with_structured_output(WorkspaceDetection, method="function_calling")
     detected = structured_llm.invoke([
@@ -38,18 +45,80 @@ def git_setup_node(state: AgentState) -> Dict[str, Any]:
     }
 
 
+def context_loader_node(state: AgentState) -> Dict[str, Any]:
+    ws = state["workspace_path"]
+    last_message = state["messages"][-1].content
+    
+    workspace_context = ""
+    thongtin_path = Path(ws) / "THONGTIN.md"
+    if thongtin_path.exists():
+        try:
+            workspace_context = thongtin_path.read_text(encoding="utf-8")
+        except Exception as e:
+            workspace_context = f"Lỗi khi đọc file THONGTIN.md: {str(e)}"
+            
+    structured_llm = model.with_structured_output(TaskTriage, method="function_calling")
+    
+    system_prompt = (
+        "Bạn là một điều phối viên Agent thông minh. Hãy phân tích yêu cầu của người dùng "
+        "để xác định xem đây là một yêu cầu đơn giản (chỉ cần chỉnh sửa trực tiếp 1-2 file, không cần lập kế hoạch chi tiết) "
+        "hay một yêu cầu phức tạp (cần lên kế hoạch khảo sát, phát triển nhiều bước).\n"
+        "Ví dụ về tác vụ ĐƠN GIẢN: Thêm một trường/thuộc tính mới vào model, sửa lỗi giao diện nhỏ, "
+        "ẩn/hiện một phần tử dựa trên điều kiện đầu vào của người dùng."
+    )
+    
+    try:
+        triage_output = structured_llm.invoke([
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": last_message}
+        ])
+        is_simple = getattr(triage_output, "is_simple", False)
+        task_type = getattr(triage_output, "task_type", "development")
+    except Exception:
+        is_simple = False
+        task_type = "development"
+        
+    plan_steps = []
+    messages = []
+    
+    if is_simple:
+        plan_steps = [f"Xử lý trực tiếp yêu cầu của người dùng: {last_message}"]
+        messages.append(AIMessage(content="📋 Đã tải ngữ cảnh `THONGTIN.md`. Kích hoạt chế độ **Fast-Track (Nhiệm vụ đơn giản)**. Bỏ qua bước lập kế hoạch chi tiết."))
+    else:
+        messages.append(AIMessage(content="📋 Đã tải ngữ cảnh `THONGTIN.md`. Nhận diện tác vụ phức tạp, chuyển tiếp tới Planner để thiết kế kế hoạch."))
+        
+    return {
+        "workspace_context": workspace_context,
+        "plan": plan_steps,
+        "task_type": task_type,
+        "messages": messages
+    }
+
+
 def planner_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
     conversation_history = state["messages"]
     existing_plan = state.get("plan", [])
-    existing_idx = state.get("current_step_idx", 0)
+    workspace_context = state.get("workspace_context", "")
+    
+    if existing_plan:
+        return {
+            "current_step_idx": 0,
+            "modified_files": [],
+            "attempts": 0,
+            "step_findings": ["__RESET__"],
+        }
     
     structured_llm = model.with_structured_output(TaskPlan, method="function_calling")
     
     system_prompt = (
         "Bạn là một Kiến trúc sư phần mềm cấp cao. Hãy lập hoặc cập nhật kế hoạch thực hiện "
         f"cho dự án nằm trong thư mục '{ws}'.\n"
-        f"Kế hoạch hiện hành của hệ thống trước đó: {existing_plan} (Đang ở bước: {existing_idx}).\n"
+    )
+    if workspace_context:
+        system_prompt += f"\n--- NGỮ CẢNH HỆ THỐNG HIỆN TẠI (THONGTIN.md) ---\n{workspace_context}\n"
+        
+    system_prompt += (
         "Hãy phân tích kỹ lưỡng toàn bộ lịch sử trò chuyện của người dùng để sinh ra kế hoạch hành động tiếp theo thích hợp nhất.\n"
         "Đặc biệt lưu ý phân loại trường `task_type` chính xác:\n"
         "- Chọn 'analysis' nếu yêu cầu chỉ là đọc, khảo sát cấu trúc dự án hoặc viết báo cáo.\n"
@@ -79,16 +148,25 @@ def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
     steps = state["plan"]
     current_idx = state["current_step_idx"]
+    workspace_context = state.get("workspace_context", "")
+    messages = list(state["messages"])
     
+    # Nếu tin nhắn cuối cùng của lượt trước là tin nhắn thường không gọi tool,
+    # tức là bước hiện tại đã kết thúc, ta tăng chỉ mục lên để thực hiện bước tiếp theo.
+    if messages and isinstance(messages[-1], AIMessage) and not messages[-1].tool_calls:
+        current_idx += 1
+        
     if current_idx >= len(steps):
-         return {"messages": [AIMessage(content="Đã hoàn thành khảo sát toàn bộ các bước.")]}
+         return {
+             "current_step_idx": current_idx,
+             "messages": [AIMessage(content="Đã hoàn thành khảo sát toàn bộ các bước.")]
+         }
          
     current_step = steps[current_idx]
     
-    # Khởi tạo công cụ tĩnh một cách tối ưu
+    # Chỉ định cấu hình tools để LLM tùy chọn, không gọi .invoke() thủ công nữa
     read_files = ReadFilesTool(workspace_path=ws)
     list_directory = ListDirectoryTool(workspace_path=ws)
-    
     tools = [read_files, list_directory]
     model_with_tools = model.bind_tools(tools)
     
@@ -101,7 +179,12 @@ def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
         "Bạn là một kiến trúc sư chuyên khảo sát, đọc hiểu và phân tích cấu trúc mã nguồn (Read-Only Mode).\n"
         f"Nhiệm vụ: Bạn đang thực hiện bước khảo sát {current_idx + 1}/{len(steps)}: '{current_step}'.\n"
         f"Thư mục làm việc: {ws}\n"
-        "Hãy sử dụng các công cụ `read_files` và `list_directory` để đọc hiểu cấu trúc hệ thống.\n"
+    )
+    if workspace_context:
+        system_prompt += f"\n--- TỔNG QUAN VỀ DỰ ÁN (THONGTIN.md) ---\n{workspace_context}\n"
+        
+    system_prompt += (
+        "\nHãy sử dụng các công cụ `read_files` và `list_directory` để đọc hiểu cấu trúc hệ thống.\n"
         "YÊU CẦU QUAN TRỌNG:\n"
         "- Bạn chỉ có quyền ĐỌC dữ liệu, tuyệt đối không chỉnh sửa mã nguồn hoặc tự ý tạo tệp tin trong bước này.\n"
         "- Trình bày chi tiết, chuyên nghiệp về kết quả phát hiện được của bạn ở tin nhắn phản hồi cuối cùng.\n"
@@ -110,55 +193,15 @@ def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
     if previous_findings_str:
         system_prompt += previous_findings_str
     
-    react_messages = [SystemMessage(content=system_prompt), HumanMessage(content=f"Yêu cầu: Hãy khảo sát bước này: '{current_step}'")]
+    response = model_with_tools.invoke([SystemMessage(content=system_prompt)] + messages)
     
-    for _ in range(10):
-        try:
-            response = model_with_tools.invoke(react_messages)
-        except Exception as e:
-            react_messages.append(AIMessage(content=f"Lỗi gọi mô hình: {str(e)}"))
-            break
-            
-        react_messages.append(response)
-        if not response.tool_calls:
-            break
-            
-        for tool_call in response.tool_calls:
-            tool_name = tool_call["name"]
-            tool_args = tool_call["args"] or {}
-            
-            try:
-                if tool_name == "read_files":
-                    result = read_files.invoke(tool_args)
-                elif tool_name == "list_directory":
-                    result = list_directory.invoke(tool_args)
-                else:
-                    result = f"Lỗi: Không tìm thấy công cụ '{tool_name}'."
-            except Exception as tool_err:
-                result = f"Lỗi thực thi công cụ '{tool_name}': {str(tool_err)}"
-                
-            react_messages.append(ToolMessage(content=str(result), name=tool_name, tool_call_id=tool_call["id"]))
-            
-    final_output = ""
-    for msg in reversed(react_messages):
-        if isinstance(msg, AIMessage) and msg.content and len(msg.content.strip()) > 15:
-            final_output = msg.content.strip()
-            break
-            
-    if not final_output:
-        try:
-            summary_prompt = "Hãy viết một báo cáo tóm tắt chi tiết các kết quả khảo sát bạn đã thu được ở bước này."
-            react_messages.append(HumanMessage(content=summary_prompt))
-            forced_response = model.invoke(react_messages)
-            final_output = forced_response.content
-        except Exception as e:
-            final_output = f"Lỗi xảy ra trong quá trình tổng kết: {str(e)}"
+    findings = []
+    if not response.tool_calls and response.content:
+        findings = [f"### Khảo sát bước '{current_step}':\n{response.content}"]
         
-    findings = [f"### Khảo sát bước '{current_step}':\n{final_output}"]
-    
     return {
-        "messages": [AIMessage(content=f"**[Phân tích] Thực thi bước '{current_step}':**\n\n{final_output}")],
-        "current_step_idx": current_idx + 1,
+        "current_step_idx": current_idx,
+        "messages": [response],
         "step_findings": findings
     }
 
@@ -168,13 +211,21 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
     steps = state["plan"]
     current_idx = state["current_step_idx"]
     error_logs = state.get("error_logs", "")
+    workspace_context = state.get("workspace_context", "")
+    messages = list(state["messages"])
     
+    # Tăng chỉ mục nếu bước trước đó vừa hoàn tất
+    if messages and isinstance(messages[-1], AIMessage) and not messages[-1].tool_calls:
+        current_idx += 1
+        
     if current_idx >= len(steps):
-         return {"messages": [AIMessage(content="Đã hoàn thành toàn bộ các bước phát triển.")]}
+         return {
+             "current_step_idx": current_idx,
+             "messages": [AIMessage(content="Đã hoàn thành toàn bộ các bước phát triển.")]
+         }
          
     current_step = steps[current_idx]
     
-    # Khởi tạo công cụ tĩnh
     read_files = ReadFilesTool(workspace_path=ws)
     write_file = WriteFileTool(workspace_path=ws)
     list_directory = ListDirectoryTool(workspace_path=ws)
@@ -187,81 +238,83 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
         "Bạn là một kỹ sư phần mềm thực thi chuyên nghiệp chuyên sửa lỗi và viết mới mã nguồn (Write-Access Mode).\n"
         f"Nhiệm vụ: Bạn đang thực hiện bước phát triển {current_idx + 1}/{len(steps)}: '{current_step}'.\n"
         f"Thư mục làm việc: {ws}\n"
-        "Hãy sử dụng các công cụ `read_files`, `write_file`, `list_directory` và `run_terminal_command` để giải quyết nhiệm vụ.\n"
+    )
+    if workspace_context:
+        system_prompt += f"\n--- NGỮ CẢNH HỆ THỐNG HIỆN TẠI (THONGTIN.md) ---\n{workspace_context}\n"
+        
+    system_prompt += (
+        "\nHãy sử dụng các công cụ `read_files`, `write_file`, `list_directory` và `run_terminal_command` để giải quyết nhiệm vụ.\n"
         "YÊU CẦU QUAN TRỌNG:\n"
         "- Khi chỉnh sửa tệp đã có, luôn luôn dùng `read_files` đọc nội dung trước để hiểu ngữ cảnh và tránh làm mất mã nguồn cũ.\n"
         "- Bạn có thể cài đặt thư viện, build dự án, hoặc chạy kiểm thử bằng công cụ `run_terminal_command`.\n"
         "- Mô tả thật chi tiết các hành động, giải pháp và vị trí các dòng code bạn đã cập nhật ở tin nhắn phản hồi cuối cùng."
     )
     
-    react_messages = [SystemMessage(content=system_prompt)]
+    input_messages = [SystemMessage(content=system_prompt)]
     if error_logs:
-        react_messages.append(HumanMessage(content=f"LƯU Ý SỬA LỖI TỪ LƯỢT CHẠY TRƯỚC (HỆ THỐNG KIỂM TRA BÁO LỖI):\n{error_logs}\nHãy tập trung khắc phục lỗi này triệt để."))
-    react_messages.append(HumanMessage(content=f"Yêu cầu: Hãy thực hiện phát triển bước này: '{current_step}'"))
+        input_messages.append(HumanMessage(content=f"LƯU Ý SỬA LỖI TỪ LƯỢT CHẠY TRƯỚC (HỆ THỐNG KIỂM TRA BÁO LỖI):\n{error_logs}\nHãy tập trung khắc phục lỗi này triệt để."))
+        
+    response = model_with_tools.invoke(input_messages + messages)
     
-    # Tạo bản sao cục bộ để tránh mutate trực tiếp State List
+    return {
+        "current_step_idx": current_idx,
+        "messages": [response]
+    }
+
+
+def tool_node(state: AgentState) -> Dict[str, Any]:
+    """
+    NODE MỚI: Nhận các yêu cầu gọi công cụ từ tin nhắn AI gần nhất,
+    khởi tạo công cụ động dựa trên đường dẫn workspace hiện tại và thực thi.
+    """
+    ws = state["workspace_path"]
+    read_files = ReadFilesTool(workspace_path=ws)
+    write_file = WriteFileTool(workspace_path=ws)
+    list_directory = ListDirectoryTool(workspace_path=ws)
+    run_terminal_command = RunTerminalTool(workspace_path=ws)
+    
+    tools_map = {
+        "read_files": read_files,
+        "write_file": write_file,
+        "list_directory": list_directory,
+        "run_terminal_command": run_terminal_command
+    }
+    
+    last_message = state["messages"][-1]
+    if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
+        return {}
+        
+    tool_messages = []
     modified_files = list(state.get("modified_files", []))
     
-    for _ in range(5):
-        try:
-            response = model_with_tools.invoke(react_messages)
-        except Exception as e:
-            react_messages.append(AIMessage(content=f"Lỗi gọi mô hình: {str(e)}"))
-            break
-            
-        react_messages.append(response)
+    for tool_call in last_message.tool_calls:
+        tool_name = tool_call["name"]
+        tool_args = tool_call["args"] or {}
+        tool_id = tool_call["id"]
         
-        if not response.tool_calls:
-            break
-            
-        for tool_call in response.tool_calls:
-            tool_name = tool_call["name"]
-            tool_args = tool_call["args"] or {}
-            
+        tool_instance = tools_map.get(tool_name)
+        if not tool_instance:
+            result = f"Lỗi: Không tìm thấy công cụ '{tool_name}'."
+        else:
             try:
-                if tool_name == "read_files":
-                    result = read_files.invoke(tool_args)
-                elif tool_name == "write_file":
+                result = tool_instance.invoke(tool_args)
+                # Đưa tệp tin vào danh sách đã sửa đổi nếu gọi công cụ ghi
+                if tool_name == "write_file":
                     file_path = tool_args.get("file_path")
-                    if not file_path:
-                        raise ValueError("Thiếu tham số 'file_path' bắt buộc trong lệnh gọi write_file.")
-                    result = write_file.invoke(tool_args)
-                    try:
-                        safe_path = sanitize_and_resolve_path(ws, file_path, create_parent=True)
-                        if str(safe_path) not in modified_files:
-                            modified_files.append(str(safe_path))
-                    except Exception:
-                        pass
-                elif tool_name == "list_directory":
-                    result = list_directory.invoke(tool_args)
-                elif tool_name == "run_terminal_command":
-                    result = run_terminal_command.invoke(tool_args)
-                else:
-                    result = f"Lỗi: Không tìm thấy công cụ '{tool_name}'."
-            except Exception as tool_err:
-                result = f"Lỗi thực thi công cụ '{tool_name}': {str(tool_err)}"
+                    if file_path:
+                        try:
+                            safe_path = sanitize_and_resolve_path(ws, file_path, create_parent=True)
+                            if str(safe_path) not in modified_files:
+                                modified_files.append(str(safe_path))
+                        except Exception:
+                            pass
+            except Exception as e:
+                result = f"Lỗi thực thi công cụ '{tool_name}': {str(e)}"
                 
-            react_messages.append(ToolMessage(content=str(result), name=tool_name, tool_call_id=tool_call["id"]))
-            
-    final_output = ""
-    for msg in reversed(react_messages):
-        if isinstance(msg, AIMessage) and msg.content and len(msg.content.strip()) > 15:
-            final_output = msg.content.strip()
-            break
-            
-    if not final_output:
-        try:
-            summary_prompt = "Hãy viết một tóm tắt chi tiết về mã nguồn bạn đã chỉnh sửa hoặc tạo mới trong bước này."
-            react_messages.append(HumanMessage(content=summary_prompt))
-            forced_response = model.invoke(react_messages)
-            final_output = forced_response.content
-        except Exception as e:
-            final_output = f"Lỗi xảy ra khi cố gắng tóm tắt mã nguồn: {str(e)}"
+        tool_messages.append(ToolMessage(content=str(result), name=tool_name, tool_call_id=tool_id))
         
-    # LƯU Ý: Không tự ý cộng `current_step_idx` tại đây nữa. 
-    # Việc quản lý chuyển tiếp bước tiếp theo sẽ do `tester_node` xử lý sau khi kiểm tra xong.
     return {
-        "messages": [AIMessage(content=f"**[Phát triển] Thực thi bước '{current_step}':**\n\n{final_output}")],
+        "messages": tool_messages,
         "modified_files": modified_files
     }
 
@@ -272,7 +325,6 @@ def tester_node(state: AgentState) -> Dict[str, Any]:
     current_idx = state["current_step_idx"]
     errors = []
     
-    # 1. Kiểm tra biên dịch mã nguồn Python
     for file_path in modified_files:
         if file_path.endswith(".py"):
             res = subprocess.run(["python", "-m", "py_compile", file_path], capture_output=True, text=True)
@@ -281,15 +333,13 @@ def tester_node(state: AgentState) -> Dict[str, Any]:
                 
     if errors:
         combined_error = "\n".join(errors)
-        # Nếu gặp lỗi và chưa vượt quá 3 lần sửa lỗi liên tục cho bước này:
-        if attempts < 2:  # Lần 0, 1 -> Tổng cộng tối đa 3 lần thực thi (1 lần gốc + 2 lần sửa lỗi)
+        if attempts < 2:
             return {
                 "error_logs": combined_error,
                 "attempts": attempts + 1,
                 "messages": [AIMessage(content=f"⚠️ Phát hiện lỗi kiểm tra tại bước {current_idx + 1}:\n{combined_error}\nHệ thống chuẩn bị quay lại sửa lỗi.")]
             }
         else:
-            # Quá giới hạn sửa lỗi cho bước này. Bắt buộc bỏ qua để chuyển sang bước tiếp theo
             return {
                 "error_logs": "",
                 "attempts": 0,
@@ -297,7 +347,6 @@ def tester_node(state: AgentState) -> Dict[str, Any]:
                 "messages": [AIMessage(content=f"❌ Đã vượt quá 3 lần tự động sửa lỗi tại bước {current_idx + 1}. Bỏ qua bước này để tiếp tục thực hiện các bước khác.")]
             }
             
-    # 2. Vượt qua kiểm thử thành công: Reset lỗi, tăng chỉ mục bước, chuẩn bị cho bước tiếp theo
     return {
         "error_logs": "",
         "attempts": 0,
@@ -358,6 +407,7 @@ def synthesis_node(state: AgentState) -> Dict[str, Any]:
             git_manager._run_cmd(["git", "add", "THONGTIN.md"], ignore_error=True)
             
             return {
+                "workspace_context": cleaned_md,
                 "messages": [AIMessage(content="**Tổng hợp tài liệu hoàn tất:** Hệ thống đã thu thập tri thức của toàn bộ các bước khảo sát tuần tự và biên dịch thành tệp `THONGTIN.md` thành công tại thư mục gốc của dự án.")]
             }
     except Exception as e:

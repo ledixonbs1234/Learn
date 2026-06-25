@@ -246,8 +246,39 @@ class WorkspaceTools:
         except Exception as e:
             return f"Lỗi liệt kê thư mục: {str(e)}"
 
+    def run_terminal(self, command: str, timeout: int = 60) -> str:
+        """
+        Thực thi trực tiếp một lệnh shell/terminal trong không gian làm việc an toàn của workspace.
+        """
+        try:
+            res = subprocess.run(
+                command,
+                cwd=str(self.workspace),
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            
+            output = []
+            if res.stdout:
+                output.append(f"[STDOUT]\n{res.stdout.strip()}")
+            if res.stderr:
+                output.append(f"[STDERR]\n{res.stderr.strip()}")
+                
+            status_msg = f"Lệnh kết thúc với exit code: {res.returncode}"
+            if not output:
+                return f"{status_msg} (Không có dữ liệu đầu ra)"
+                
+            return f"{status_msg}\n" + "\n\n".join(output)
+            
+        except subprocess.TimeoutExpired:
+            return f"Lỗi: Lệnh bị buộc dừng do vượt quá thời gian chờ (timeout) {timeout} giây."
+        except Exception as e:
+            return f"Lỗi thực thi lệnh terminal: {str(e)}"
 
-# Định nghĩa schemas phục vụ Tool Calling cho LLM
+
+# Định nghĩa các schemas phục vụ Tool Calling cho LLM
 class ReadFilesSchema(BaseModel):
     file_paths: Union[str, List[str]] = Field(description="Đường dẫn tương đối hoặc danh sách đường dẫn tương đối của các tệp tin.")
 
@@ -257,6 +288,9 @@ class WriteFileSchema(BaseModel):
 
 class ListDirSchema(BaseModel):
     sub_dir: str = Field(default=".", description="Đường dẫn tương đối của thư mục cần xem.")
+
+class RunTerminalSchema(BaseModel):
+    command: str = Field(description="Lệnh terminal hệ điều hành cần thực thi trực tiếp tại thư mục gốc của workspace (ví dụ: 'flutter pub get', 'pytest', 'python main.py').")
 
 
 # ==========================================
@@ -507,17 +541,25 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
     def list_directory(sub_dir: str = ".") -> str:
         """Liệt kê các tệp và thư mục con trong thư mục chỉ định đệ quy."""
         return tools_mgr.list_directory(sub_dir)
+
+    @tool(args_schema=RunTerminalSchema)
+    def run_terminal_command(command: str) -> str:
+        """Thực thi một lệnh terminal hệ điều hành trực tiếp trong thư mục gốc của workspace."""
+        # Chạy lệnh với timeout mặc định là 60 giây để tránh làm treo hệ thống
+        return tools_mgr.run_terminal(command, timeout=60)
     
-    tools = [read_files, write_file, list_directory]
+    # Đưa công cụ run_terminal_command vào bộ công cụ của mô hình phát triển [2]
+    tools = [read_files, write_file, list_directory, run_terminal_command]
     model_with_tools = model.bind_tools(tools)
     
     system_prompt = (
         "Bạn là một kỹ sư phần mềm thực thi chuyên nghiệp chuyên sửa lỗi và viết mới mã nguồn (Write-Access Mode).\n"
         f"Nhiệm vụ: Bạn đang thực hiện bước phát triển {current_idx + 1}/{len(steps)}: '{current_step}'.\n"
         f"Thư mục làm việc: {ws}\n"
-        "Hãy sử dụng các công cụ `read_files`, `write_file`, và `list_directory` để sửa đổi hoặc tạo mới mã nguồn cho phù hợp.\n"
+        "Hãy sử dụng các công cụ `read_files`, `write_file`, `list_directory` và `run_terminal_command` để giải quyết nhiệm vụ.\n"
         "YÊU CẦU QUAN TRỌNG:\n"
         "- Khi chỉnh sửa tệp đã có, luôn luôn dùng `read_files` đọc nội dung trước để hiểu ngữ cảnh và tránh làm mất mã nguồn cũ.\n"
+        "- Bạn có thể cài đặt thư viện, build dự án, hoặc chạy kiểm thử bằng công cụ `run_terminal_command`.\n"
         "- Mô tả thật chi tiết các hành động, giải pháp và vị trí các dòng code bạn đã cập nhật ở tin nhắn phản hồi cuối cùng."
     )
     
@@ -529,7 +571,7 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
     modified_files = list(state.get("modified_files", []))
     
     # Vòng lặp ReAct được bảo vệ chống sập chương trình
-    for _ in range(10):
+    for _ in range(5):
         try:
             response = model_with_tools.invoke(react_messages)
         except Exception as e:
@@ -561,6 +603,8 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
                         pass
                 elif tool_name == "list_directory":
                     result = list_directory.invoke(tool_args)
+                elif tool_name == "run_terminal_command":
+                    result = run_terminal_command.invoke(tool_args)
                 else:
                     result = f"Lỗi: Không tìm thấy công cụ '{tool_name}'."
             except Exception as tool_err:

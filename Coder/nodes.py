@@ -10,7 +10,8 @@ from config import model, sanitize_and_resolve_path
 from state import AgentState, WorkspaceDetection, TaskPlan, TaskTriage
 from tools import (
     GitManager, WorkspaceTools, 
-    ReadFilesTool, WriteFileTool, ListDirectoryTool, RunTerminalTool
+    ReadFilesTool, WriteFileTool, ApplyPatchTool,  # <--- THÊM APPLYPATCHTOOL Ở ĐÂY
+    ListDirectoryTool, RunTerminalTool
 )
 
 def detect_workspace_node(state: AgentState) -> Dict[str, Any]:
@@ -21,7 +22,18 @@ def detect_workspace_node(state: AgentState) -> Dict[str, Any]:
             "messages": [AIMessage(content=f"Sử dụng workspace sẵn có: `{resolved_ws}`")]
         }
 
-    last_message = state["messages"][-1].content
+    # BẢO VỆ ĐẦU VÀO: Tìm kiếm chính xác HumanMessage gần nhất từ người dùng
+    messages = state["messages"]
+    user_msg = None
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage) or getattr(msg, "type", None) == "human":
+            user_msg = msg
+            break
+            
+    if not user_msg:
+        user_msg = messages[-1]
+
+    last_message = user_msg.content
     structured_llm = model.with_structured_output(WorkspaceDetection, method="function_calling")
     detected = structured_llm.invoke([
         {"role": "system", "content": "Trích xuất đường dẫn thư mục dự án cần xử lý từ yêu cầu người dùng."},
@@ -47,8 +59,22 @@ def git_setup_node(state: AgentState) -> Dict[str, Any]:
 
 def context_loader_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
-    last_message = state["messages"][-1].content
     
+    # BẢO VỆ ĐẦU VÀO: Tìm kiếm chính xác HumanMessage gần nhất từ người dùng
+    # Loại bỏ hoàn toàn sự can thiệp của các AIMessage kỹ thuật từ detect_workspace hay git_setup
+    messages = state["messages"]
+    user_msg = None
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage) or getattr(msg, "type", None) == "human":
+            user_msg = msg
+            break
+            
+    if not user_msg:
+        user_msg = messages[0] # Fallback về phần tử đầu tiên nếu không lọc được
+        
+    user_query = user_msg.content
+    
+    # 1. Đọc file THONGTIN.md nếu tồn tại
     workspace_context = ""
     thongtin_path = Path(ws) / "THONGTIN.md"
     if thongtin_path.exists():
@@ -57,6 +83,7 @@ def context_loader_node(state: AgentState) -> Dict[str, Any]:
         except Exception as e:
             workspace_context = f"Lỗi khi đọc file THONGTIN.md: {str(e)}"
             
+    # 2. Phân loại nhanh độ phức tạp (Triage) dựa trên câu hỏi CHUẨN của người dùng
     structured_llm = model.with_structured_output(TaskTriage, method="function_calling")
     
     system_prompt = (
@@ -70,7 +97,7 @@ def context_loader_node(state: AgentState) -> Dict[str, Any]:
     try:
         triage_output = structured_llm.invoke([
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": last_message}
+            {"role": "user", "content": user_query}  # <--- GỬI ĐÚNG YÊU CẦU CỦA NGƯỜI DÙNG
         ])
         is_simple = getattr(triage_output, "is_simple", False)
         task_type = getattr(triage_output, "task_type", "development")
@@ -79,19 +106,19 @@ def context_loader_node(state: AgentState) -> Dict[str, Any]:
         task_type = "development"
         
     plan_steps = []
-    messages = []
+    messages_to_append = []
     
     if is_simple:
-        plan_steps = [f"Xử lý trực tiếp yêu cầu của người dùng: {last_message}"]
-        messages.append(AIMessage(content="📋 Đã tải ngữ cảnh `THONGTIN.md`. Kích hoạt chế độ **Fast-Track (Nhiệm vụ đơn giản)**. Bỏ qua bước lập kế hoạch chi tiết."))
+        plan_steps = [f"Xử lý trực tiếp yêu cầu của người dùng: {user_query}"]
+        messages_to_append.append(AIMessage(content="📋 Đã tải ngữ cảnh `THONGTIN.md`. Kích hoạt chế độ **Fast-Track (Nhiệm vụ đơn giản)**. Bỏ qua bước lập kế hoạch chi tiết."))
     else:
-        messages.append(AIMessage(content="📋 Đã tải ngữ cảnh `THONGTIN.md`. Nhận diện tác vụ phức tạp, chuyển tiếp tới Planner để thiết kế kế hoạch."))
+        messages_to_append.append(AIMessage(content="📋 Đã tải ngữ cảnh `THONGTIN.md`. Nhận diện tác vụ phức tạp, chuyển tiếp tới Planner để thiết kế kế hoạch."))
         
     return {
         "workspace_context": workspace_context,
         "plan": plan_steps,
         "task_type": task_type,
-        "messages": messages
+        "messages": messages_to_append
     }
 
 
@@ -228,10 +255,12 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
     
     read_files = ReadFilesTool(workspace_path=ws)
     write_file = WriteFileTool(workspace_path=ws)
+    apply_patch = ApplyPatchTool(workspace_path=ws)  # <--- KHỞI TẠO CÔNG CỤ APY PATCH TOOL
     list_directory = ListDirectoryTool(workspace_path=ws)
     run_terminal_command = RunTerminalTool(workspace_path=ws)
     
-    tools = [read_files, write_file, list_directory, run_terminal_command]
+    # RÀNG BUỘC CÔNG CỤ: Bổ sung apply_patch vào danh sách tools của Agent
+    tools = [read_files, write_file, apply_patch, list_directory, run_terminal_command]
     model_with_tools = model.bind_tools(tools)
     
     system_prompt = (
@@ -242,9 +271,20 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
     if workspace_context:
         system_prompt += f"\n--- NGỮ CẢNH HỆ THỐNG HIỆN TẠI (THONGTIN.md) ---\n{workspace_context}\n"
         
+    # CẬP NHẬT SYSTEM PROMPT ĐỂ RÀNG BUỘC QUY TẮC PHÁT TRIỂN TRÊN FILE > 300 DÒNG
     system_prompt += (
-        "\nHãy sử dụng các công cụ `read_files`, `write_file`, `list_directory` và `run_terminal_command` để giải quyết nhiệm vụ.\n"
-        "YÊU CẦU QUAN TRỌNG:\n"
+        "\nHãy sử dụng các công cụ `read_files`, `write_file`, `apply_search_replace_patch`, `list_directory` và `run_terminal_command` để giải quyết nhiệm vụ.\n"
+        "\n⚠️ QUY TẮC QUAN TRỌNG VỀ SỬA ĐỔI FILE (BẮT BUỘC TUÂN THỦ):\n"
+        "1. Đối với các file có sẵn trong hệ thống có độ dài TRÊN 300 DÒNG (hoặc tệp tin có kích thước lớn):\n"
+        "   - Bạn TUYỆT ĐỐI KHÔNG ĐƯỢC sử dụng công cụ `write_file` để ghi đè lại toàn bộ tệp.\n"
+        "   - Thay vào đó, bạn BẮT BUỘC PHẢI sử dụng công cụ `apply_search_replace_patch` để áp dụng bản vá cục bộ (Search-and-Replace).\n"
+        "   - Điều này giúp tránh lỗi ngắt quãng đầu ra (output truncation) và giữ tính toàn vẹn của mã nguồn hiện hành.\n"
+        "2. Công cụ `write_file` CHỈ được dùng để:\n"
+        "   - Tạo mới các tệp tin chưa từng tồn tại trong workspace.\n"
+        "   - Sửa đổi các tệp cực kỳ ngắn (dưới 300 dòng).\n"
+        "3. Khi sử dụng `apply_search_replace_patch`:\n"
+        "   - Hãy chắc chắn rằng khối văn bản SEARCH trùng khớp 100% từng ký tự, dấu cách và thụt lề dòng (indentation) với tệp gốc.\n"
+        "\nYÊU CẦU PHÁT TRIỂN KHÁC:\n"
         "- Khi chỉnh sửa tệp đã có, luôn luôn dùng `read_files` đọc nội dung trước để hiểu ngữ cảnh và tránh làm mất mã nguồn cũ.\n"
         "- Bạn có thể cài đặt thư viện, build dự án, hoặc chạy kiểm thử bằng công cụ `run_terminal_command`.\n"
         "- Mô tả thật chi tiết các hành động, giải pháp và vị trí các dòng code bạn đã cập nhật ở tin nhắn phản hồi cuối cùng."
@@ -270,12 +310,14 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
     read_files = ReadFilesTool(workspace_path=ws)
     write_file = WriteFileTool(workspace_path=ws)
+    apply_patch = ApplyPatchTool(workspace_path=ws)  # <--- KHỞI TẠO CÔNG CỤ APY PATCH TOOL
     list_directory = ListDirectoryTool(workspace_path=ws)
     run_terminal_command = RunTerminalTool(workspace_path=ws)
     
     tools_map = {
         "read_files": read_files,
         "write_file": write_file,
+        "apply_search_replace_patch": apply_patch,  # <--- ĐĂNG KÝ CÔNG CỤ APY PATCH TOOL VÀO BẢN ĐỒ
         "list_directory": list_directory,
         "run_terminal_command": run_terminal_command
     }
@@ -298,8 +340,8 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         else:
             try:
                 result = tool_instance.invoke(tool_args)
-                # Đưa tệp tin vào danh sách đã sửa đổi nếu gọi công cụ ghi
-                if tool_name == "write_file":
+                # ĐỒNG BỘ: Theo dõi file sửa đổi cho cả write_file và apply_search_replace_patch
+                if tool_name in ["write_file", "apply_search_replace_patch"]:
                     file_path = tool_args.get("file_path")
                     if file_path:
                         try:

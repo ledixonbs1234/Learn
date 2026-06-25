@@ -1,5 +1,6 @@
 # tools.py
 import subprocess
+import re  # <--- THÊM IMPORT THƯ VIỆN RE Ở ĐẦU FILE
 from pathlib import Path
 from typing import List, Union, Type
 from pydantic import BaseModel, Field
@@ -15,6 +16,17 @@ class ReadFilesSchema(BaseModel):
 class WriteFileSchema(BaseModel):
     file_path: str = Field(description="Đường dẫn tương đối của tệp tin trong workspace cần ghi hoặc cập nhật.")
     content: str = Field(description="Toàn bộ nội dung tệp tin chi tiết cần lưu xuống đĩa.")
+
+class ApplyPatchSchema(BaseModel):  # <--- THÊM SCHEMA CHO BẢN VÁ MỚI
+    file_path: str = Field(description="Đường dẫn tương đối của tệp tin trong workspace cần sửa đổi.")
+    patch_block: str = Field(
+        description="Khối bản vá Tìm kiếm & Thay thế (Search-and-Replace) bắt buộc viết theo định dạng:\n"
+                    "<<<<<<< SEARCH\n"
+                    "[Mã cũ cần thay thế khớp chính xác]\n"
+                    "=======\n"
+                    "[Mã mới cần đổi]\n"
+                    ">>>>>>> REPLACE"
+    )
 
 class ListDirSchema(BaseModel):
     sub_dir: str = Field(default=".", description="Đường dẫn tương đối của thư mục cần xem.")
@@ -45,6 +57,17 @@ class WriteFileTool(BaseTool):
     def _run(self, file_path: str, content: str) -> str:
         tools_mgr = WorkspaceTools(self.workspace_path)
         return tools_mgr.write_file(file_path, content)
+
+
+class ApplyPatchTool(BaseTool):  # <--- THÊM CLASS LỚP CÔNG CỤ APY PATCH TOOL
+    name: str = "apply_search_replace_patch"
+    description: str = "Áp dụng bản vá sửa đổi cục bộ tối giản vào một tệp tin thông qua khối Tìm kiếm & Thay thế (Search-and-Replace)."
+    args_schema: Type[BaseModel] = ApplyPatchSchema
+    workspace_path: str
+
+    def _run(self, file_path: str, patch_block: str) -> str:
+        tools_mgr = WorkspaceTools(self.workspace_path)
+        return tools_mgr.apply_search_replace_patch(file_path, patch_block)
 
 
 class ListDirectoryTool(BaseTool):
@@ -151,6 +174,48 @@ class WorkspaceTools:
             return f"Đã ghi và lưu tệp thành công tại đường dẫn: '{file_path}'"
         except Exception as e:
             return f"Lỗi ghi tệp: {str(e)}"
+
+    def apply_search_replace_patch(self, file_path: str, patch_block: str) -> str:  # <--- HÀM XỬ LÝ VẬT LÝ BẢN VÁ
+        try:
+            safe_path = sanitize_and_resolve_path(str(self.workspace), file_path, create_parent=False)
+            if not safe_path.exists():
+                return f"Lỗi: Không tìm thấy tệp tin '{file_path}' cần áp dụng bản vá."
+                
+            # Phân tích cú pháp khối Search-and-Replace
+            pattern = r"<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n>>>>>>> REPLACE"
+            match = re.search(pattern, patch_block, re.DOTALL)
+            
+            if not match:
+                return (
+                    "Lỗi: Bản vá không đúng định dạng. Bạn bắt buộc phải tuân thủ chính xác cấu trúc:\n"
+                    "<<<<<<< SEARCH\n"
+                    "[Mã nguồn cũ cần tìm chính xác]\n"
+                    "=======\n"
+                    "[Mã nguồn mới thay thế]\n"
+                    ">>>>>>> REPLACE"
+                )
+                
+            search_code = match.group(1)
+            replace_code = match.group(2)
+            
+            original_content = safe_path.read_text(encoding="utf-8")
+            
+            # Đảm bảo khối SEARCH tồn tại khớp chính xác trong tệp
+            if search_code not in original_content:
+                return (
+                    f"Lỗi: Không tìm thấy phân đoạn mã SEARCH được chỉ định trong tệp '{file_path}'.\n"
+                    "Hãy chắc chắn rằng bạn đã copy chính xác từng khoảng trắng, thụt lề dòng (indentation), "
+                    "và ký tự xuống dòng từ nội dung gốc của tệp."
+                )
+                
+            # Thay thế cục bộ (Chỉ thay thế khớp đầu tiên để đảm bảo tính toàn vẹn)
+            new_content = original_content.replace(search_code, replace_code, 1)
+            safe_path.write_text(new_content, encoding="utf-8")
+            
+            return f"Thành công: Đã áp dụng bản vá Search-and-Replace cho tệp '{file_path}'."
+            
+        except Exception as e:
+            return f"Lỗi xảy ra khi áp dụng bản vá cục bộ: {str(e)}"
 
     def list_directory(self, sub_dir: str = ".") -> str:
         try:

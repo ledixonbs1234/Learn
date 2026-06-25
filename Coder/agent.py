@@ -3,7 +3,7 @@ import re
 import subprocess
 import fnmatch
 from pathlib import Path
-from typing import List, Dict, Any, Literal, Sequence, TypedDict, Annotated
+from typing import List, Dict, Any, Literal, Sequence, TypedDict, Annotated, Union
 
 from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
@@ -156,16 +156,33 @@ class WorkspaceTools:
     def __init__(self, workspace_path: str):
         self.workspace = Path(workspace_path).resolve()
 
-    def read_file(self, file_path: str) -> str:
-        try:
-            safe_path = sanitize_and_resolve_path(str(self.workspace), file_path, create_parent=False)
-            if not safe_path.exists():
-                return f"Lỗi: Tệp tin '{file_path}' không tồn tại trong workspace."
-            if safe_path.is_dir():
-                return f"Lỗi: '{file_path}' là một thư mục, không thể đọc như một tệp tin thông thường."
-            return safe_path.read_text(encoding="utf-8")
-        except Exception as e:
-            return f"Lỗi đọc tệp: {str(e)}"
+    def read_files(self, file_paths: Union[str, List[str]]) -> str:
+        """
+        Đọc nội dung của một hoặc nhiều tệp tin trong workspace cùng lúc.
+        """
+        # Chuẩn hóa đầu vào thành danh sách nếu người dùng truyền một chuỗi đơn lẻ
+        paths = [file_paths] if isinstance(file_paths, str) else file_paths
+        
+        if not paths:
+            return "Lỗi: Danh sách đường dẫn tệp tin trống."
+            
+        results = []
+        for path in paths:
+            try:
+                safe_path = sanitize_and_resolve_path(str(self.workspace), path, create_parent=False)
+                if not safe_path.exists():
+                    results.append(f"--- THẤT BẠI: '{path}' (Tệp không tồn tại) ---")
+                    continue
+                if safe_path.is_dir():
+                    results.append(f"--- THẤT BẠI: '{path}' (Đường dẫn được chỉ định là thư mục) ---")
+                    continue
+                
+                content = safe_path.read_text(encoding="utf-8")
+                results.append(f"=== BẮT ĐẦU NỘI DUNG TỆP: {path} ===\n{content}\n=== KẾT THÚC NỘI DUNG TỆP: {path} ===")
+            except Exception as e:
+                results.append(f"--- THẤT BẠI: '{path}' (Lỗi đọc tệp: {str(e)}) ---")
+                
+        return "\n\n".join(results)
 
     def write_file(self, file_path: str, content: str) -> str:
         try:
@@ -224,8 +241,10 @@ class WorkspaceTools:
 
 
 # Định nghĩa schemas phục vụ Tool Calling cho LLM
-class ReadFileSchema(BaseModel):
-    file_path: str = Field(description="Đường dẫn tương đối của tệp tin trong workspace cần đọc.")
+class ReadFilesSchema(BaseModel):
+    file_paths: Union[str, List[str]] = Field(
+        description="Đường dẫn tương đối hoặc danh sách các đường dẫn tương đối của các tệp tin trong workspace cần đọc."
+    )
 
 class WriteFileSchema(BaseModel):
     file_path: str = Field(description="Đường dẫn tương đối của tệp tin trong workspace cần ghi hoặc cập nhật.")
@@ -367,10 +386,10 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
     tools_mgr = WorkspaceTools(ws)
     
     # Khai báo các công cụ cục bộ tương tác động dựa trên thư mục hiện tại của Thread
-    @tool(args_schema=ReadFileSchema)
-    def read_file(file_path: str) -> str:
-        """Đọc nội dung của một tệp tin bất kỳ trong workspace."""
-        return tools_mgr.read_file(file_path)
+    @tool(args_schema=ReadFilesSchema)
+    def read_files(file_paths: Union[str, List[str]]) -> str:
+        """Đọc nội dung của một hoặc nhiều tệp tin bất kỳ trong workspace cùng lúc."""
+        return tools_mgr.read_files(file_paths)
 
     @tool(args_schema=WriteFileSchema)
     def write_file(file_path: str, content: str) -> str:
@@ -383,7 +402,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         return tools_mgr.list_directory(sub_dir)
     
     # Liên kết các công cụ với mô hình ngôn ngữ lớn
-    tools = [read_file, write_file, list_directory]
+    tools = [read_files, write_file, list_directory]
     model_with_tools = model.bind_tools(tools)
     
     # Thiết lập chuỗi hội thoại ReAct nhỏ bên trong node để thực thi bước hiện tại
@@ -391,8 +410,9 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         "Bạn là một kỹ sư phần mềm thực thi chuyên nghiệp.\n"
         f"Nhiệm vụ: Bạn đang thực hiện bước {current_idx + 1}/{len(steps)}: '{current_step}'.\n"
         f"Thư mục làm việc (Workspace): {ws}\n"
-        "Hãy sử dụng các công cụ được cung cấp (`read_file`, `write_file`, `list_directory`) để đọc tệp, tìm hiểu cấu trúc và chỉnh sửa mã nguồn cho phù hợp.\n"
-        "Khuyên dùng: Nếu muốn sửa đổi tệp tin đã có, hãy đọc nội dung tệp tin đó trước để hiểu ngữ cảnh. "
+        "Hãy sử dụng các công cụ được cung cấp (`read_files`, `write_file`, `list_directory`) để đọc tệp, tìm hiểu cấu trúc và chỉnh sửa mã nguồn cho phù hợp.\n"
+        "Khuyên dùng: Khi cần đọc thông tin của nhiều tệp, hãy truyền một danh sách các đường dẫn vào công cụ 'read_files' "
+        "để đọc đồng thời, tối ưu hóa lượt gọi và giữ cấu trúc hệ thống gọn gàng. "
         "Khi đã hoàn thành bước này, hãy tổng hợp phản hồi rõ ràng về các hành động bạn đã thực hiện."
     )
     
@@ -416,8 +436,8 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             tool_args = tool_call["args"]
             
             # Thực thi công cụ thực tế
-            if tool_name == "read_file":
-                result = read_file.invoke(tool_args)
+            if tool_name == "read_files":
+                result = read_files.invoke(tool_args)
             elif tool_name == "write_file":
                 result = write_file.invoke(tool_args)
                 try:

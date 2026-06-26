@@ -5,7 +5,7 @@ import re  # <--- THÊM IMPORT THƯ VIỆN RE Ở ĐẦU FILE
 from pathlib import Path
 from typing import List, Union, Type
 from pydantic import BaseModel, Field
-from langchain_core.tools import BaseTool
+from langchain_core.tools import BaseTool, tool
 from config import GitIgnoreMatcher, sanitize_and_resolve_path
 
 # ==========================================
@@ -334,3 +334,50 @@ class WorkspaceTools:
             return f"Lỗi: Lệnh bị buộc dừng do vượt quá thời gian chờ (timeout) {timeout} giây."
         except Exception as e:
             return f"Lỗi thực thi lệnh terminal: {str(e)}"
+        
+        
+@tool
+def get_current_working_directory() -> str:
+    """Trả về đường dẫn thư mục làm việc hiện tại (Current Working Directory - CWD) của tiến trình đang chạy Agent."""
+    return str(Path.cwd().resolve())
+
+
+@tool
+def check_path_exists(path_str: str) -> str:
+    """Kiểm tra xem một đường dẫn cụ thể trên máy tính có tồn tại không và trả về đường dẫn tuyệt đối đã được chuẩn hóa (bao gồm cả việc dịch dấu ~)."""
+    try:
+        p = Path(path_str).expanduser().resolve()
+        exists = p.exists()
+        is_dir = p.is_dir() if exists else False
+        return json.dumps({
+            "exists": exists,
+            "is_directory": is_dir,
+            "resolved_absolute_path": str(p) if exists else None
+        }, ensure_ascii=False)
+    except Exception as e:
+        return f"Lỗi kiểm tra đường dẫn: {str(e)}"
+
+
+@tool
+def find_project_root(start_path: str) -> str:
+    """Tìm kiếm ngược lên trên (upwards) từ một đường dẫn bắt đầu để tìm kiếm các tệp tin đánh dấu gốc dự án như '.git', 'package.json', 'pyproject.toml', 'requirements.txt', 'THONGTIN.md'."""
+    try:
+        current = Path(start_path).expanduser().resolve()
+        markers = [".git", "package.json", "pyproject.toml", "requirements.txt", "THONGTIN.md", "main.py"]
+        
+        # Quét ngược lên tối đa 5 cấp thư mục cha để tìm thư mục gốc thực sự của dự án
+        for _ in range(5):
+            for marker in markers:
+                if (current / marker).exists():
+                    return json.dumps({
+                        "found": True,
+                        "project_root": str(current),
+                        "matched_marker": marker
+                    }, ensure_ascii=False)
+            if current.parent == current:
+                break
+            current = current.parent
+            
+        return json.dumps({"found": False, "message": "Không tìm thấy file đánh dấu dự án nào ở các thư mục cha."}, ensure_ascii=False)
+    except Exception as e:
+        return f"Lỗi tìm kiếm dự án gốc: {str(e)}"

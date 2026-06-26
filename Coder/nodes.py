@@ -11,7 +11,7 @@ from state import AgentState, WorkspaceDetection, TaskPlan, TaskTriage, Task
 from tools import (
     GitManager, WorkspaceTools, 
     ReadFilesTool, WriteFileTool, ApplyPatchTool, 
-    ListDirectoryTool, RunTerminalTool
+    ListDirectoryTool, RunTerminalTool, check_path_exists, find_project_root, get_current_working_directory
 )
 
 # Hàm tiện ích nội bộ để lọc các task đủ điều kiện thực thi (DAG)
@@ -38,34 +38,97 @@ def get_eligible_tasks(plan: List[Any]) -> List[Any]:
 
 
 def detect_workspace_node(state: AgentState) -> Dict[str, Any]:
+    # 1. Nếu state đã có sẵn workspace được định nghĩa trước, sử dụng luôn
     if state.get("workspace_path"):
-        resolved_ws = str(Path(state["workspace_path"]).resolve())
+        resolved_ws = str(Path(state["workspace_path"]).expanduser().resolve())
         return {
             "workspace_path": resolved_ws,
-            "messages": [AIMessage(content=f"Sử dụng workspace sẵn có: `{resolved_ws}`")]
+            "messages": [AIMessage(content=f"Sử dụng workspace cấu hình sẵn: `{resolved_ws}`")]
         }
 
-    messages = state["messages"]
+    # 2. Tìm tin nhắn gần nhất của người dùng
     user_msg = None
-    for msg in reversed(messages):
+    for msg in reversed(state["messages"]):
         if isinstance(msg, HumanMessage) or getattr(msg, "type", None) == "human":
             user_msg = msg
             break
             
     if not user_msg:
-        user_msg = messages[-1]
+        user_msg = state["messages"][-1]
 
-    last_message = user_msg.content
-    structured_llm = model.with_structured_output(WorkspaceDetection, method="function_calling")
-    detected = structured_llm.invoke([
-        {"role": "system", "content": "Trích xuất đường dẫn thư mục dự án cần xử lý từ yêu cầu người dùng."},
-        {"role": "user", "content": last_message}
-    ])
-    raw_ws = getattr(detected, "workspace_path", ".")
-    resolved_ws = str(Path(raw_ws).resolve())
+    # 3. Chuẩn bị danh sách công cụ dò tìm và cấu trúc đầu ra kết thúc (WorkspaceDetection)
+    discovery_tools = [get_current_working_directory, check_path_exists, find_project_root]
+    
+    # Ràng buộc cả công cụ dò tìm và mô hình Pydantic đầu ra vào LLM
+    model_with_tools = model.bind_tools(discovery_tools + [WorkspaceDetection])
+    
+    system_prompt = (
+        "Bạn là một Agent chuyên nghiệp chịu trách nhiệm dò tìm và thiết lập thư mục làm việc (Workspace) chính xác trên máy tính.\n"
+        "Nhiệm vụ của bạn là phân tích yêu cầu của người dùng để xác định thư mục họ muốn xử lý.\n\n"
+        "⚠️ QUY TẮC TUÂN THỦ THỰC TẾ (CHỐNG ĐOÁN MÒ):\n"
+        "1. Bạn TUYỆT ĐỐI KHÔNG ĐƯỢC tự ý đoán mò đường dẫn. Hãy sử dụng các công cụ được cung cấp để khảo sát hệ thống.\n"
+        "2. Đầu tiên, hãy gọi `get_current_working_directory` để biết máy chủ của bạn đang chạy ở thư mục nào.\n"
+        "3. Nếu người dùng nhắc tới một đường dẫn (ví dụ: 'Desktop', '~/Desktop', 'my-project'), hãy gọi `check_path_exists` để kiểm tra xem nó có tồn tại vật lý và đường dẫn tuyệt đối của nó là gì.\n"
+        "4. Nếu người dùng muốn làm việc với dự án hiện hành, hãy gọi `find_project_root` để tìm đúng thư mục gốc chứa các tệp cấu hình của dự án.\n"
+        "5. Sau khi đã xác minh chắc chắn đường dẫn tồn tại vật lý, hãy gọi công cụ `WorkspaceDetection` với đường dẫn tuyệt đối đã được xác minh đó để hoàn tất nhiệm vụ."
+    )
+    
+    local_history = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_msg.content)
+    ]
+    
+    # Vòng lặp tối đa 5 bước để LLM dò tìm thực tế
+    max_steps = 5
+    for _ in range(max_steps):
+        response = model_with_tools.invoke(local_history)
+        local_history.append(response)
+        
+        # Nếu LLM trả lời trực tiếp mà không gọi công cụ nào, thoát vòng lặp
+        if not response.tool_calls:
+            break
+            
+        # Kiểm tra xem LLM đã gọi công cụ "WorkspaceDetection" (đã ra quyết định cuối) chưa
+        finish_call = None
+        for tool_call in response.tool_calls:
+            if tool_call["name"] == "WorkspaceDetection":
+                finish_call = tool_call
+                break
+                
+        if finish_call:
+            # LLM đã tìm ra và kiểm chứng đường dẫn thành công
+            raw_detected_path = finish_call["args"].get("workspace_path", ".")
+            final_ws = str(Path(raw_detected_path).expanduser().resolve())
+            return {
+                "workspace_path": final_ws,
+                "messages": [AIMessage(content=f"🔍 Hệ thống đã xác minh thực tế và thiết lập workspace tại: `{final_ws}`")]
+            }
+            
+        # Nếu LLM gọi các công cụ khảo sát hệ thống khác, chúng ta thực thi ngay lập tức
+        tool_messages = []
+        for tool_call in response.tool_calls:
+            tool_name = tool_call["name"]
+            tool_args = tool_call["args"]
+            tool_id = tool_call["id"]
+            
+            if tool_name == "get_current_working_directory":
+                result = get_current_working_directory.invoke(tool_args)
+            elif tool_name == "check_path_exists":
+                result = check_path_exists.invoke(tool_args)
+            elif tool_name == "find_project_root":
+                result = find_project_root.invoke(tool_args)
+            else:
+                result = f"Lỗi: Không tìm thấy công cụ khảo sát '{tool_name}'."
+                
+            tool_messages.append(ToolMessage(content=str(result), name=tool_name, tool_call_id=tool_id))
+            
+        local_history.extend(tool_messages)
+        
+    # Luồng dự phòng an toàn (Fallback) nếu vòng lặp bị lỗi hoặc LLM không chịu đưa ra quyết định
+    fallback_ws = str(Path(".").resolve())
     return {
-        "workspace_path": resolved_ws,
-        "messages": [AIMessage(content=f"Đã phát hiện và thiết lập workspace tại: `{resolved_ws}`")]
+        "workspace_path": fallback_ws,
+        "messages": [AIMessage(content=f"⚠️ Không thể dò tìm tự động bằng công cụ. Thiết lập workspace dự phòng tại: `{fallback_ws}`")]
     }
 
 
@@ -251,7 +314,9 @@ def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
     
     read_files = ReadFilesTool(workspace_path=ws)
     list_directory = ListDirectoryTool(workspace_path=ws)
-    tools = [read_files, list_directory]
+    terminal = RunTerminalTool(workspace_path=ws)
+
+    tools = [read_files, list_directory,terminal]
     model_with_tools = model.bind_tools(tools)
     
     previous_findings_str = ""
@@ -269,6 +334,7 @@ def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
         
     system_prompt += (
         "\nHãy sử dụng các công cụ `read_files` và `list_directory` để đọc hiểu cấu trúc hệ thống.\n"
+        "\n Nếu cần thêm thông tin mà 2 công cụ trên không hỗ trợ hãy dùng run_terminal_command \n"
         "YÊU CẦU QUAN TRỌNG:\n"
         "- Bạn chỉ có quyền ĐỌC dữ liệu, tuyệt đối không chỉnh sửa mã nguồn hoặc tự ý tạo tệp tin trong bước này.\n"
         "- Trình bày chi tiết, chuyên nghiệp về kết quả phát hiện được của bạn ở tin nhắn phản hồi cuối cùng.\n"

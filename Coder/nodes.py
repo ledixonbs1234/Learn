@@ -71,12 +71,29 @@ def detect_workspace_node(state: AgentState) -> Dict[str, Any]:
 
 def git_setup_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
-    git_manager = GitManager(ws)
-    branch = git_manager.init_and_prepare_branch()
-    return {
-        "git_branch": branch,
-        "messages": [AIMessage(content=f"Đã cấu hình nhánh Git hoạt động: `{branch}`")]
-    }
+    
+    # Kiểm tra xem có thư mục .git trong workspace hay không
+    git_dir = Path(ws) / ".git"
+    if not git_dir.exists():
+        # Nếu chưa có Git, thiết lập nhánh là "no_git" và bỏ qua toàn bộ việc thiết lập
+        return {
+            "git_branch": "no_git",
+            "messages": [AIMessage(content="ℹ️ Không phát hiện Git repository trong workspace này. Hệ thống sẽ bỏ qua các bước quản lý phiên bản (Git).")]
+        }
+
+    try:
+        git_manager = GitManager(ws)
+        branch = git_manager.init_and_prepare_branch()
+        return {
+            "git_branch": branch,
+            "messages": [AIMessage(content=f"Đã cấu hình nhánh Git hoạt động: `{branch}`")]
+        }
+    except Exception as e:
+        # Cơ chế fallback nếu có lỗi bất ngờ xảy ra khi tương tác với Git
+        return {
+            "git_branch": "no_git",
+            "messages": [AIMessage(content=f"⚠️ Có lỗi xảy ra với Git ({str(e)}). Chuyển sang chế độ không dùng Git.")]
+        }
 
 
 def context_loader_node(state: AgentState) -> Dict[str, Any]:
@@ -542,12 +559,15 @@ def synthesis_node(state: AgentState) -> Dict[str, Any]:
             tools_mgr = WorkspaceTools(ws)
             tools_mgr.write_file("THONGTIN.md", cleaned_md)
             
-            git_manager = GitManager(ws)
-            git_manager._run_cmd(["git", "add", "THONGTIN.md"], ignore_error=True)
+            # CHỈ CHẠY LỆNH GIT KHI WORKSPACE CÓ SỬ DỤNG GIT
+            git_branch = state.get("git_branch", "no_git")
+            if git_branch != "no_git":
+                git_manager = GitManager(ws)
+                git_manager._run_cmd(["git", "add", "THONGTIN.md"], ignore_error=True)
             
             return {
                 "workspace_context": cleaned_md,
-                "messages": [AIMessage(content="**Tổng hợp tài liệu hoàn tất:** Hệ thống đã thu thập tri thức của toàn bộ các bước khảo sát tuần tự và biên dịch thành tệp `THONGTIN.md` thành công tại thư mục gốc của dự án.")]
+                "messages": [AIMessage(content="**Tổng hợp tài liệu hoàn tất:** Hệ thống đã biên dịch thành tệp `THONGTIN.md` thành công tại thư mục gốc của dự án.")]
             }
     except Exception as e:
         return {
@@ -559,11 +579,18 @@ def synthesis_node(state: AgentState) -> Dict[str, Any]:
 def commit_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
     task_type = state.get("task_type", "development")
-    git_manager = GitManager(ws)
-    plan = state["plan"]
+    git_branch = state.get("git_branch", "no_git")
     
+    # Nếu đang ở chế độ không dùng Git, bỏ qua và báo cáo kết quả
+    if git_branch == "no_git":
+        return {
+            "messages": [AIMessage(content="Đã hoàn thành toàn bộ yêu cầu của bạn. Chế độ Không-Git được kích hoạt, các thay đổi vật lý đã được lưu trực tiếp xuống đĩa.")]
+        }
+        
+    git_manager = GitManager(ws)
     status = git_manager._run_cmd(["git", "status", "--porcelain"], ignore_error=True)
     
+    plan = state["plan"]
     plan_steps_str = "\n".join([
         f"- [{getattr(t, 'id', None) or t.get('id')}] {getattr(t, 'description', None) or t.get('description')} ({getattr(t, 'status', None) or t.get('status')})"
         for t in plan
@@ -572,7 +599,7 @@ def commit_node(state: AgentState) -> Dict[str, Any]:
     if status and not status.startswith("ERROR"):
         commit_msg = f"feat(ai): automatic execution ({task_type}) \n\nSteps:\n{plan_steps_str}"
         git_manager.commit_changes(commit_msg)
-        msg = f"Đã hoàn thành yêu cầu và commit các thay đổi lên nhánh `{state['git_branch']}`."
+        msg = f"Đã hoàn thành yêu cầu và commit các thay đổi lên nhánh `{git_branch}`."
     else:
         msg = "Đã hoàn thành quy trình công việc. Không có thay đổi tệp tin vật lý nào cần commit lên Git."
         

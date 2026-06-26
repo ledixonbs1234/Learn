@@ -10,9 +10,15 @@ from langgraph.graph.message import add_messages
 class WorkspaceDetection(BaseModel):
     workspace_path: str = Field(description="Đường dẫn của workspace chứa dự án.")
 
+class Task(BaseModel):
+    id: str = Field(description="Mã định danh duy nhất cho nhiệm vụ, ví dụ: 'T1', 'T2'")
+    description: str = Field(description="Mô tả chi tiết hành động cần thực hiện")
+    dependencies: List[str] = Field(default=[], description="Danh sách ID các nhiệm vụ cần hoàn thành trước khi bắt đầu nhiệm vụ này, ví dụ: ['T1']")
+    status: Literal["pending", "completed"] = Field(default="pending", description="Trạng thái thực thi nhiệm vụ")
+
 class TaskPlan(BaseModel):
-    steps: List[str] = Field(description="Các bước thực hiện tuần tự để giải quyết yêu cầu.")
-    explanation: str = Field(description="Mô tả chiến lược thực hiện nhiệm vụ.")
+    tasks: List[Task] = Field(description="Danh sách các nhiệm vụ có thiết lập quan hệ phụ thuộc lẫn nhau (DAG).")
+    explanation: str = Field(description="Mô tả chiến lược thực hiện nhiệm vụ và cách xử lý tuần tự/song song.")
     task_type: Literal["analysis", "development"] = Field(
         description="Phân loại yêu cầu: 'analysis' nếu chỉ đọc/khảo sát/báo cáo thông tin, 'development' nếu có viết/sửa/nâng cấp mã nguồn."
     )
@@ -41,12 +47,12 @@ def reduce_findings(left: Union[List[str], None], right: Union[List[str], None])
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
     workspace_path: str
-    workspace_context: str  # <--- THÊM: Lưu trữ nội dung file THONGTIN.md
-    plan: List[str]
+    workspace_context: str  
+    plan: List[Task]                      # <--- THAY ĐỔI: Chuyển sang lưu trữ danh sách Task (DAG)
     task_type: Literal["analysis", "development"]
-    current_step_idx: int
     git_branch: str
     error_logs: str
     modified_files: List[str]
     attempts: int
     step_findings: Annotated[List[str], reduce_findings]
+    last_executed_task_ids: List[str]     # <--- THÊM MỚI: Theo dõi vết các task vừa chạy để phục vụ rollback khi test lỗi

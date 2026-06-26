@@ -1,4 +1,5 @@
 # tools.py
+import json
 import subprocess
 import re  # <--- THÊM IMPORT THƯ VIỆN RE Ở ĐẦU FILE
 from pathlib import Path
@@ -114,14 +115,9 @@ class GitManager:
     def init_and_prepare_branch(self) -> str:
         git_dir = self.workspace / ".git"
         if not git_dir.exists():
-            self._run_cmd(["git", "init"])
-            self._run_cmd(["git", "config", "user.name", "AI-Agent"])
-            self._run_cmd(["git", "config", "user.email", "ai-agent@production.local"])
-            try:
-                self._run_cmd(["git", "add", "."])
-                self._run_cmd(["git", "commit", "-m", "Initial commit from Agent Workspace Setup"])
-            except Exception:
-                pass
+            # Thay vì tự ý chạy "git init", chúng ta ném ra lỗi để cảnh báo
+            # (Node xử lý phía trên sẽ bắt điều kiện này trước khi gọi hàm)
+            raise RuntimeError("Thư mục hiện tại không phải là một Git repository.")
             
         branch_name = "ai-development"
         branches_str = self._run_cmd(["git", "branch"], ignore_error=True)
@@ -144,10 +140,66 @@ class WorkspaceTools:
     def __init__(self, workspace_path: str):
         self.workspace = Path(workspace_path).resolve()
 
+    def _normalize_file_paths(self, file_paths: Union[str, List[str]]) -> List[str]:
+        """Chuẩn hóa mọi dạng đầu vào từ LLM (chuỗi JSON, chuỗi thô, list) về List[str] sạch sẽ."""
+        if not file_paths:
+            return []
+            
+        # 1. Nếu đã là một List thực sự
+        if isinstance(file_paths, list):
+            cleaned = []
+            for p in file_paths:
+                if isinstance(p, str):
+                    # Gọi đệ quy đề phòng trường hợp phần tử bên trong list vẫn bị bọc chuỗi JSON
+                    cleaned.extend(self._normalize_file_paths(p))
+            return cleaned
+            
+        # 2. Nếu đầu vào là một String
+        if isinstance(file_paths, str):
+            raw_str = file_paths.strip()
+            
+            # Kiểm tra nếu chuỗi trông giống như một JSON Array (bắt đầu bằng [ và kết thúc bằng ])
+            if raw_str.startswith('[') and raw_str.endswith(']'):
+                try:
+                    # Thử giải mã JSON
+                    parsed = json.loads(raw_str)
+                    if isinstance(parsed, list):
+                        return [str(p).strip() for p in parsed if p]
+                except json.JSONDecodeError:
+                    pass
+                
+                # Nếu không phải JSON hợp lệ (ví dụ: [lib/main.dart, lib/routes.dart] không có dấu nháy)
+                # Tiến hành cắt bỏ cặp ngoặc [] và tách thủ công bằng dấu phẩy
+                inner = raw_str[1:-1].strip()
+                if inner:
+                    parts = []
+                    for part in inner.split(','):
+                        part_clean = part.strip().strip('"').strip("'").strip()
+                        if part_clean:
+                            parts.append(part_clean)
+                    return parts
+            
+            # Kiểm tra nếu chuỗi chứa dấu phẩy phân cách mà không phải cấu trúc JSON
+            if ',' in raw_str and not raw_str.startswith('{'):
+                parts = []
+                for part in raw_str.split(','):
+                    part_clean = part.strip().strip('"').strip("'").strip()
+                    if part_clean:
+                        parts.append(part_clean)
+                return parts
+            
+            # Xử lý trường hợp chuỗi đơn bị bọc nháy kép hoặc nháy đơn dư thừa từ LLM
+            cleaned_path = raw_str.strip('"').strip("'").strip()
+            if cleaned_path:
+                return [cleaned_path]
+                
+        return []
+
     def read_files(self, file_paths: Union[str, List[str]]) -> str:
-        paths = [file_paths] if isinstance(file_paths, str) else file_paths
+        # Sử dụng hàm chuẩn hoá đầu vào mới được thiết kế
+        paths = self._normalize_file_paths(file_paths)
         if not paths:
-            return "Lỗi: Danh sách đường dẫn tệp tin trống."
+            return "Lỗi: Danh sách đường dẫn tệp tin trống hoặc không thể phân tích định dạng."
             
         results = []
         for path in paths:

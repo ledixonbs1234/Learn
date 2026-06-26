@@ -7,12 +7,35 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langchain_core.tools import tool
 
 from config import model, sanitize_and_resolve_path
-from state import AgentState, WorkspaceDetection, TaskPlan, TaskTriage
+from state import AgentState, WorkspaceDetection, TaskPlan, TaskTriage, Task
 from tools import (
     GitManager, WorkspaceTools, 
     ReadFilesTool, WriteFileTool, ApplyPatchTool, 
     ListDirectoryTool, RunTerminalTool
 )
+
+# Hàm tiện ích nội bộ để lọc các task đủ điều kiện thực thi (DAG)
+def get_eligible_tasks(plan: List[Any]) -> List[Any]:
+    completed_ids = set()
+    for t in plan:
+        # Kiểm tra kiểu dữ liệu một cách minh bạch
+        t_id = t.get("id") if isinstance(t, dict) else getattr(t, "id", None)
+        t_status = t.get("status") if isinstance(t, dict) else getattr(t, "status", None)
+        
+        if t_status == "completed":
+            completed_ids.add(t_id)
+            
+    eligible = []
+    for t in plan:
+        t_status = t.get("status") if isinstance(t, dict) else getattr(t, "status", None)
+        # Sử dụng toán tử ternary thay vì toán tử 'or' để tránh Falsy trap của danh sách rỗng []
+        t_deps = t.get("dependencies", []) if isinstance(t, dict) else (getattr(t, "dependencies", None) or [])
+        
+        if t_status == "pending":
+            if all(dep in completed_ids for dep in t_deps):
+                eligible.append(t)
+    return eligible
+
 
 def detect_workspace_node(state: AgentState) -> Dict[str, Any]:
     if state.get("workspace_path"):
@@ -100,19 +123,25 @@ def context_loader_node(state: AgentState) -> Dict[str, Any]:
         is_simple = False
         task_type = "development"
         
-    plan_steps = []
+    plan_tasks = []
     messages_to_append = []
     
     if is_simple:
-        plan_steps = [f"Xử lý trực tiếp yêu cầu của người dùng: {user_query}"]
+        plan_tasks = [Task(
+            id="T1", 
+            description=f"Xử lý trực tiếp yêu cầu của người dùng: {user_query}", 
+            dependencies=[], 
+            status="pending"
+        )]
         messages_to_append.append(AIMessage(content=f"📋 Đã tải ngữ cảnh `THONGTIN.md`. Kích hoạt chế độ **Fast-Track (Nhiệm vụ đơn giản)**. Bỏ qua bước lập kế hoạch chi tiết."))
     else:
         messages_to_append.append(AIMessage(content="📋 Đã tải ngữ cảnh `THONGTIN.md`. Nhận diện tác vụ phức tạp, chuyển tiếp tới Planner để thiết kế kế hoạch."))
         
     return {
         "workspace_context": workspace_context,
-        "plan": plan_steps,
+        "plan": plan_tasks,
         "task_type": task_type,
+        "last_executed_task_ids": [],
         "messages": messages_to_append
     }
 
@@ -125,10 +154,10 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
     
     if existing_plan:
         return {
-            "current_step_idx": 0,
             "modified_files": [],
             "attempts": 0,
             "step_findings": ["__RESET__"],
+            "last_executed_task_ids": []
         }
     
     structured_llm = model.with_structured_output(TaskPlan, method="function_calling")
@@ -141,10 +170,16 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
         system_prompt += f"\n--- NGỮ CẢNH HỆ THỐNG HIỆN TẠI (THONGTIN.md) ---\n{workspace_context}\n"
         
     system_prompt += (
-        "Hãy phân tích kỹ lưỡng toàn bộ lịch sử trò chuyện của người dùng để sinh ra kế hoạch hành động tiếp theo thích hợp nhất.\n"
-        "Đặc biệt lưu ý phân loại trường `task_type` chính xác:\n"
-        "- Chọn 'analysis' nếu yêu cầu chỉ là đọc, khảo sát cấu trúc dự án hoặc viết báo cáo.\n"
-        "- Chọn 'development' nếu yêu cầu có can thiệp sửa đổi, cập nhật hoặc viết mới mã nguồn."
+        "Hãy phân tích kỹ lưỡng toàn bộ lịch sử trò chuyện để sinh ra kế hoạch dạng Đồ thị phụ thuộc (DAG).\n"
+        "QUY TẮC QUAN TRỌNG VỀ PHỤ THUỘC (DEPENDENCIES):\n"
+        "- Thiết lập `dependencies` của từng nhiệm vụ chính xác để cho phép chạy song song (nếu không liên quan) hoặc nối tiếp (nếu cần sự liên tục).\n"
+        "  Ví dụ:\n"
+        "  + Nhiệm vụ T1 (không có dep) và T5 (không có dep) có thể chạy song song.\n"
+        "  + Nhiệm vụ T2 phụ thuộc T1 (dependencies=['T1']) -> phải chạy T1 trước.\n"
+        "⚠️ LƯU Ý ĐẶC BIỆT QUAN TRỌNG ĐỂ TRÁNH TRÙNG LẶP (BẮT BUỘC):\n"
+        "- Tuyệt đối KHÔNG đưa bước 'Tổng hợp và báo cáo' hoặc 'Viết tệp THONGTIN.md' làm nhiệm vụ cuối cùng trong kế hoạch!\n"
+        "- Lý do: Hệ thống đã thiết kế một node chuyên biệt 'synthesis_node' độc lập để tự động làm việc này ở cuối đồ thị.\n"
+        "Kế hoạch của bạn chỉ tập trung hoàn toàn vào các bước thực thi khảo sát vật lý (analysis) hoặc sửa đổi mã nguồn (development)."
     )
     
     plan_output = structured_llm.invoke([
@@ -152,33 +187,50 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
         *conversation_history
     ])
     
-    plan_steps = getattr(plan_output, "steps", [])
+    plan_tasks = getattr(plan_output, "tasks", [])
     task_type = getattr(plan_output, "task_type", "development")
     
+    plan_str = "\n".join([
+        f"- [{t.id}] {t.description} (Phụ thuộc: {t.dependencies if t.dependencies else 'Không'})" 
+        for t in plan_tasks
+    ])
+    
     return {
-        "plan": plan_steps,
+        "plan": plan_tasks,
         "task_type": task_type,
-        "current_step_idx": 0,
         "modified_files": [],
         "attempts": 0,
         "step_findings": ["__RESET__"],
-        "messages": [AIMessage(content=f"Đã lập kế hoạch hành động (Loại: {task_type.upper()}):\n" + "\n".join([f"- {s}" for s in plan_steps]))]
+        "last_executed_task_ids": [],
+        "messages": [AIMessage(content=f"Đã lập kế hoạch hành động dạng đồ thị phụ thuộc (Loại: {task_type.upper()}):\n{plan_str}")]
     }
 
 
 def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
-    steps = state["plan"]
-    current_idx = state["current_step_idx"]
+    plan = state["plan"]
     workspace_context = state.get("workspace_context", "")
     messages = list(state["messages"])
     
-    if current_idx >= len(steps):
-         return {
-             "messages": [AIMessage(content="Đã hoàn thành khảo sát toàn bộ các bước.")]
-         }
+    # 1. Tìm các task đủ điều kiện chạy song song/tuần tự dựa trên dependencies
+    eligible_tasks = get_eligible_tasks(plan)
+    if not eligible_tasks:
+        pending_tasks = [
+            t for t in plan 
+            if (t.get("status") if isinstance(t, dict) else getattr(t, "status", None)) == "pending"
+        ]
+        if pending_tasks:
+            # Cơ chế an toàn giải quyết deadlock nếu có cấu hình dependencies lỗi từ LLM
+            eligible_tasks = [pending_tasks[0]]
+        else:
+            return {
+                "messages": [AIMessage(content="Đã hoàn thành khảo sát toàn bộ các bước.")]
+            }
          
-    current_step = steps[current_idx]
+    tasks_str = "\n".join([
+        f"- [{getattr(t, 'id', None) or t.get('id')}] {getattr(t, 'description', None) or t.get('description')}"
+        for t in eligible_tasks
+    ])
     
     read_files = ReadFilesTool(workspace_path=ws)
     list_directory = ListDirectoryTool(workspace_path=ws)
@@ -192,7 +244,7 @@ def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
     
     system_prompt = (
         "Bạn là một kiến trúc sư chuyên khảo sát, đọc hiểu và phân tích cấu trúc mã nguồn (Read-Only Mode).\n"
-        f"Nhiệm vụ: Bạn đang thực hiện bước khảo sát {current_idx + 1}/{len(steps)}: '{current_step}'.\n"
+        f"Nhiệm vụ: Bạn đang thực hiện đồng thời các nhiệm vụ song song/tuần tự sau:\n{tasks_str}\n"
         f"Thư mục làm việc: {ws}\n"
     )
     if workspace_context:
@@ -210,14 +262,30 @@ def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
     
     response = model_with_tools.invoke([SystemMessage(content=system_prompt)] + messages)
     
-    # CHUYỂN DỊCH THỜI ĐIỂM TĂNG CHỈ MỤC: Tăng index ngay khi không còn yêu cầu gọi công cụ
+    # CHUYỂN DỊCH THỜI ĐIỂM HOÀN THÀNH: Đánh dấu hoàn thành khi không còn yêu cầu gọi công cụ
     if not response.tool_calls:
         findings = []
         if response.content:
-            findings = [f"### Khảo sát bước '{current_step}':\n{response.content}"]
+            tasks_ids = ", ".join([str(getattr(t, "id", None) or t.get("id")) for t in eligible_tasks])
+            findings = [f"### Kết quả khảo sát các nhiệm vụ ({tasks_ids}):\n{response.content}"]
+            
+        # Cập nhật trạng thái completed cho các task vừa hoàn thành trong state
+        updated_plan = []
+        eligible_ids = {t.get("id") if isinstance(t, dict) else getattr(t, "id", None) for t in eligible_tasks}
+        for t in plan:
+            if isinstance(t, dict):
+                t_copy = dict(t)
+                if t_copy["id"] in eligible_ids:
+                    t_copy["status"] = "completed"
+            else:
+                t_copy = t.model_copy()
+                if t_copy.id in eligible_ids:
+                    t_copy.status = "completed"
+            updated_plan.append(t_copy)
+            
         return {
             "messages": [response],
-            "current_step_idx": current_idx + 1,  # <--- Tăng trực tiếp tại đây
+            "plan": updated_plan,
             "step_findings": findings
         }
     else:
@@ -228,18 +296,30 @@ def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
 
 def development_executor_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
-    steps = state["plan"]
-    current_idx = state["current_step_idx"]
+    plan = state["plan"]
     error_logs = state.get("error_logs", "")
     workspace_context = state.get("workspace_context", "")
     messages = list(state["messages"])
         
-    if current_idx >= len(steps):
-         return {
-             "messages": [AIMessage(content="Đã hoàn thành toàn bộ các bước phát triển.")]
-         }
+    # 1. Tìm các task đủ điều kiện chạy song song/tuần tự dựa trên dependencies
+    eligible_tasks = get_eligible_tasks(plan)
+    if not eligible_tasks:
+        pending_tasks = [
+            t for t in plan 
+            if (t.get("status") if isinstance(t, dict) else getattr(t, "status", None)) == "pending"
+        ]
+        if pending_tasks:
+            # Cơ chế an toàn tránh deadlock
+            eligible_tasks = [pending_tasks[0]]
+        else:
+            return {
+                "messages": [AIMessage(content="Đã hoàn thành toàn bộ các bước phát triển.")]
+            }
          
-    current_step = steps[current_idx]
+    tasks_str = "\n".join([
+        f"- [{getattr(t, 'id', None) or t.get('id')}] {getattr(t, 'description', None) or t.get('description')}"
+        for t in eligible_tasks
+    ])
     
     read_files = ReadFilesTool(workspace_path=ws)
     write_file = WriteFileTool(workspace_path=ws)
@@ -252,7 +332,7 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
     
     system_prompt = (
         "Bạn là một kỹ sư phần mềm thực thi chuyên nghiệp chuyên sửa lỗi và viết mới mã nguồn (Write-Access Mode).\n"
-        f"Nhiệm vụ: Bạn đang thực hiện bước phát triển {current_idx + 1}/{len(steps)}: '{current_step}'.\n"
+        f"Nhiệm vụ: Bạn đang thực hiện đồng thời các nhiệm vụ song song/tuần tự sau:\n{tasks_str}\n"
         f"Thư mục làm việc: {ws}\n"
     )
     if workspace_context:
@@ -282,13 +362,28 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
         
     response = model_with_tools.invoke(input_messages + messages)
     
-    # CHUYỂN DỊCH THỜI ĐIỂM TĂNG CHỈ MỤC: Tăng index ngay khi không còn yêu cầu gọi công cụ
+    # CHUYỂN DỊCH THỜI ĐIỂM HOÀN THÀNH: Đóng trạng thái khi không gọi tool nữa
     if not response.tool_calls:
+        # Đánh dấu hoàn thành các task vừa thực thi
+        updated_plan = []
+        eligible_ids = {t.get("id") if isinstance(t, dict) else getattr(t, "id", None) for t in eligible_tasks}
+        for t in plan:
+            if isinstance(t, dict):
+                t_copy = dict(t)
+                if t_copy["id"] in eligible_ids:
+                    t_copy["status"] = "completed"
+            else:
+                t_copy = t.model_copy()
+                if t_copy.id in eligible_ids:
+                    t_copy.status = "completed"
+            updated_plan.append(t_copy)
+
         return {
             "messages": [response],
-            "current_step_idx": current_idx + 1,  # <--- Tăng trực tiếp tại đây
-            "attempts": 0,                        # Reset số lần thử sửa lỗi cho bước cũ
-            "error_logs": ""                      # Xóa vết log lỗi của bước cũ
+            "plan": updated_plan,
+            "last_executed_task_ids": list(eligible_ids), # Lưu lại danh sách ID để tester rollback chính xác nếu lỗi
+            "attempts": 0,                        
+            "error_logs": ""                      
         }
     else:
         return {
@@ -353,7 +448,8 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
 def tester_node(state: AgentState) -> Dict[str, Any]:
     modified_files = state.get("modified_files", [])
     attempts = state.get("attempts", 0)
-    current_idx = state["current_step_idx"]  # Đã là (idx + 1) do executor tự động tăng khi hoàn thành
+    plan = state["plan"]
+    last_executed_ids = state.get("last_executed_task_ids", [])
     errors = []
     
     for file_path in modified_files:
@@ -362,31 +458,40 @@ def tester_node(state: AgentState) -> Dict[str, Any]:
             if res.returncode != 0:
                 errors.append(f"Lỗi cú pháp tại {Path(file_path).name}:\n{res.stderr.strip()}")
                 
-        if errors:
-            combined_error = "\n".join(errors)
-            if attempts < 2:
-                # Do lỗi kiểm thử thất bại, ta kéo lùi current_step_idx về bước đang sửa lỗi (current_idx - 1)
-                # để chuẩn bị cho lượt sửa đổi tái hiện tại executor node
-                return {
-                    "error_logs": combined_error,
-                    "attempts": attempts + 1,
-                    "current_step_idx": current_idx - 1,  # <--- Đưa lùi chỉ mục về bước đang sửa lỗi
-                    "messages": [AIMessage(content=f"⚠️ Phát hiện lỗi kiểm tra tại bước {current_idx}:\n{combined_error}\nHệ thống chuẩn bị quay lại sửa lỗi.")]
-                }
-            else:
-                return {
-                    "error_logs": "",
-                    "attempts": 0,
-                    # Giữ nguyên current_idx (đã tăng sẵn) vì chúng ta chấp nhận bỏ qua lỗi và đi tiếp sang bước kế tiếp/commit
-                    "messages": [AIMessage(content=f"❌ Đã vượt quá 3 lần tự động sửa lỗi tại bước {current_idx}. Bỏ qua lỗi này để tiếp tục.")]
-                }
+    if errors:
+        combined_error = "\n".join(errors)
+        if attempts < 2:
+            # Sửa đổi quan trọng: Thay vì giảm index, ta rollback trạng thái các task vừa chạy về 'pending'
+            updated_plan = []
+            for t in plan:
+                if isinstance(t, dict):
+                    t_copy = dict(t)
+                    if t_copy["id"] in last_executed_ids:
+                        t_copy["status"] = "pending"
+                else:
+                    t_copy = t.model_copy()
+                    if t_copy.id in last_executed_ids:
+                        t_copy.status = "pending"
+                updated_plan.append(t_copy)
                 
-        return {
-            "error_logs": "",
-            "attempts": 0,
-            # Giữ nguyên current_idx (đã tăng sẵn) vì kiểm thử thành công
-            "messages": [AIMessage(content=f"✅ Bước {current_idx} đã vượt qua vòng kiểm tra thành công. Tiến hành lưu vết.")]
-        }
+            return {
+                "error_logs": combined_error,
+                "attempts": attempts + 1,
+                "plan": updated_plan,
+                "messages": [AIMessage(content=f"⚠️ Phát hiện lỗi kiểm tra tại các nhiệm vụ vừa thực thi ({', '.join(last_executed_ids)}):\n{combined_error}\nHệ thống đưa các bước này về 'pending' để chuẩn bị quay lại sửa đổi.")]
+            }
+        else:
+            return {
+                "error_logs": "",
+                "attempts": 0,
+                "messages": [AIMessage(content="❌ Đã vượt quá 3 lần tự động sửa lỗi. Bỏ qua lỗi này để tiếp tục.")]
+            }
+                
+    return {
+        "error_logs": "",
+        "attempts": 0,
+        "messages": [AIMessage(content="✅ Toàn bộ các bước phát triển vừa qua đã vượt qua vòng kiểm tra thành công.")]
+    }
 
 
 def synthesis_node(state: AgentState) -> Dict[str, Any]:
@@ -455,11 +560,17 @@ def commit_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
     task_type = state.get("task_type", "development")
     git_manager = GitManager(ws)
+    plan = state["plan"]
     
     status = git_manager._run_cmd(["git", "status", "--porcelain"], ignore_error=True)
     
+    plan_steps_str = "\n".join([
+        f"- [{getattr(t, 'id', None) or t.get('id')}] {getattr(t, 'description', None) or t.get('description')} ({getattr(t, 'status', None) or t.get('status')})"
+        for t in plan
+    ])
+    
     if status and not status.startswith("ERROR"):
-        commit_msg = f"feat(ai): automatic execution ({task_type}) \n\nSteps:\n" + "\n".join(state["plan"])
+        commit_msg = f"feat(ai): automatic execution ({task_type}) \n\nSteps:\n{plan_steps_str}"
         git_manager.commit_changes(commit_msg)
         msg = f"Đã hoàn thành yêu cầu và commit các thay đổi lên nhánh `{state['git_branch']}`."
     else:

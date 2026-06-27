@@ -138,7 +138,7 @@ class UniversalSymbolSearchTool(BaseTool):
     name: str = "search_symbols_universal"
     description: str = (
         "Quét tệp tin nguồn để trích xuất danh sách các định nghĩa Class, Hàm, Phương thức, Struct... "
-        "Đi kèm với KHOẢNG DÒNG BẮT ĐẦU VÀ KẾT THÚC chính xác tuyệt đối của từng khối mã, tên ký hiệu tinh gọn "
+        "Đi kèm với KHOẢNG DÒNG BẮT ĐẦU VÀ KẾT THÚC chính xác tuyệt đối, Chữ ký khai báo đầy đủ (bao gồm cả tham số và kiểu trả về) "
         "và mô tả chức năng được trích xuất trực tiếp từ các comments/docstrings của chúng. "
         "Hỗ trợ tất cả các ngôn ngữ phổ biến (Python, Dart, TS, JS, Go, Rust, C++, Java, C#, Swift, Kotlin)."
     )
@@ -146,21 +146,14 @@ class UniversalSymbolSearchTool(BaseTool):
     workspace_path: str
 
     def _clean_block_comments(self, content: str) -> str:
-        """
-        Xóa sạch comment khối /* ... */ đa dòng nhưng bảo toàn tuyệt đối số dòng 
-        bằng cách đếm số dòng bị xóa và bù lại bằng bấy nhiêu ký tự xuống dòng.
-        """
+        """Xóa sạch comment khối /* ... */ đa dòng nhưng bảo toàn tuyệt đối số dòng."""
         def replacer(match):
             newlines_count = match.group(0).count("\n")
             return "\n" * newlines_count
-            
         return re.sub(r"/\*.*?\*/", replacer, content, flags=re.DOTALL)
 
     def _strip_strings_and_line_comments(self, line: str, ext: str) -> str:
-        """
-        Xóa sạch comment một dòng và mọi chuỗi ký tự nằm trong ngoặc đơn/kép/template literal 
-        để loại bỏ hoàn toàn các dấu ngoặc nhọn { } gây nhiễu trong chuỗi.
-        """
+        """Xóa sạch comments và chuỗi ký tự để tránh nhiễu ngoặc nhọn."""
         if ext in [".py", ".yaml", ".yml"]:
             clean_line = re.sub(r"#.*$", "", line)
         else:
@@ -178,7 +171,6 @@ class UniversalSymbolSearchTool(BaseTool):
         end_idx = start_idx
         
         first_line_clean = self._strip_strings_and_line_comments(lines[start_idx], ext)
-        # JS/TS/Dart Arrow Function expression check (Hàm rút gọn không ngoặc nhọn)
         if "=>" in first_line_clean and "{" not in first_line_clean:
             return start_idx + 1
 
@@ -186,7 +178,6 @@ class UniversalSymbolSearchTool(BaseTool):
             line = lines[idx]
             clean_line = self._strip_strings_and_line_comments(line, ext)
             
-            # 🛡️ CHỐT CHẶN BẢO VỆ SEMICOLON: Tránh quét trôi đối với Prototype / Abstract Declarations kết thúc bằng ';'
             if ";" in clean_line and not found_first_brace:
                 return idx + 1
             
@@ -203,19 +194,15 @@ class UniversalSymbolSearchTool(BaseTool):
             
             if found_first_brace and brace_count == 0:
                 return idx + 1
-            
             end_idx = idx
             
         return end_idx + 1
 
     def _find_python_block_end(self, lines: list, start_idx: int) -> int:
-        """Thuật toán Indentation nâng cao: Nhận diện ranh giới thụt lề của Python xử lý tốt cả Multi-line Signatures."""
-        # 🛡️ ĐỊNH VỊ ĐẦU TIÊN: Tìm dòng thực sự kết thúc signature (có chứa dấu hai chấm ':')
+        """Thuật toán Indentation nâng cao: Nhận diện ranh giới thụt lề của Python."""
         sig_end_idx = start_idx
         for idx in range(start_idx, len(lines)):
-            clean_line = lines[idx].strip()
-            # Xóa tạm thời comment để tránh nhầm lẫn dấu ':' nằm trong comment
-            clean_line = clean_line.split("#", 1)[0].strip()
+            clean_line = lines[idx].strip().split("#", 1)[0].strip()
             if clean_line.endswith(":"):
                 sig_end_idx = idx
                 break
@@ -224,7 +211,6 @@ class UniversalSymbolSearchTool(BaseTool):
         start_indent = len(start_line) - len(start_line.lstrip())
         
         end_idx = sig_end_idx
-        # Quét ranh giới thụt lề từ dòng tiếp sau signature kết thúc
         for idx in range(sig_end_idx + 1, len(lines)):
             line = lines[idx]
             clean_line = line.strip()
@@ -240,64 +226,65 @@ class UniversalSymbolSearchTool(BaseTool):
             
         return end_idx + 1
 
-    def _classify_symbol(self, matched_line: str, ext: str) -> str:
-        """Phân loại ký hiệu động dựa trên từ khóa khai báo để điền cột Loại Ký Hiệu."""
-        line_lower = matched_line.lower()
-        if "class " in line_lower:
-            return "Class 📁"
-        if "interface " in line_lower:
-            return "Interface 🔌"
-        if "struct " in line_lower:
-            return "Struct 📦"
-        if "namespace " in line_lower:
-            return "Namespace 🌐"
-        if "impl " in line_lower:
-            return "Implementation 🛠️"
-        if "mixin " in line_lower:
-            return "Mixin 🎛️"
-        if "extension " in line_lower:
-            return "Extension 🧩"
-        if "def " in line_lower or "fn " in line_lower or "func " in line_lower or "fun " in line_lower:
-            return "Method/Function ⚙️"
-        if "#define" in line_lower:
-            return "Macro 📌"
-        if "type " in line_lower:
-            return "Type Alias 🏷️"
-        return "Symbol 📄"
-
-    def _extract_symbol_name(self, decl: str) -> str:
-        """Trích xuất duy nhất tên của hàm, phương thức hoặc Class từ chuỗi signature thô."""
-        decl_clean = decl.strip()
-        decl_clean = re.sub(r"^@\w+\s+", "", decl_clean)
+    # ==========================================
+    # 🛠️ THÊM MỚI: BỘ TRÍCH XUẤT CHỮ KÝ KHAI BÁO TOÀN DIỆN (SIGNATURE EXTRACTOR)
+    # ==========================================
+    def _extract_full_signature(self, lines: list, start_idx: int, ext: str) -> str:
+        """
+        Trích xuất và định dạng chuẩn hóa toàn bộ signature khai báo (kể cả khi viết trên nhiều dòng)
+        để hiển thị nguyên vẹn kiểu dữ liệu tham số và kiểu trả về trong bảng Markdown.
+        """
+        sig_end_idx = start_idx
         
-        match_type = re.search(r"\b(class|struct|interface|mixin|extension|enum|union|namespace|impl)\s+([a-zA-Z0-9_<>]+)", decl_clean)
-        if match_type:
-            return match_type.group(2)
-        
-        match_def = re.search(r"\bdef\s+([a-zA-Z0-9_]+)", decl_clean)
-        if match_def:
-            return match_def.group(1)
-            
-        match_fn = re.search(r"\b(fn|func|fun)\s+([a-zA-Z0-9_]+)", decl_clean)
-        if match_fn:
-            return match_fn.group(2)
-            
-        match_arrow = re.search(r"\b(const|let|var)\s+([a-zA-Z0-9_]+)\s*=", decl_clean)
-        if match_arrow:
-            return match_arrow.group(2)
-
-        match_method = re.search(r"\b([a-zA-Z0-9_~]+)\s*\(", decl_clean)
-        if match_method:
-            name = match_method.group(1)
-            if name not in ["if", "for", "while", "switch", "catch", "synchronized"]:
-                return name
+        if ext == ".py":
+            # Python signature kết thúc bằng dấu ':'
+            for idx in range(start_idx, len(lines)):
+                clean_line = lines[idx].strip().split("#", 1)[0].strip()
+                if clean_line.endswith(":"):
+                    sig_end_idx = idx
+                    break
+        else:
+            # C-Style signature kết thúc khi gặp '{', ';' hoặc '=>'
+            for idx in range(start_idx, len(lines)):
+                clean_line = self._strip_strings_and_line_comments(lines[idx], ext).strip()
+                if "{" in clean_line or ";" in clean_line or "=>" in clean_line:
+                    sig_end_idx = idx
+                    break
+                    
+        # Gộp các dòng cấu thành signature lại làm một
+        sig_parts = []
+        for idx in range(start_idx, sig_end_idx + 1):
+            line = lines[idx].strip()
+            if ext == ".py":
+                line = line.split("#", 1)[0].strip()
+            else:
+                line = line.split("//", 1)[0].strip()
+            if line:
+                sig_parts.append(line)
                 
-        return decl_clean
+        full_sig = " ".join(sig_parts)
+        
+        # Nén khoảng trắng thừa
+        full_sig = re.sub(r"\s+", " ", full_sig)
+        
+        # Loại bỏ decorators/annotations ở đầu (ví dụ: @override, @tool)
+        full_sig = re.sub(r"^@\w+(?:\([^)]*\))?\s+", "", full_sig)
+        
+        # Làm sạch các ký hiệu mở khối code thừa thãi để tập trung vào định nghĩa kiểu
+        if ext == ".py":
+            if not full_sig.endswith(":"):
+                full_sig += ":"
+        else:
+            # Đối với Dart arrow function, chỉ lấy phần signature trước dấu '=>'
+            if "=>" in full_sig:
+                full_sig = full_sig.split("=>")[0].strip()
+            # Xóa dấu mở ngoặc nhọn hoặc chấm phẩy ở cuối chữ ký C-Style
+            full_sig = full_sig.rstrip("{").rstrip(";").strip()
+            
+        return full_sig
 
     def _extract_description(self, lines: list, start_line_1based: int, ext: str) -> str:
-        """
-        Trích xuất thông minh phần giải thích/mô tả chức năng từ Docstrings hoặc Comments.
-        """
+        """Trích xuất giải thích/mô tả chức năng từ Docstrings hoặc Comments."""
         description_lines = []
         def_idx = start_line_1based - 1
 
@@ -346,7 +333,6 @@ class UniversalSymbolSearchTool(BaseTool):
         
         while up_idx >= 0:
             line = lines[up_idx].strip()
-            
             if not line:
                 if comment_block:
                     break
@@ -410,7 +396,6 @@ class UniversalSymbolSearchTool(BaseTool):
             lines = clean_content.splitlines()
             
             patterns = {
-                # 🛡️ SỬA ĐỔI: Thêm (?:async\s+)? để khớp hàm async def của Python
                 ".py": [
                     r"^\s*(class\s+[a-zA-Z0-9_]+)",
                     r"^\s*(?:async\s+)?(def\s+[a-zA-Z0-9_]+)"
@@ -469,7 +454,7 @@ class UniversalSymbolSearchTool(BaseTool):
                 ],
                 ".swift": [
                     r"\b(?:public|internal|private|fileprivate|open|\s)*(?:class|struct|protocol|enum|extension)\s+([a-zA-Z0-9_]+)",
-                    r"\b(?:public|internal|private|fileprivate|open|static|class|override|async|\s)*func\s+([a-zA-Z0-9_]+)\s*\("
+                    r"^\s*(?:public|internal|private|fileprivate|open|static|class|override|async|\s)*func\s+([a-zA-Z0-9_]+)\s*\("
                 ],
                 ".kt": [
                     r"\b(?:public|internal|private|protected|sealed|data|\s)*(?:class|interface|object)\s+([a-zA-Z0-9_]+)",
@@ -485,11 +470,9 @@ class UniversalSymbolSearchTool(BaseTool):
                 if not clean_line:
                     continue
                 
-                # Bỏ qua các dòng comment một dòng thuần túy trước khi bắt đầu quét mẫu signature
                 if clean_line.startswith("//") or clean_line.startswith("#") or clean_line.startswith("/*") or clean_line.startswith("*"):
                     continue
                 
-                # 🛡️ NÂNG CẤP LỌC SẠCH: Chỉ quét Regex trên dòng đã xóa sạch chuỗi ký tự và comments để tránh khớp nhầm log/string
                 clean_matching_line = self._strip_strings_and_line_comments(line, ext)
                 if not clean_matching_line.strip():
                     continue
@@ -503,10 +486,11 @@ class UniversalSymbolSearchTool(BaseTool):
                         else:
                             end_line = self._find_brace_block_end(lines, line_no - 1, ext)
                         
-                        symbol_name = self._extract_symbol_name(clean_line)
+                        # ⚙️ NÂNG CẤP CHÍNH: Gọi hàm _extract_full_signature để lấy signature nguyên vẹn
+                        symbol_signature = self._extract_full_signature(lines, line_no - 1, ext)
                         description = self._extract_description(lines, line_no, ext)
                         
-                        raw_symbols.append((start_line, end_line, symbol_name, description))
+                        raw_symbols.append((start_line, end_line, symbol_signature, description))
                         break
             
             if not raw_symbols:
@@ -515,12 +499,13 @@ class UniversalSymbolSearchTool(BaseTool):
             table_rows = [
                 f"### 📊 DANH SÁCH CÁC HÀM TRONG `{file_path}`",
                 "",
-                "| STT | Tên hàm | Dòng | Mô tả chức năng |",
+                "| STT | Chữ ký khai báo (Signature) | Dòng | Mô tả chức năng |",
                 "| :---: | :--- | :---: | :--- |"
             ]
             
-            for stt, (start, end, name, desc) in enumerate(raw_symbols, 1):
-                table_rows.append(f"| {stt} | `{name}` | {start:02d}-{end:02d} | {desc} |")
+            for stt, (start, end, signature, desc) in enumerate(raw_symbols, 1):
+                # Hiển thị signature trong khối inline code `...` để giữ nguyên định dạng kiểu dữ liệu
+                table_rows.append(f"| {stt} | `{signature}` | {start:02d}-{end:02d} | {desc} |")
                 
             return "\n".join(table_rows)
 

@@ -142,7 +142,8 @@ class UniversalSymbolSearchTool(BaseTool):
     name: str = "search_symbols_universal"
     description: str = (
         "Quét tệp tin nguồn để trích xuất danh sách các định nghĩa Class, Hàm, Phương thức, Struct... "
-        "Đi kèm với KHOẢNG DÒNG BẮT ĐẦU VÀ KẾT THÚC chính xác tuyệt đối của từng khối mã. "
+        "Đi kèm với KHOẢNG DÒNG BẮT ĐẦU VÀ KẾT THÚC chính xác tuyệt đối của từng khối mã, tên ký hiệu tinh gọn "
+        "và mô tả chức năng được trích xuất trực tiếp từ các comments/docstrings của chúng. "
         "Hỗ trợ tất cả các ngôn ngữ phổ biến (Python, Dart, TS, JS, Go, Rust, C++, Java, C#, Swift, Kotlin)."
     )
     args_schema: Type[BaseModel] = UniversalSearchSchema
@@ -262,6 +263,154 @@ class UniversalSymbolSearchTool(BaseTool):
         return "Symbol 📄"
 
     # ==========================================
+    # CÁC HÀM TIỆN ÍCH PHỤC VỤ TRÍ TUỆ NHÂN DIỆN MỚI
+    # ==========================================
+    def _extract_symbol_name(self, decl: str) -> str:
+        """Trích xuất duy nhất tên của hàm, phương thức hoặc Class từ chuỗi signature thô."""
+        decl_clean = decl.strip()
+        # Loại bỏ decorators/annotations ở đầu nếu có
+        decl_clean = re.sub(r"^@\w+\s+", "", decl_clean)
+        
+        # 1. Class / Struct / Interface / Mixin / Extension / Enum / Impl
+        match_type = re.search(r"\b(class|struct|interface|mixin|extension|enum|union|namespace|impl)\s+([a-zA-Z0-9_<>]+)", decl_clean)
+        if match_type:
+            return match_type.group(2)
+        
+        # 2. Python / Ruby 'def'
+        match_def = re.search(r"\bdef\s+([a-zA-Z0-9_]+)", decl_clean)
+        if match_def:
+            return match_def.group(1)
+            
+        # 3. Rust / Swift / Kotlin 'fn'/'func'/'fun'
+        match_fn = re.search(r"\b(fn|func|fun)\s+([a-zA-Z0-9_]+)", decl_clean)
+        if match_fn:
+            return match_fn.group(2)
+            
+        # 4. JS/TS Arrow function định nghĩa qua biến: const/let/var name = ...
+        match_arrow = re.search(r"\b(const|let|var)\s+([a-zA-Z0-9_]+)\s*=", decl_clean)
+        if match_arrow:
+            return match_arrow.group(2)
+
+        # 5. C/C++/Java/C#/Dart Signature truyền thống: Type name(Args)
+        match_method = re.search(r"\b([a-zA-Z0-9_~]+)\s*\(", decl_clean)
+        if match_method:
+            name = match_method.group(1)
+            if name not in ["if", "for", "while", "switch", "catch", "synchronized"]:
+                return name
+                
+        return decl_clean
+
+    def _extract_description(self, lines: list, start_line_1based: int, ext: str) -> str:
+        """
+        Trích xuất thông minh phần giải thích/mô tả chức năng từ Docstrings hoặc Comments.
+        """
+        description_lines = []
+        def_idx = start_line_1based - 1 # Chuyển về 0-indexed đại diện dòng khai báo
+
+        # --------------------------------------------------
+        # TRƯỜNG HỢP PYTHON: Quét xuôi xuống dưới tìm nháy ba (def_idx + 1)
+        # --------------------------------------------------
+        if ext == ".py":
+            docstring_started = False
+            quote_char = None
+            for idx in range(def_idx + 1, len(lines)):
+                line = lines[idx].strip()
+                if not line:
+                    continue
+                
+                if not docstring_started:
+                    if line.startswith('"""'):
+                        quote_char = '"""'
+                        docstring_started = True
+                        content = line[3:]
+                        if content.endswith('"""') and len(line) >= 6:
+                            return content[:-3].strip()
+                        if content:
+                            description_lines.append(content)
+                    elif line.startswith("'''"):
+                        quote_char = "'''"
+                        docstring_started = True
+                        content = line[3:]
+                        if content.endswith("'''") and len(line) >= 6:
+                            return content[:-3].strip()
+                        if content:
+                            description_lines.append(content)
+                    else:
+                        break # Dòng code đầu tiên không phải Docstring, kết thúc tìm kiếm
+                else:
+                    if line.endswith(quote_char):
+                        content = line[:-3]
+                        if content:
+                            description_lines.append(content)
+                        break
+                    else:
+                        description_lines.append(line)
+            
+            if description_lines:
+                return " ".join([l.strip() for l in description_lines if l.strip()]).strip()
+
+        # --------------------------------------------------
+        # TRƯỜNG HỢP C-STYLE / DART / TS: Quét ngược lên trên để nhặt Comments (def_idx - 1)
+        # --------------------------------------------------
+        up_idx = def_idx - 1
+        comment_block = []
+        in_block_comment = False
+        
+        while up_idx >= 0:
+            line = lines[up_idx].strip()
+            
+            if not line:
+                if comment_block:
+                    break
+                up_idx -= 1
+                if def_idx - up_idx > 3: # Giới hạn không quét quá xa
+                    break
+                continue
+            
+            # Xử lý Single-line comments (// hoặc ///)
+            if line.startswith("///") or line.startswith("//"):
+                cleaned_comment = line.lstrip("/").strip()
+                comment_block.insert(0, cleaned_comment)
+                up_idx -= 1
+            # Xử lý kết thúc Block comment (*/) khi dò ngược từ dưới lên
+            elif line.endswith("*/"):
+                in_block_comment = True
+                cleaned = line.rstrip("*/").strip()
+                if cleaned.startswith("/*"): # Trường hợp một dòng duy nhất /* comment */
+                    cleaned = cleaned.lstrip("/*").strip()
+                    comment_block.insert(0, cleaned)
+                    break
+                if cleaned:
+                    comment_block.insert(0, cleaned)
+                up_idx -= 1
+            elif in_block_comment:
+                if line.startswith("/*"):
+                    cleaned = line.lstrip("/*").strip()
+                    if cleaned:
+                        comment_block.insert(0, cleaned)
+                    in_block_comment = False
+                    break
+                else:
+                    cleaned = line.lstrip("*").strip()
+                    comment_block.insert(0, cleaned)
+                up_idx -= 1
+            else:
+                break # Gặp dòng code bình thường, dừng quét ngược
+                
+        if comment_block:
+            # Gộp các dòng comment thành một chuỗi duy nhất, loại bỏ khoảng trắng thừa
+            return " ".join([c.strip() for c in comment_block if c.strip()]).strip()
+            
+        # Thử nghiệm cuối cùng: Tìm comment cùng dòng với định nghĩa (e.g. def func(): # Mô tả)
+        def_line = lines[def_idx]
+        if "#" in def_line and ext == ".py":
+            return def_line.split("#", 1)[1].strip()
+        elif "//" in def_line and ext != ".py":
+            return def_line.split("//", 1)[1].strip()
+
+        return "Không có mô tả"
+
+    # ==========================================
     # PHƯƠNG THỨC THỰC THI CHÍNH (RUN METHOD)
     # ==========================================
     def _run(self, file_path: str) -> str:
@@ -273,7 +422,7 @@ class UniversalSymbolSearchTool(BaseTool):
             raw_content = safe_path.read_text(encoding="utf-8")
             ext = safe_path.suffix.lower()
             
-            # 1. Tiền xử lý: Xóa sạch block comments nhưng vẫn giữ nguyên vị trí dòng
+            # Tiền xử lý: Xóa sạch block comments nhưng vẫn giữ nguyên vị trí dòng
             clean_content = self._clean_block_comments(raw_content)
             lines = clean_content.splitlines()
             
@@ -358,7 +507,7 @@ class UniversalSymbolSearchTool(BaseTool):
                 if not clean_line:
                     continue
                 
-                # Bỏ qua các comment thuần một dòng trước khi quét mẫu signature
+                # Bỏ qua các comment một dòng thuần túy
                 if clean_line.startswith("//") or clean_line.startswith("#") or clean_line.startswith("/*") or clean_line.startswith("*"):
                     continue
                 
@@ -371,30 +520,34 @@ class UniversalSymbolSearchTool(BaseTool):
                         else:
                             end_line = self._find_brace_block_end(lines, line_no - 1, ext)
                         
-                        # Phân loại ký hiệu động dựa trên nội dung dòng khai báo
-                        symbol_type = self._classify_symbol(clean_line, ext)
-                        raw_symbols.append((start_line, end_line, symbol_type, clean_line))
+                        # 1. Trích xuất tên hàm/class tinh gọn
+                        symbol_name = self._extract_symbol_name(clean_line)
+                        # 2. Trích xuất mô tả chi tiết từ comment/docstring
+                        description = self._extract_description(lines, line_no, ext)
+                        
+                        raw_symbols.append((start_line, end_line, symbol_name, description))
                         break
             
             if not raw_symbols:
-                return f"Thông báo: Đã quét tệp '{file_path}' nhưng không phát hiện cấu trúc đặc trưng."
+                return f"Thông báo: Đã quét tệp '{file_path}' nhưng không phát hiện cấu trúc đặc trưng nào."
             
-            # 🛠️ CẤU TRÚC LẠI ĐẦU RA THÀNH BẢNG MARKDOWN TRỰC QUAN CHO AGENT VÀ LANGSMITH
+            # 📊 CẤU TRÚC LẠI THÀNH BẢNG MARKDOWN CHUẨN ĐẸP NHƯ HÌNH MINH HỌA
             table_rows = [
-                f"### 🔍 BẢN ĐỒ KÝ HIỆU PHÁT HIỆN ĐƯỢC ({ext.upper()}): `{file_path}`",
+                f"### 📊 DANH SÁCH CÁC HÀM TRONG `{file_path}`",
                 "",
-                "| Phạm vi dòng | Loại ký hiệu | Chi tiết khai báo |",
-                "| :--- | :--- | :--- |"
+                "| STT | Tên hàm | Dòng | Mô tả chức năng |",
+                "| :---: | :--- | :---: | :--- |"
             ]
             
-            for start, end, sym_type, decl in raw_symbols:
-                # Định dạng bọc inline code để tăng độ tách bạch dữ liệu
-                table_rows.append(f"| Dòng `{start:03d}` -> `{end:03d}` | {sym_type} | `{decl}` |")
+            for stt, (start, end, name, desc) in enumerate(raw_symbols, 1):
+                # Hiển thị Tên hàm ở dạng inline code, hiển thị khoảng dòng rõ ràng
+                table_rows.append(f"| {stt} | `{name}` | {start:02d}-{end:02d} | {desc} |")
                 
             return "\n".join(table_rows)
 
         except Exception as e:
             return f"Lỗi phân tích phạm vi khối mã: {str(e)}"
+
 # ==========================================
 # CÁC LỚP CÔNG CỤ CHUẨN HOÁ (BASE TOOL)
 # ==========================================

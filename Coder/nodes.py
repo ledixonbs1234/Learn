@@ -9,7 +9,7 @@ from langchain_core.tools import tool
 from config import model, sanitize_and_resolve_path
 from state import AgentState, WorkspaceDetection, TaskPlan, TaskTriage, Task, WorkspaceDiscoveryState
 from tools import (
-    GitManager, WorkspaceTools, 
+    GitManager, ReadFileLinesTool, UniversalSymbolSearchTool, WorkspaceTools, 
     ReadFilesTool, WriteFileTool, ApplyPatchTool, 
     ListDirectoryTool, RunTerminalTool,
     get_current_working_directory, check_path_exists, find_project_root
@@ -348,7 +348,10 @@ def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
     
     read_files = ReadFilesTool(workspace_path=ws)
     list_directory = ListDirectoryTool(workspace_path=ws)
-    tools = [read_files, list_directory]
+    search_symbols = UniversalSymbolSearchTool(workspace_path=ws)
+    read_file_lines = ReadFileLinesTool(workspace_path=ws)
+    tools = [read_files, list_directory,search_symbols,read_file_lines]
+
     model_with_tools = model.bind_tools(tools)
     
     previous_findings_str = ""
@@ -425,10 +428,13 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
     read_files = ReadFilesTool(workspace_path=ws)
     write_file = WriteFileTool(workspace_path=ws)
     apply_patch = ApplyPatchTool(workspace_path=ws)
+    search_symbols = UniversalSymbolSearchTool(workspace_path=ws)
     list_directory = ListDirectoryTool(workspace_path=ws)
     run_terminal_command = RunTerminalTool(workspace_path=ws)
+
+    read_file_lines = ReadFileLinesTool(workspace_path=ws)
     
-    tools = [read_files, write_file, apply_patch, list_directory, run_terminal_command]
+    tools = [read_files, write_file, apply_patch, list_directory, run_terminal_command,search_symbols,read_file_lines]
     model_with_tools = model.bind_tools(tools)
     
     system_prompt = (
@@ -484,13 +490,17 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
     apply_patch = ApplyPatchTool(workspace_path=ws)
     list_directory = ListDirectoryTool(workspace_path=ws)
     run_terminal_command = RunTerminalTool(workspace_path=ws)
+    search_symbols = UniversalSymbolSearchTool(workspace_path=ws)
+    read_file_lines = ReadFileLinesTool(workspace_path=ws)
     
     tools_map = {
         "read_files": read_files,
         "write_file": write_file,
         "apply_search_replace_patch": apply_patch,
         "list_directory": list_directory,
-        "run_terminal_command": run_terminal_command
+        "run_terminal_command": run_terminal_command,
+        "search_symbols_universal":search_symbols,
+        "read_file_lines": read_file_lines
     }
     
     last_message = state["messages"][-1]

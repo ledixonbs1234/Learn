@@ -84,6 +84,161 @@ class ListDirSchema(BaseModel):
 class RunTerminalSchema(BaseModel):
     command: str = Field(description="Lệnh terminal hệ điều hành cần thực thi trực tiếp tại thư mục gốc của workspace.")
 
+class ReadFileLinesSchema(BaseModel):
+    file_path: str = Field(description="Đường dẫn tương đối của tệp tin trong workspace.")
+    start_line: int = Field(description="Dòng bắt đầu đọc (đánh chỉ số từ 1).")
+    end_line: int = Field(description="Dòng kết thúc đọc (bao gồm cả dòng này).")
+
+class ReadFileLinesTool(BaseTool):
+    name: str = "read_file_lines"
+    description: str = (
+        "Đọc một phân đoạn cụ thể của tệp tin trong phạm vi dòng [start_line] đến [end_line]. "
+        "Giúp tập trung phân tích đoạn code cần thiết và tránh làm tràn bộ nhớ ngữ cảnh của mô hình."
+    )
+    args_schema: Type[BaseModel] = ReadFileLinesSchema
+    workspace_path: str
+
+    def _run(self, file_path: str, start_line: int, end_line: int) -> str:
+        try:
+            # Giải quyết đường dẫn tuyệt đối an toàn
+            safe_path = sanitize_and_resolve_path(self.workspace_path, file_path, create_parent=False)
+            if not safe_path.exists():
+                return f"Lỗi: Không tìm thấy tệp '{file_path}'"
+            
+            if safe_path.is_dir():
+                return f"Lỗi: '{file_path}' là một thư mục, vui lòng truyền đường dẫn tệp tin cụ thể."
+            
+            # Đọc toàn bộ dòng để xử lý cắt lát (slicing)
+            content = safe_path.read_text(encoding="utf-8")
+            lines = content.splitlines()
+            total_lines = len(lines)
+            
+            # Phòng thủ giới hạn đầu vào của Agent (bảo vệ biên)
+            start = max(1, start_line)
+            end = min(total_lines, end_line)
+            
+            if start > total_lines or start > end:
+                return f"Lỗi: Phạm vi dòng yêu cầu ({start_line} - {end_line}) vượt quá giới hạn của tệp (Tệp hiện có {total_lines} dòng)."
+            
+            # Lấy các dòng được yêu cầu (mảng Python tính từ chỉ số 0)
+            selected_lines = lines[start - 1 : end]
+            
+            # Định dạng đầu ra đi kèm số dòng hiển thị rõ ràng
+            formatted_lines = []
+            for idx, line in enumerate(selected_lines, start=start):
+                formatted_lines.append(f"{idx:04d} | {line}")
+                
+            header = f"=== NỘI DUNG TỆP KHOANH VÙNG: {file_path} (Dòng {start} đến {end} trên tổng số {total_lines} dòng) ===\n"
+            return header + "\n".join(formatted_lines)
+            
+        except Exception as e:
+            return f"Lỗi xảy ra khi đọc phân đoạn dòng của tệp tin: {str(e)}"
+        
+        
+class UniversalSearchSchema(BaseModel):
+    file_path: str = Field(description="Đường dẫn tương đối của tệp tin nguồn trong workspace cần quét cấu trúc ký hiệu.")
+
+class UniversalSymbolSearchTool(BaseTool):
+    name: str = "search_symbols_universal"
+    description: str = (
+        "Quét nhanh tệp tin nguồn để trích xuất danh sách các định nghĩa Class, "
+        "Hàm, Phương thức, Interface, Struct, v.v. của bất kỳ ngôn ngữ nào (Python, Dart, TS, JS, Go, Rust, C++). "
+        "Giúp định vị vị trí dòng cụ thể để sửa đổi mà không cần đọc toàn bộ nội dung tệp tin."
+    )
+    args_schema: Type[BaseModel] = UniversalSearchSchema
+    workspace_path: str
+
+    def _run(self, file_path: str) -> str:
+        try:
+            # Giải quyết đường dẫn an toàn tuyệt đối thông qua hàm có sẵn của bạn
+            safe_path = sanitize_and_resolve_path(self.workspace_path, file_path, create_parent=False)
+            if not safe_path.exists():
+                return f"Thất bại: Không tìm thấy tệp tin '{file_path}' trong workspace."
+            
+            if safe_path.is_dir():
+                return f"Thất bại: Đường dẫn '{file_path}' chỉ tới một thư mục, không phải tệp tin."
+
+            content = safe_path.read_text(encoding="utf-8")
+            ext = safe_path.suffix.lower()
+            
+            # Bản đồ Regex tối ưu hóa cho từng ngôn ngữ lập trình
+            patterns = {
+                ".py": [
+                    r"^\s*(class\s+[a-zA-Z0-9_]+)",
+                    r"^\s*(def\s+[a-zA-Z0-9_]+)"
+                ],
+                ".dart": [
+                    r"\b(class\s+[a-zA-Z0-9_<>]+)",
+                    r"\b(mixin\s+[a-zA-Z0-9_]+)",
+                    r"\b(extension\s+\w*\s*on\s+\w+)",
+                    # Nhận diện hàm/phương thức trong Dart
+                    r"^\s*(?:async\s+)?(?:[\w<>]+[\s\n]+)?([a-zA-Z0-9_]+)\s*\([^)]*\)\s*(?:async\s*)?\{?"
+                ],
+                ".ts": [
+                    r"\b(class\s+[a-zA-Z0-9_]+)",
+                    r"\b(interface\s+[a-zA-Z0-9_]+)",
+                    r"\b(type\s+[a-zA-Z0-9_]+)",
+                    r"\b(function\s+[a-zA-Z0-9_]+)",
+                    r"\b(const|let|var)\s+([a-zA-Z0-9_]+)\s*=\s*(?:\([^)]*\)|[a-zA-Z0-9_]+)\s*=>"
+                ],
+                ".tsx": [
+                    r"\b(class\s+[a-zA-Z0-9_]+)",
+                    r"\b(interface\s+[a-zA-Z0-9_]+)",
+                    r"\b(function\s+[a-zA-Z0-9_]+)",
+                    r"\b(const|let|var)\s+([a-zA-Z0-9_]+)\s*=\s*(?:\([^)]*\)|[a-zA-Z0-9_]+)\s*=>"
+                ],
+                ".js": [
+                    r"\b(class\s+[a-zA-Z0-9_]+)",
+                    r"\b(function\s+[a-zA-Z0-9_]+)",
+                    r"\b(const|let|var)\s+([a-zA-Z0-9_]+)\s*=\s*(?:\([^)]*\)|[a-zA-Z0-9_]+)\s*=>"
+                ],
+                ".rs": [
+                    r"\b(?:pub\s+)?(?:struct|enum|union)\s+([a-zA-Z0-9_]+)",
+                    r"\b(?:pub\s+)?(?:async\s+)?fn\s+([a-zA-Z0-9_]+)",
+                    r"\b(?:pub\s+)?trait\s+([a-zA-Z0-9_]+)",
+                    r"\bimpl(?:\s*<.*>)?\s+([a-zA-Z0-9_<>]+)"
+                ],
+                ".go": [
+                    r"\btype\s+([a-zA-Z0-9_]+)\s+(struct|interface)",
+                    r"\bfunc\s+(?:\([^)]+\)\s+)?([a-zA-Z0-9_]+)\s*\("
+                ],
+                ".cpp": [
+                    r"\b(class\s+[a-zA-Z0-9_]+)",
+                    r"\b(struct\s+[a-zA-Z0-9_]+)",
+                    r"\bnamespace\s+[a-zA-Z0-9_]+"
+                ],
+                ".h": [
+                    r"\b(class\s+[a-zA-Z0-9_]+)",
+                    r"\b(struct\s+[a-zA-Z0-9_]+)",
+                    r"^\s*#define\s+[a-zA-Z0-9_]+"
+                ]
+            }
+
+            # Lấy mẫu regex tương ứng hoặc dùng mẫu chung nếu là tệp ngôn ngữ khác
+            selected_patterns = patterns.get(ext, [r"\b(class\s+\w+)", r"\b(function\s+\w+)"])
+            
+            matched_symbols = []
+            for line_no, line in enumerate(content.splitlines(), 1):
+                clean_line = line.strip()
+                # Bỏ qua dòng trống và các dòng comment thuần túy để giảm nhiễu thông tin
+                if not clean_line or clean_line.startswith("//") or clean_line.startswith("#") or clean_line.startswith("/*") or clean_line.startswith("*"):
+                    continue
+                
+                for pattern in selected_patterns:
+                    match = re.search(pattern, line)
+                    if match:
+                        matched_symbols.append(f"Dòng {line_no:03d}: {clean_line}")
+                        break # Dòng đã khớp thì chuyển sang dòng tiếp theo
+            
+            if not matched_symbols:
+                return f"Thông báo: Đã quét tệp '{file_path}' nhưng không tìm thấy định nghĩa cấu trúc hoặc ký hiệu nào đặc trưng."
+            
+            total_symbols = len(matched_symbols)
+            header = f"=== BẢN ĐỒ KÝ HIỆU PHÁT HIỆN ĐƯỢC TRONG TỆP ({ext.upper()} - {total_symbols} ký hiệu): {file_path} ===\n"
+            return header + "\n".join(matched_symbols)
+
+        except Exception as e:
+            return f"Lỗi nghiêm trọng xảy ra khi quét tệp tin: {str(e)}"
 # ==========================================
 # CÁC LỚP CÔNG CỤ CHUẨN HOÁ (BASE TOOL)
 # ==========================================

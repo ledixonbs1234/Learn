@@ -141,49 +141,136 @@ class UniversalSearchSchema(BaseModel):
 class UniversalSymbolSearchTool(BaseTool):
     name: str = "search_symbols_universal"
     description: str = (
-        "Quét nhanh tệp tin nguồn để trích xuất danh sách các định nghĩa Class, "
-        "Hàm, Phương thức, Interface, Struct, v.v. của bất kỳ ngôn ngữ nào (Python, Dart, TS, JS, Go, Rust, C++). "
-        "Giúp định vị vị trí dòng cụ thể để sửa đổi mà không cần đọc toàn bộ nội dung tệp tin."
+        "Quét tệp tin nguồn để trích xuất danh sách các định nghĩa Class, Hàm, Phương thức, Struct... "
+        "Đi kèm với KHOẢNG DÒNG BẮT ĐẦU VÀ KẾT THÚC chính xác tuyệt đối của từng khối mã. "
+        "Hỗ trợ tất cả các ngôn ngữ phổ biến (Python, Dart, TS, JS, Go, Rust, C++, Java, C#, Swift, Kotlin)."
     )
     args_schema: Type[BaseModel] = UniversalSearchSchema
     workspace_path: str
 
+    def _clean_block_comments(self, content: str) -> str:
+        """
+        Xóa sạch comment khối /* ... */ đa dòng nhưng bảo toàn tuyệt đối số dòng 
+        bằng cách đếm số dòng bị xóa và bù lại bằng bấy nhiêu ký tự xuống dòng.
+        """
+        def replacer(match):
+            newlines_count = match.group(0).count("\n")
+            return "\n" * newlines_count
+            
+        return re.sub(r"/\*.*?\*/", replacer, content, flags=re.DOTALL)
+
+    def _strip_strings_and_line_comments(self, line: str, ext: str) -> str:
+        """
+        Xóa sạch comment một dòng và mọi chuỗi ký tự nằm trong ngoặc đơn/kép/template literal 
+        để loại bỏ hoàn toàn các dấu ngoặc nhọn { } gây nhiễu trong chuỗi.
+        """
+        # 1. Xóa comment một dòng tùy theo ngôn ngữ
+        if ext in [".py", ".yaml", ".yml"]:
+            clean_line = re.sub(r"#.*$", "", line)
+        else:
+            clean_line = re.sub(r"//.*$", "", line)
+
+        # 2. Xóa các chuỗi ký tự ngoặc kép "..." (bao gồm cả xử lý ký tự escape \")
+        clean_line = re.sub(r'"(?:[^"\\]|\\.)*"', '""', clean_line)
+        
+        # 3. Xóa các chuỗi ký tự ngoặc đơn '...'
+        clean_line = re.sub(r"'(?:[^'\\]|\\.)*'", "''", clean_line)
+        
+        # 4. Xóa chuỗi Template Literal `...` (cho JS, TS, Dart)
+        clean_line = re.sub(r"`(?:[^`\\]|\\.)*`", "``", clean_line)
+        
+        return clean_line
+
+    def _find_brace_block_end(self, lines: list, start_idx: int, ext: str) -> int:
+        """Thuật toán Brace-Matching nâng cao: Khử chuỗi và comment trước khi đếm ngoặc nhọn."""
+        brace_count = 0
+        found_first_brace = False
+        end_idx = start_idx
+        
+        # Phòng thủ: Kiểm tra xem đây có phải là Arrow Function một dòng không (JS/TS/Dart)
+        first_line_clean = self._strip_strings_and_line_comments(lines[start_idx], ext)
+        if "=>" in first_line_clean and first_line_clean.endswith(";"):
+            return start_idx + 1 # Hàm một dòng, kết thúc ngay tại dòng bắt đầu [5]
+
+        for idx in range(start_idx, len(lines)):
+            line = lines[idx]
+            # Làm sạch chuỗi và comment trên dòng hiện tại trước khi đếm ngoặc
+            clean_line = self._strip_strings_and_line_comments(line, ext)
+            
+            for char in clean_line:
+                if char == '{':
+                    if not found_first_brace:
+                        found_first_brace = True
+                    brace_count += 1
+                elif char == '}':
+                    if found_first_brace:
+                        brace_count -= 1
+                        if brace_count == 0:
+                            return idx + 1 # Tìm thấy ngoặc đóng khớp hoàn toàn
+            
+            if found_first_brace and brace_count == 0:
+                return idx + 1
+            
+            end_idx = idx
+            
+        return end_idx + 1 # Fallback về cuối file nếu gặp file lỗi cú pháp bị khuyết ngoặc đóng
+
+    def _find_python_block_end(self, lines: list, start_idx: int) -> int:
+        """Thuật toán Indentation: Nhận diện ranh giới thụt lề của Python."""
+        start_line = lines[start_idx]
+        start_indent = len(start_line) - len(start_line.lstrip())
+        
+        end_idx = start_idx
+        for idx in range(start_idx + 1, len(lines)):
+            line = lines[idx]
+            clean_line = line.strip()
+            
+            if not clean_line or clean_line.startswith('#') or clean_line.startswith('"""') or clean_line.startswith("'''"):
+                continue
+                
+            line_indent = len(line) - len(line.lstrip())
+            if line_indent <= start_indent:
+                return end_idx + 1
+                
+            end_idx = idx
+            
+        return end_idx + 1
+
     def _run(self, file_path: str) -> str:
         try:
-            # Giải quyết đường dẫn an toàn tuyệt đối thông qua hàm có sẵn của bạn
             safe_path = sanitize_and_resolve_path(self.workspace_path, file_path, create_parent=False)
             if not safe_path.exists():
-                return f"Thất bại: Không tìm thấy tệp tin '{file_path}' trong workspace."
+                return f"Thất bại: Không tìm thấy tệp tin '{file_path}'"
             
-            if safe_path.is_dir():
-                return f"Thất bại: Đường dẫn '{file_path}' chỉ tới một thư mục, không phải tệp tin."
-
-            content = safe_path.read_text(encoding="utf-8")
+            raw_content = safe_path.read_text(encoding="utf-8")
             ext = safe_path.suffix.lower()
             
-            # Bản đồ Regex tối ưu hóa cho từng ngôn ngữ lập trình
+            # 1. Tiền xử lý: Xóa sạch block comments nhưng vẫn giữ nguyên vị trí dòng
+            clean_content = self._clean_block_comments(raw_content)
+            lines = clean_content.splitlines()
+            
+            # Bản đồ mẫu Regex hỗ trợ toàn diện các ngôn ngữ lập trình chính
             patterns = {
                 ".py": [
                     r"^\s*(class\s+[a-zA-Z0-9_]+)",
                     r"^\s*(def\s+[a-zA-Z0-9_]+)"
                 ],
-                ".dart": [
-                    r"\b(class\s+[a-zA-Z0-9_<>]+)",
-                    r"\b(mixin\s+[a-zA-Z0-9_]+)",
-                    r"\b(extension\s+\w*\s*on\s+\w+)",
-                    # Nhận diện hàm/phương thức trong Dart
-                    r"^\s*(?:async\s+)?(?:[\w<>]+[\s\n]+)?([a-zA-Z0-9_]+)\s*\([^)]*\)\s*(?:async\s*)?\{?"
+               ".dart": [
+                    r"\b(class|mixin|extension)\s+[a-zA-Z0-9_<>]+",
+                    # Mẫu A: Có kiểu trả về đứng trước (bắt buộc có ít nhất 1 từ + khoảng trắng trước tên hàm)
+                    r"^\s*(?:async\s+)?(?:[\w<>]+[\s\n]+)+([a-zA-Z0-9_]+)\s*\([^)]*\)\s*(?:async\s*)?\{?",
+                    # Mẫu B: Constructor hoặc phương thức không có kiểu trả về, bắt buộc kết thúc bằng {
+                    r"^\s*(?:async\s+)?([a-zA-Z0-9_]+)\s*\([^)]*\)\s*(?:async\s*)?\{\s*$",
+                    # Mẫu C: Hàm rút gọn => bắt buộc có ký tự =>
+                    r"^\s*(?:async\s+)?([a-zA-Z0-9_]+)\s*\([^)]*\)\s*=>"
                 ],
                 ".ts": [
-                    r"\b(class\s+[a-zA-Z0-9_]+)",
-                    r"\b(interface\s+[a-zA-Z0-9_]+)",
-                    r"\b(type\s+[a-zA-Z0-9_]+)",
+                    r"\b(class|interface|type)\s+[a-zA-Z0-9_]+",
                     r"\b(function\s+[a-zA-Z0-9_]+)",
                     r"\b(const|let|var)\s+([a-zA-Z0-9_]+)\s*=\s*(?:\([^)]*\)|[a-zA-Z0-9_]+)\s*=>"
                 ],
                 ".tsx": [
-                    r"\b(class\s+[a-zA-Z0-9_]+)",
-                    r"\b(interface\s+[a-zA-Z0-9_]+)",
+                    r"\b(class|interface)\s+[a-zA-Z0-9_]+",
                     r"\b(function\s+[a-zA-Z0-9_]+)",
                     r"\b(const|let|var)\s+([a-zA-Z0-9_]+)\s*=\s*(?:\([^)]*\)|[a-zA-Z0-9_]+)\s*=>"
                 ],
@@ -193,9 +280,8 @@ class UniversalSymbolSearchTool(BaseTool):
                     r"\b(const|let|var)\s+([a-zA-Z0-9_]+)\s*=\s*(?:\([^)]*\)|[a-zA-Z0-9_]+)\s*=>"
                 ],
                 ".rs": [
-                    r"\b(?:pub\s+)?(?:struct|enum|union)\s+([a-zA-Z0-9_]+)",
+                    r"\b(?:pub\s+)?(?:struct|enum|union|trait)\s+([a-zA-Z0-9_]+)",
                     r"\b(?:pub\s+)?(?:async\s+)?fn\s+([a-zA-Z0-9_]+)",
-                    r"\b(?:pub\s+)?trait\s+([a-zA-Z0-9_]+)",
                     r"\bimpl(?:\s*<.*>)?\s+([a-zA-Z0-9_<>]+)"
                 ],
                 ".go": [
@@ -203,42 +289,77 @@ class UniversalSymbolSearchTool(BaseTool):
                     r"\bfunc\s+(?:\([^)]+\)\s+)?([a-zA-Z0-9_]+)\s*\("
                 ],
                 ".cpp": [
-                    r"\b(class\s+[a-zA-Z0-9_]+)",
-                    r"\b(struct\s+[a-zA-Z0-9_]+)",
-                    r"\bnamespace\s+[a-zA-Z0-9_]+"
-                ],
+                    r"\b(class|struct|namespace)\s+[a-zA-Z0-9_]+",
+                    # Mẫu A: Có kiểu trả về đứng trước (bắt buộc có ít nhất một kiểu trả về / modifier)
+                    r"^\s*(?:[\w&*<>:]+\s+)+([a-zA-Z0-9_~]+::)?([a-zA-Z0-9_~]+)\s*\([^)]*\)\s*(?:const|override|noexcept)?\s*\{?",
+                    # Mẫu B: Constructor/Destructor không có kiểu trả về, bắt buộc kết thúc bằng { (hoặc có Initializer List :)
+                    r"^\s*(?:[a-zA-Z0-9_~]+::)?([a-zA-Z0-9_~]+)\s*\([^)]*\)\s*(?::\s*[a-zA-Z0-9_~]+\(.*?\))*\s*\{\s*$"
+                ],      
                 ".h": [
-                    r"\b(class\s+[a-zA-Z0-9_]+)",
-                    r"\b(struct\s+[a-zA-Z0-9_]+)",
-                    r"^\s*#define\s+[a-zA-Z0-9_]+"
+                    r"\b(class|struct|namespace)\s+[a-zA-Z0-9_]+",
+                    r"^\s*#define\s+[a-zA-Z0-9_]+",
+                    r"^\s*(?:[\w&*<>:]+\s+)*([a-zA-Z0-9_~]+::)?([a-zA-Z0-9_~]+)\s*\([^)]*\)\s*(?:const|override|noexcept)?\s*;"
+                ],
+                ".hpp": [
+                    r"\b(class|struct|namespace)\s+[a-zA-Z0-9_]+",
+                    r"^\s*(?:[\w&*<>:]+\s+)*([a-zA-Z0-9_~]+::)?([a-zA-Z0-9_~]+)\s*\([^)]*\)\s*(?:const|override|noexcept)?\s*\{?"
+                ],
+                # 🛠️ THÊM MỚI: HỖ TRỢ JAVA (.java)
+                ".java": [
+                    r"\b(?:public|protected|private|static|\s)+(?:class|interface|enum)\s+([a-zA-Z0-9_]+)",
+                    r"^\s*(?:@\w+\s+)*(?:public|protected|private|static|final|synchronized|\s)+(?:[\w<>]+)\s+([a-zA-Z0-9_]+)\s*\([^)]*\)\s*(?:throws\s+[\w,\s]+)?\s*\{?"
+                ],
+                # 🛠️ THÊM MỚI: HỖ TRỢ C# (.cs)
+                ".cs": [
+                    r"\b(?:public|protected|private|internal|static|\s)+(?:class|interface|struct|enum)\s+([a-zA-Z0-9_]+)",
+                    r"^\s*(?:public|protected|private|internal|static|virtual|override|async|partial|\s)+(?:[\w<>]+)\s+([a-zA-Z0-9_]+)\s*\([^)]*\)\s*\{?"
+                ],
+                # 🛠️ THÊM MỚI: HỖ TRỢ SWIFT (.swift)
+                ".swift": [
+                    r"\b(?:public|internal|private|fileprivate|open|\s)*(?:class|struct|protocol|enum|extension)\s+([a-zA-Z0-9_]+)",
+                    r"\b(?:public|internal|private|fileprivate|open|static|class|override|async|\s)*func\s+([a-zA-Z0-9_]+)\s*\("
+                ],
+                # 🛠️ THÊM MỚI: HỖ TRỢ KOTLIN (.kt)
+                ".kt": [
+                    r"\b(?:public|internal|private|protected|sealed|data|\s)*(?:class|interface|object)\s+([a-zA-Z0-9_]+)",
+                    r"\b(?:public|internal|private|protected|override|actual|expect|inline|tailrec|\s)*fun\s+(?:\([^)]+\)\s*)?([a-zA-Z0-9_]+)\s*\("
                 ]
             }
 
-            # Lấy mẫu regex tương ứng hoặc dùng mẫu chung nếu là tệp ngôn ngữ khác
             selected_patterns = patterns.get(ext, [r"\b(class\s+\w+)", r"\b(function\s+\w+)"])
-            
             matched_symbols = []
-            for line_no, line in enumerate(content.splitlines(), 1):
+            
+            for line_no, line in enumerate(lines, 1):
                 clean_line = line.strip()
-                # Bỏ qua dòng trống và các dòng comment thuần túy để giảm nhiễu thông tin
-                if not clean_line or clean_line.startswith("//") or clean_line.startswith("#") or clean_line.startswith("/*") or clean_line.startswith("*"):
+                if not clean_line:
+                    continue
+                
+                # Bỏ qua các comment thuần một dòng trước khi quét mẫu signature
+                if clean_line.startswith("//") or clean_line.startswith("#") or clean_line.startswith("/*") or clean_line.startswith("*"):
                     continue
                 
                 for pattern in selected_patterns:
-                    match = re.search(pattern, line)
-                    if match:
-                        matched_symbols.append(f"Dòng {line_no:03d}: {clean_line}")
-                        break # Dòng đã khớp thì chuyển sang dòng tiếp theo
+                    if re.search(pattern, line):
+                        start_line = line_no
+                        
+                        if ext == ".py":
+                            end_line = self._find_python_block_end(lines, line_no - 1)
+                        else:
+                            end_line = self._find_brace_block_end(lines, line_no - 1, ext)
+                        
+                        matched_symbols.append(
+                            f"Dòng {start_line:03d} -> Dòng {end_line:03d}: {clean_line}"
+                        )
+                        break
             
             if not matched_symbols:
-                return f"Thông báo: Đã quét tệp '{file_path}' nhưng không tìm thấy định nghĩa cấu trúc hoặc ký hiệu nào đặc trưng."
+                return f"Thông báo: Đã quét tệp '{file_path}' nhưng không phát hiện cấu trúc đặc trưng."
             
-            total_symbols = len(matched_symbols)
-            header = f"=== BẢN ĐỒ KÝ HIỆU PHÁT HIỆN ĐƯỢC TRONG TỆP ({ext.upper()} - {total_symbols} ký hiệu): {file_path} ===\n"
+            header = f"=== BẢN ĐỒ PHẠM VI KHỐI MÃ (Ngôn ngữ: {ext.upper()}): {file_path} ===\n"
             return header + "\n".join(matched_symbols)
 
         except Exception as e:
-            return f"Lỗi nghiêm trọng xảy ra khi quét tệp tin: {str(e)}"
+            return f"Lỗi phân tích phạm vi khối mã: {str(e)}"
 # ==========================================
 # CÁC LỚP CÔNG CỤ CHUẨN HOÁ (BASE TOOL)
 # ==========================================

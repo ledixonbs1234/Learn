@@ -1,21 +1,55 @@
 # routers.py
 from typing import Literal
 from langchain_core.messages import AIMessage
-from state import AgentState
+from state import AgentState, WorkspaceDiscoveryState
 
-def start_router(state: AgentState) -> Literal["detect_workspace", "planner"]:
+# ==========================================
+# ĐỊNH TUYẾN CHO ĐỒ THỊ CON DÒ TÌM WORKSPACE
+# ==========================================
+def discovery_router(state: WorkspaceDiscoveryState) -> Literal["discovery_tool_node", "discovery_finalize_node"]:
+    messages = state["messages"]
+    if not messages:
+        return "discovery_finalize_node"
+        
+    last_message = messages[-1]
+    if isinstance(last_message, AIMessage) and last_message.tool_calls:
+        for tool_call in last_message.tool_calls:
+            if tool_call["name"] == "WorkspaceDetection":
+                return "discovery_finalize_node"
+        return "discovery_tool_node"
+        
+    return "discovery_finalize_node"
+
+
+# ==========================================
+# ĐỊNH TUYẾN CHO ĐỒ THỊ CHÍNH (MAIN GRAPH)
+# ==========================================
+
+# SỬA ĐỔI: Sử dụng start_router chuẩn để bypass qua Subgraph nếu đã có workspace_path
+def start_router(state: AgentState) -> Literal["detect_workspace", "context_loader"]:
     if not state.get("workspace_path"):
         return "detect_workspace"
+    return "context_loader"
+
+
+# THÊM MỚI: Định tuyến sau git_setup giúp bỏ qua Planner nếu đã có sẵn kế hoạch từ bước Triage (Fast-Track)
+def git_setup_router(state: AgentState) -> Literal["planner", "analysis_executor", "development_executor"]:
+    # Nếu đã có sẵn kế hoạch (ví dụ từ Triage chế độ đơn giản)
+    if state.get("plan"):
+        task_type = state.get("task_type", "development")
+        if task_type == "analysis":
+            return "analysis_executor"
+        return "development_executor"
     return "planner"
 
 
 def planner_router(state: AgentState) -> Literal["analysis_executor", "development_executor"]:
     task_type = state.get("task_type", "development")
     if task_type == "analysis":
-        print("--> Kích hoạt khảo sát đồ thị nhiệm vụ (DAG) để tối ưu hóa hiệu năng.")
+        print("--> Kích hoạt khảo sát đồ thị nhiệm vụ (DAG).")
         return "analysis_executor"
         
-    print("--> Kích hoạt phát triển đồ thị nhiệm vụ (DAG) để sửa đổi tối ưu.")
+    print("--> Kích hoạt phát triển đồ thị nhiệm vụ (DAG).")
     return "development_executor"
 
 
@@ -25,13 +59,9 @@ def analysis_router(state: AgentState) -> Literal["tool_node", "analysis_executo
         return "synthesis"
           
     last_message = messages[-1]
-    
-    # 1. Nếu tin nhắn AI yêu cầu gọi Tool -> Route đến tool_node để thực thi
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
         return "tool_node"
         
-    # 2. Nếu AI trả lời bình thường (không gọi Tool) -> Hoàn thành bước hiện tại
-    # Kiểm duyệt xem còn bất kỳ task nào chưa hoàn thành hay không
     plan = state["plan"]
     pending_tasks = [t for t in plan if (getattr(t, "status", None) or t.get("status")) == "pending"]
     
@@ -46,12 +76,9 @@ def development_router(state: AgentState) -> Literal["tool_node", "development_e
         return "tester"
         
     last_message = messages[-1]
-    
-    # 1. Nếu tin nhắn AI yêu cầu gọi Tool -> Route đến tool_node để thực thi
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
         return "tool_node"
         
-    # 2. Nếu AI trả lời bình thường (không gọi Tool) -> Hoàn thành bước hiện tại
     plan = state["plan"]
     pending_tasks = [t for t in plan if (getattr(t, "status", None) or t.get("status")) == "pending"]
     

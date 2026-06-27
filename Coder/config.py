@@ -11,7 +11,7 @@ os.environ["LANGCHAIN_PROJECT"] = "LangGraph-Production-Coder-V3"
 
 from langchain_openai import ChatOpenAI
 
-# Khởi tạo Model tương thích với môi trường cục bộ của bạn
+# Khởi tạo Model
 model = ChatOpenAI(
     base_url="http://localhost:20128/v1",
     api_key="khongco",  # type: ignore
@@ -71,8 +71,12 @@ class GitIgnoreMatcher:
 
 def sanitize_and_resolve_path(workspace: str, raw_target_path: str, create_parent: bool = False) -> Path:
     cleaned = raw_target_path.replace('"', '').replace("'", "").replace("\\", "/").strip()
-    workspace_path = Path(workspace).resolve()
+    # GIẢI PHÁP: Sử dụng expanduser() để dịch dấu ~ thành thư mục Home [2]
+    workspace_path = Path(workspace).expanduser().resolve()
+    
     target_path = Path(cleaned)
+    if cleaned.startswith("~"):
+        target_path = target_path.expanduser()
     
     if target_path.is_absolute():
         try:

@@ -8,7 +8,7 @@ from langgraph.graph.message import add_messages
 # CẤU TRÚC ĐẦU RA MONG MUỐN (STRUCTURED OUTPUT)
 # ==========================================
 class WorkspaceDetection(BaseModel):
-    workspace_path: str = Field(description="Đường dẫn của workspace chứa dự án.")
+    workspace_path: str = Field(description="Đường dẫn tuyệt đối đã xác minh của workspace chứa dự án.")
 
 class Task(BaseModel):
     id: str = Field(description="Mã định danh duy nhất cho nhiệm vụ, ví dụ: 'T1', 'T2'")
@@ -25,7 +25,7 @@ class TaskPlan(BaseModel):
 
 class TaskTriage(BaseModel):
     is_simple: bool = Field(
-        description="True nếu yêu cầu của người dùng cực kỳ đơn giản (chỉ cần sửa đổi 1-2 file, thêm tính năng nhỏ, sửa lỗi cú pháp). False nếu yêu cầu phức tạp cần khảo sát sâu hoặc thiết kế nhiều bước."
+        description="True nếu yêu cầu cực kỳ đơn giản (chỉ cần sửa đổi trực tiếp 1-2 file, thêm tính năng nhỏ, sửa lỗi cú pháp). False nếu yêu cầu phức tạp cần khảo sát sâu hoặc thiết kế nhiều bước."
     )
     task_type: Literal["analysis", "development"] = Field(
         description="Phân loại hướng xử lý của yêu cầu."
@@ -44,15 +44,23 @@ def reduce_findings(left: Union[List[str], None], right: Union[List[str], None])
     return left_list + right_list
 
 
+# Trạng thái của Đồ thị chính
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
     workspace_path: str
     workspace_context: str  
-    plan: List[Task]                      # <--- THAY ĐỔI: Chuyển sang lưu trữ danh sách Task (DAG)
+    plan: List[Task]                      
     task_type: Literal["analysis", "development"]
     git_branch: str
     error_logs: str
     modified_files: List[str]
     attempts: int
     step_findings: Annotated[List[str], reduce_findings]
-    last_executed_task_ids: List[str]     # <--- THÊM MỚI: Theo dõi vết các task vừa chạy để phục vụ rollback khi test lỗi
+    last_executed_task_ids: List[str]     
+
+
+# Trạng thái độc lập của Đồ thị con dò tìm Workspace [1.2.2]
+class WorkspaceDiscoveryState(TypedDict):
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+    workspace_path: str
+    finished: bool

@@ -1,12 +1,61 @@
 # tools.py
 import json
 import subprocess
-import re  # <--- THÊM IMPORT THƯ VIỆN RE Ở ĐẦU FILE
+import re
 from pathlib import Path
 from typing import List, Union, Type
 from pydantic import BaseModel, Field
 from langchain_core.tools import BaseTool, tool
 from config import GitIgnoreMatcher, sanitize_and_resolve_path
+
+# ==========================================
+# CÁC CÔNG CỤ DÒ TÌM HỆ THỐNG THỰC TẾ (SENSING TOOLS) [1.2.3]
+# ==========================================
+@tool
+def get_current_working_directory() -> str:
+    """Trả về đường dẫn thư mục làm việc hiện tại (Current Working Directory - CWD) của tiến trình đang chạy Agent."""
+    return str(Path.cwd().resolve())
+
+
+@tool
+def check_path_exists(path_str: str) -> str:
+    """Kiểm tra xem một đường dẫn cụ thể trên máy tính có tồn tại vật lý không và trả về đường dẫn tuyệt đối đã được chuẩn hóa (bao gồm cả việc dịch dấu ~)."""
+    try:
+        p = Path(path_str).expanduser().resolve()
+        exists = p.exists()
+        is_dir = p.is_dir() if exists else False
+        return json.dumps({
+            "exists": exists,
+            "is_directory": is_dir,
+            "resolved_absolute_path": str(p) if exists else None
+        }, ensure_ascii=False)
+    except Exception as e:
+        return f"Lỗi kiểm tra đường dẫn: {str(e)}"
+
+
+@tool
+def find_project_root(start_path: str) -> str:
+    """Tìm kiếm ngược lên trên (upwards) từ một đường dẫn bắt đầu để tìm kiếm các tệp tin đánh dấu gốc dự án như '.git', 'package.json', 'pyproject.toml', 'requirements.txt', 'THONGTIN.md'."""
+    try:
+        current = Path(start_path).expanduser().resolve()
+        markers = [".git", "package.json", "pyproject.toml", "requirements.txt", "THONGTIN.md", "main.py"]
+        
+        # Quét ngược lên tối đa 5 cấp thư mục cha
+        for _ in range(5):
+            for marker in markers:
+                if (current / marker).exists():
+                    return json.dumps({
+                        "found": True,
+                        "project_root": str(current),
+                        "matched_marker": marker
+                    }, ensure_ascii=False)
+            if current.parent == current:
+                break
+            current = current.parent
+            
+        return json.dumps({"found": False, "message": "Không tìm thấy file đánh dấu dự án nào ở các thư mục cha."}, ensure_ascii=False)
+    except Exception as e:
+        return f"Lỗi tìm kiếm dự án gốc: {str(e)}"
 
 # ==========================================
 # SCHEMAS PHỤC VỤ TOOL CALLING
@@ -18,7 +67,7 @@ class WriteFileSchema(BaseModel):
     file_path: str = Field(description="Đường dẫn tương đối của tệp tin trong workspace cần ghi hoặc cập nhật.")
     content: str = Field(description="Toàn bộ nội dung tệp tin chi tiết cần lưu xuống đĩa.")
 
-class ApplyPatchSchema(BaseModel):  # <--- THÊM SCHEMA CHO BẢN VÁ MỚI
+class ApplyPatchSchema(BaseModel):
     file_path: str = Field(description="Đường dẫn tương đối của tệp tin trong workspace cần sửa đổi.")
     patch_block: str = Field(
         description="Khối bản vá Tìm kiếm & Thay thế (Search-and-Replace) bắt buộc viết theo định dạng:\n"
@@ -60,7 +109,7 @@ class WriteFileTool(BaseTool):
         return tools_mgr.write_file(file_path, content)
 
 
-class ApplyPatchTool(BaseTool):  # <--- THÊM CLASS LỚP CÔNG CỤ APY PATCH TOOL
+class ApplyPatchTool(BaseTool):
     name: str = "apply_search_replace_patch"
     description: str = "Áp dụng bản vá sửa đổi cục bộ tối giản vào một tệp tin thông qua khối Tìm kiếm & Thay thế (Search-and-Replace)."
     args_schema: Type[BaseModel] = ApplyPatchSchema
@@ -97,7 +146,7 @@ class RunTerminalTool(BaseTool):
 # ==========================================
 class GitManager:
     def __init__(self, workspace_path: str):
-        self.workspace = Path(workspace_path).resolve()
+        self.workspace = Path(workspace_path).expanduser().resolve()
         
     def _run_cmd(self, args: list, ignore_error: bool = False) -> str:
         try:
@@ -114,10 +163,9 @@ class GitManager:
 
     def init_and_prepare_branch(self) -> str:
         git_dir = self.workspace / ".git"
+        # GIẢI PHÁP: Không tự khởi tạo git mới nếu chưa có sẵn. Báo lỗi để chuyển sang chế độ không Git.
         if not git_dir.exists():
-            # Thay vì tự ý chạy "git init", chúng ta ném ra lỗi để cảnh báo
-            # (Node xử lý phía trên sẽ bắt điều kiện này trước khi gọi hàm)
-            raise RuntimeError("Thư mục hiện tại không phải là một Git repository.")
+            raise RuntimeError("Thư mục hiện tại chưa được khởi tạo Git repository.")
             
         branch_name = "ai-development"
         branches_str = self._run_cmd(["git", "branch"], ignore_error=True)
@@ -138,38 +186,26 @@ class GitManager:
 
 class WorkspaceTools:
     def __init__(self, workspace_path: str):
-        self.workspace = Path(workspace_path).resolve()
+        self.workspace = Path(workspace_path).expanduser().resolve()
 
     def _normalize_file_paths(self, file_paths: Union[str, List[str]]) -> List[str]:
-        """Chuẩn hóa mọi dạng đầu vào từ LLM (chuỗi JSON, chuỗi thô, list) về List[str] sạch sẽ."""
         if not file_paths:
             return []
-            
-        # 1. Nếu đã là một List thực sự
         if isinstance(file_paths, list):
             cleaned = []
             for p in file_paths:
                 if isinstance(p, str):
-                    # Gọi đệ quy đề phòng trường hợp phần tử bên trong list vẫn bị bọc chuỗi JSON
                     cleaned.extend(self._normalize_file_paths(p))
             return cleaned
-            
-        # 2. Nếu đầu vào là một String
         if isinstance(file_paths, str):
             raw_str = file_paths.strip()
-            
-            # Kiểm tra nếu chuỗi trông giống như một JSON Array (bắt đầu bằng [ và kết thúc bằng ])
             if raw_str.startswith('[') and raw_str.endswith(']'):
                 try:
-                    # Thử giải mã JSON
                     parsed = json.loads(raw_str)
                     if isinstance(parsed, list):
                         return [str(p).strip() for p in parsed if p]
                 except json.JSONDecodeError:
                     pass
-                
-                # Nếu không phải JSON hợp lệ (ví dụ: [lib/main.dart, lib/routes.dart] không có dấu nháy)
-                # Tiến hành cắt bỏ cặp ngoặc [] và tách thủ công bằng dấu phẩy
                 inner = raw_str[1:-1].strip()
                 if inner:
                     parts = []
@@ -178,8 +214,6 @@ class WorkspaceTools:
                         if part_clean:
                             parts.append(part_clean)
                     return parts
-            
-            # Kiểm tra nếu chuỗi chứa dấu phẩy phân cách mà không phải cấu trúc JSON
             if ',' in raw_str and not raw_str.startswith('{'):
                 parts = []
                 for part in raw_str.split(','):
@@ -187,16 +221,12 @@ class WorkspaceTools:
                     if part_clean:
                         parts.append(part_clean)
                 return parts
-            
-            # Xử lý trường hợp chuỗi đơn bị bọc nháy kép hoặc nháy đơn dư thừa từ LLM
             cleaned_path = raw_str.strip('"').strip("'").strip()
             if cleaned_path:
                 return [cleaned_path]
-                
         return []
 
     def read_files(self, file_paths: Union[str, List[str]]) -> str:
-        # Sử dụng hàm chuẩn hoá đầu vào mới được thiết kế
         paths = self._normalize_file_paths(file_paths)
         if not paths:
             return "Lỗi: Danh sách đường dẫn tệp tin trống hoặc không thể phân tích định dạng."
@@ -227,19 +257,19 @@ class WorkspaceTools:
         except Exception as e:
             return f"Lỗi ghi tệp: {str(e)}"
 
-    def apply_search_replace_patch(self, file_path: str, patch_block: str) -> str:  # <--- HÀM XỬ LÝ VẬT LÝ BẢN VÁ
+    def apply_search_replace_patch(self, file_path: str, patch_block: str) -> str:
         try:
             safe_path = sanitize_and_resolve_path(str(self.workspace), file_path, create_parent=False)
             if not safe_path.exists():
                 return f"Lỗi: Không tìm thấy tệp tin '{file_path}' cần áp dụng bản vá."
                 
-            # Phân tích cú pháp khối Search-and-Replace
-            pattern = r"<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n>>>>>>> REPLACE"
+            # SỬA ĐỔI: Tối ưu hóa Regex để xử lý linh hoạt khoảng trắng và ký tự xuống dòng (\r\n hoặc \n)
+            pattern = r"<<<<<<<\s*SEARCH\s*[\r\n]+(.*?)(?:[\r\n]+)=======\s*[\r\n]+(.*?)(?:[\r\n]+)>>>>>>>\s*REPLACE"
             match = re.search(pattern, patch_block, re.DOTALL)
             
             if not match:
                 return (
-                    "Lỗi: Bản vá không đúng định dạng. Bạn bắt buộc phải tuân thủ chính xác cấu trúc:\n"
+                    "Lỗi: Bản vá không đúng định dạng. Bạn bắt buộc phải tuân thủ cấu trúc:\n"
                     "<<<<<<< SEARCH\n"
                     "[Mã nguồn cũ cần tìm chính xác]\n"
                     "=======\n"
@@ -247,23 +277,32 @@ class WorkspaceTools:
                     ">>>>>>> REPLACE"
                 )
                 
-            search_code = match.group(1)
-            replace_code = match.group(2)
+            search_code = match.group(1).strip("\r\n")
+            replace_code = match.group(2).strip("\r\n")
             
             original_content = safe_path.read_text(encoding="utf-8")
             
-            # Đảm bảo khối SEARCH tồn tại khớp chính xác trong tệp
-            if search_code not in original_content:
+            # Khớp lỏng hơn bằng cách chuẩn hóa kết thúc dòng khi tìm kiếm
+            # (Giúp công cụ bền bỉ hơn khi làm việc với môi trường đa nền tảng)
+            normalized_search = search_code.replace("\r\n", "\n")
+            normalized_original = original_content.replace("\r\n", "\n")
+            
+            if normalized_search not in normalized_original:
                 return (
                     f"Lỗi: Không tìm thấy phân đoạn mã SEARCH được chỉ định trong tệp '{file_path}'.\n"
-                    "Hãy chắc chắn rằng bạn đã copy chính xác từng khoảng trắng, thụt lề dòng (indentation), "
-                    "và ký tự xuống dòng từ nội dung gốc của tệp."
+                    "Hãy chắc chắn rằng bạn đã copy chính xác từng khoảng trắng và ký tự từ nội dung gốc."
                 )
                 
-            # Thay thế cục bộ (Chỉ thay thế khớp đầu tiên để đảm bảo tính toàn vẹn)
-            new_content = original_content.replace(search_code, replace_code, 1)
-            safe_path.write_text(new_content, encoding="utf-8")
+            # Thực hiện thay thế và lưu lại cấu trúc xuống dòng ban đầu của tệp
+            new_content_normalized = normalized_original.replace(normalized_search, replace_code, 1)
             
+            # Trả lại định dạng dòng ban đầu của hệ điều hành
+            if "\r\n" in original_content and "\r\n" not in new_content_normalized:
+                new_content = new_content_normalized.replace("\n", "\r\n")
+            else:
+                new_content = new_content_normalized
+                
+            safe_path.write_text(new_content, encoding="utf-8")
             return f"Thành công: Đã áp dụng bản vá Search-and-Replace cho tệp '{file_path}'."
             
         except Exception as e:
@@ -334,50 +373,3 @@ class WorkspaceTools:
             return f"Lỗi: Lệnh bị buộc dừng do vượt quá thời gian chờ (timeout) {timeout} giây."
         except Exception as e:
             return f"Lỗi thực thi lệnh terminal: {str(e)}"
-        
-        
-@tool
-def get_current_working_directory() -> str:
-    """Trả về đường dẫn thư mục làm việc hiện tại (Current Working Directory - CWD) của tiến trình đang chạy Agent."""
-    return str(Path.cwd().resolve())
-
-
-@tool
-def check_path_exists(path_str: str) -> str:
-    """Kiểm tra xem một đường dẫn cụ thể trên máy tính có tồn tại không và trả về đường dẫn tuyệt đối đã được chuẩn hóa (bao gồm cả việc dịch dấu ~)."""
-    try:
-        p = Path(path_str).expanduser().resolve()
-        exists = p.exists()
-        is_dir = p.is_dir() if exists else False
-        return json.dumps({
-            "exists": exists,
-            "is_directory": is_dir,
-            "resolved_absolute_path": str(p) if exists else None
-        }, ensure_ascii=False)
-    except Exception as e:
-        return f"Lỗi kiểm tra đường dẫn: {str(e)}"
-
-
-@tool
-def find_project_root(start_path: str) -> str:
-    """Tìm kiếm ngược lên trên (upwards) từ một đường dẫn bắt đầu để tìm kiếm các tệp tin đánh dấu gốc dự án như '.git', 'package.json', 'pyproject.toml', 'requirements.txt', 'THONGTIN.md'."""
-    try:
-        current = Path(start_path).expanduser().resolve()
-        markers = [".git", "package.json", "pyproject.toml", "requirements.txt", "THONGTIN.md", "main.py"]
-        
-        # Quét ngược lên tối đa 5 cấp thư mục cha để tìm thư mục gốc thực sự của dự án
-        for _ in range(5):
-            for marker in markers:
-                if (current / marker).exists():
-                    return json.dumps({
-                        "found": True,
-                        "project_root": str(current),
-                        "matched_marker": marker
-                    }, ensure_ascii=False)
-            if current.parent == current:
-                break
-            current = current.parent
-            
-        return json.dumps({"found": False, "message": "Không tìm thấy file đánh dấu dự án nào ở các thư mục cha."}, ensure_ascii=False)
-    except Exception as e:
-        return f"Lỗi tìm kiếm dự án gốc: {str(e)}"

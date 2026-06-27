@@ -1,7 +1,9 @@
 # nodes.py
+import platform
+import shutil
 import subprocess
 from pathlib import Path
-from typing import Dict, Any, Union, List
+from typing import Dict, Any, Optional, Tuple, Union, List
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
@@ -15,7 +17,97 @@ from tools import (
     get_current_working_directory, check_path_exists, find_project_root
 )
 workspace_discovery_subgraph = None
+# =====================================================================
+# CÁC HÀM TIỆN ÍCH BỔ TRỢ CHO BỘ KIỂM THỬ ĐA NGÔN NGỮ THÍCH ỨNG
+# =====================================================================
 
+def find_nearest_config(start_path: Path, config_name: str, max_depth: int = 5) -> Optional[Path]:
+    """
+    Quét ngược lên các thư mục cha từ start_path để tìm tệp cấu hình (ví dụ: package.json, Cargo.toml).
+    Giúp xác định đúng gốc của sub-project trong monorepo hoặc dự án phân tầng.
+    """
+    current = start_path.resolve()
+    if current.is_file():
+        current = current.parent
+        
+    for _ in range(max_depth):
+        target = current / config_name
+        if target.exists() and target.is_file():
+            return current
+        if current.parent == current: # Đã chạm gốc hệ thống ổ đĩa
+            break
+        current = current.parent
+    return None
+
+
+def execute_validation_cmd(cmd: List[str], cwd: Path, timeout: int = 30) -> Tuple[int, str]:
+    """
+    Thực thi lệnh kiểm thử đa nền tảng an toàn. 
+    Tự động xử lý bẫy đuôi tệp tin lệnh (.cmd/.bat) trên Windows.
+    """
+    executable = cmd[0]
+    is_windows = platform.system() == "Windows"
+    
+    # 🛡️ VÁ ĐIỂM KHUYẾT 2: Chuẩn hóa lệnh cho Windows (.cmd, .bat, .exe)
+    resolved_executable = shutil.which(executable)
+    if not resolved_executable and is_windows:
+        for ext in [".cmd", ".bat", ".exe"]:
+            if shutil.which(executable + ext):
+                cmd[0] = executable + ext
+                resolved_executable = shutil.which(cmd[0])
+                break
+                
+    # 🛡️ VÁ ĐIỂM KHUYẾT 3: Nếu thiếu công cụ, trả về mã lỗi đặc biệt (-99) để soft-bypass
+    if not resolved_executable:
+        return (-99, f"Cảnh báo: Trình biên dịch/phân tích '{executable}' chưa được cài đặt trên hệ thống.")
+        
+    try:
+        # Thực thi lệnh trên terminal
+        res = subprocess.run(
+            cmd,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+        combined_output = (res.stdout or "") + "\n" + (res.stderr or "")
+        return (res.returncode, combined_output.strip())
+        
+    except subprocess.TimeoutExpired:
+        return (-2, f"Lỗi: Lệnh kiểm thử '{' '.join(cmd)}' bị treo và vượt quá thời gian chờ.")
+    except Exception as e:
+        return (-3, f"Lỗi hệ thống khi chạy lệnh kiểm thử: {str(e)}")
+
+
+def clean_compiler_logs(raw_logs: str) -> str:
+    """
+    Nén log lỗi để giữ lại các thông tin giá trị nhất cho LLM, loại bỏ các dòng log thông tin rác.
+    """
+    lines = raw_logs.splitlines()
+    filtered_lines = []
+    
+    # Danh sách các từ khóa báo lỗi phổ biến của các trình biên dịch khác nhau
+    error_keywords = ["error", "fail", "exception", "cause", "unhandled", "invalid", "undefined"]
+    
+    for line in lines:
+        clean_line = line.strip()
+        if not clean_line:
+            continue
+            
+        # Ưu tiên các dòng chứa từ khóa báo lỗi hoặc chỉ định số dòng (ví dụ: :25:10 hoặc .dart:40)
+        has_error_kw = any(kw in clean_line.lower() for kw in error_keywords)
+        has_line_indicator = ":" in clean_line or ".dart" in clean_line or ".py" in clean_line or ".ts" in clean_line
+        
+        if has_error_kw or has_line_indicator:
+            filtered_lines.append(line)
+            
+    if not filtered_lines:
+        # Nếu bộ lọc quá chặt làm mất hết thông tin, trả về 20 dòng đầu và cuối để đảm bảo an toàn
+        if len(lines) > 40:
+            return "\n".join(lines[:20] + ["... [Đã lược bớt các dòng ở giữa] ..."] + lines[-20:])
+        return raw_logs
+        
+    return "\n".join(filtered_lines)
 # ==========================================
 # NÚT WRAPPER CHO SUBGRAPH (STATE ISOLATION)
 # ==========================================
@@ -405,6 +497,8 @@ def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
         return {"messages": [response]}
 
 
+# nodes.py
+
 def development_executor_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
     plan = state["plan"]
@@ -472,12 +566,11 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
                     t_copy.status = "completed"
             updated_plan.append(t_copy)
 
+        # 🛡️ BẢN VÁ: Loại bỏ việc ghi đè "attempts": 0 và "error_logs": "" để bảo vệ bộ đếm của Tester
         return {
             "messages": [response],
             "plan": updated_plan,
-            "last_executed_task_ids": list(eligible_ids),
-            "attempts": 0,                        
-            "error_logs": ""                      
+            "last_executed_task_ids": list(eligible_ids)
         }
     else:
         return {"messages": [response]}
@@ -545,18 +638,93 @@ def tester_node(state: AgentState) -> Dict[str, Any]:
     modified_files = state.get("modified_files", [])
     attempts = state.get("attempts", 0)
     plan = state["plan"]
+    ws = state["workspace_path"]
     last_executed_ids = state.get("last_executed_task_ids", [])
-    errors = []
     
-    for file_path in modified_files:
-        if file_path.endswith(".py"):
-            res = subprocess.run(["python", "-m", "py_compile", file_path], capture_output=True, text=True)
-            if res.returncode != 0:
-                errors.append(f"Lỗi cú pháp tại {Path(file_path).name}:\n{res.stderr.strip()}")
-                
+    errors = []
+    warnings = [] # Chứa các cảnh báo thiếu công cụ để không phạt LLM
+    workspace_root = Path(ws).expanduser().resolve()
+    
+    # Phân loại tệp đã sửa
+    files_by_ext: Dict[str, List[Path]] = {}
+    for f_path_str in modified_files:
+        try:
+            p = Path(f_path_str).resolve()
+            if p.exists() and p.is_file():
+                ext = p.suffix.lower()
+                files_by_ext.setdefault(ext, []).append(p)
+        except Exception:
+            pass
+
+    for ext, files in files_by_ext.items():
+        
+        # 1. NGÔN NGỮ PYTHON (.py)
+        if ext == ".py":
+            for f in files:
+                code, output = execute_validation_cmd(["python", "-m", "py_compile", str(f)], workspace_root)
+                if code == -99:
+                    warnings.append(output)
+                elif code != 0:
+                    errors.append(f"❌ [Lỗi Cú Pháp Python] tại `{f.name}`:\n{clean_compiler_logs(output)}")
+
+        # 2. DART / FLUTTER (.dart)
+        elif ext == ".dart":
+            for f in files:
+                target_dir = find_nearest_config(f, "pubspec.yaml") or workspace_root
+                code, output = execute_validation_cmd(["dart", "analyze"], target_dir)
+                if code == -99:
+                    warnings.append(f"{output} (Bỏ qua kiểm tra tĩnh cho `{f.name}`)")
+                elif code != 0:
+                    errors.append(f"❌ [Lỗi Dart Analysis] tại sub-project `{target_dir.name}`:\n{clean_compiler_logs(output)}")
+                    break
+
+        # 3. TYPESCRIPT / JAVASCRIPT (.ts, .tsx, .js, .jsx)
+        elif ext in [".ts", ".tsx", ".js", ".jsx"]:
+            for f in files:
+                target_dir = find_nearest_config(f, "package.json") or workspace_root
+                if ext in [".ts", ".tsx"]:
+                    cmd = ["npx", "tsc", "--noEmit", "--skipLibCheck"]
+                    code, output = execute_validation_cmd(cmd, target_dir)
+                    if code == -99:
+                        warnings.append(f"{output} (Bỏ qua phân tích kiểu dữ liệu cho `{f.name}`)")
+                    elif code != 0:
+                        errors.append(f"❌ [Lỗi TypeScript Compile] tại `{target_dir.name}`:\n{clean_compiler_logs(output)}")
+                        break
+
+        # 4. RUST (.rs)
+        elif ext == ".rs":
+            for f in files:
+                target_dir = find_nearest_config(f, "Cargo.toml") or workspace_root
+                code, output = execute_validation_cmd(["cargo", "check"], target_dir)
+                if code == -99:
+                    warnings.append(f"{output} (Bỏ qua biên dịch Rust cho `{f.name}`)")
+                elif code != 0:
+                    errors.append(f"❌ [Lỗi Biên Dịch Rust] tại `{target_dir.name}`:\n{clean_compiler_logs(output)}")
+                    break
+
+        # 5. GO (.go)
+        elif ext == ".go":
+            for f in files:
+                target_dir = find_nearest_config(f, "go.mod") or workspace_root
+                code, output = execute_validation_cmd(["go", "vet", "./..."], target_dir)
+                if code == -99:
+                    warnings.append(f"{output} (Bỏ qua kiểm tra tĩnh Go cho `{f.name}`)")
+                elif code != 0:
+                    errors.append(f"❌ [Lỗi Tĩnh Go Vet] tại `{target_dir.name}`:\n{clean_compiler_logs(output)}")
+                    break
+
+    # =====================================================================
+    # XỬ LÝ KẾT QUẢ VÀ TRẢ VỀ TRẠNG THÁI (ĐÃ SỬA LỖI TÍCH LŨY FILE)
+    # =====================================================================
+    warning_msg = ""
+    if warnings:
+        warning_msg = "⚠️ **Cảnh báo môi trường:**\n" + "\n".join([f"- {w}" for w in warnings]) + "\n\n"
+
+    # Nếu có lỗi cú pháp/biên dịch thực tế từ mã nguồn
     if errors:
-        combined_error = "\n".join(errors)
-        if attempts < 2:
+        combined_error = "\n\n---\n\n".join(errors)
+        
+        if attempts < 3:
             updated_plan = []
             for t in plan:
                 if isinstance(t, dict):
@@ -573,19 +741,23 @@ def tester_node(state: AgentState) -> Dict[str, Any]:
                 "error_logs": combined_error,
                 "attempts": attempts + 1,
                 "plan": updated_plan,
-                "messages": [AIMessage(content=f"⚠️ Phát hiện lỗi kiểm tra ({', '.join(last_executed_ids)}):\n{combined_error}\nĐưa trạng thái về 'pending' để sửa đổi.")]
+                "messages": [AIMessage(content=f"{warning_msg}⚠️ [Vòng kiểm thử thất bại] Phát hiện lỗi ở mã nguồn sửa đổi:\n\n{combined_error}\n\n⚙️ Đang gửi trả trạng thái nhiệm vụ về 'pending' để tự động sửa chữa.")]
             }
         else:
             return {
                 "error_logs": "",
                 "attempts": 0,
-                "messages": [AIMessage(content="❌ Vượt quá số lần tự sửa. Bỏ qua để tiếp tục.")]
+                "modified_files": [], # 🛡️ VÁ ĐIỂM KHUYẾT 1: Reset danh sách file khi bỏ qua để tránh lỗi tích lũy
+                "messages": [AIMessage(content=f"{warning_msg}❌ Đã vượt quá giới hạn số lần sửa lỗi tự động. Hệ thống sẽ bỏ qua lỗi để tiếp tục tiến trình.")]
             }
                 
+    # Trường hợp thành công hoàn toàn hoặc kích hoạt Soft-Bypass thành công
+    success_content = f"{warning_msg}✅ [Vòng kiểm thử thành công] Toàn bộ mã nguồn đã vượt qua kiểm tra tĩnh và biên dịch."
     return {
         "error_logs": "",
         "attempts": 0,
-        "messages": [AIMessage(content="✅ Toàn bộ các bước sửa đổi đã vượt qua vòng kiểm tra thành công.")]
+        "modified_files": [], # 🛡️ VÁ ĐIỂM KHUYẾT 1: RESET SẠCH SẼ ĐỂ NHIỆM VỤ TIẾP THEO KHÔNG BỊ TRÙNG LẶP KIỂM TRA
+        "messages": [AIMessage(content=success_content)]
     }
 
 

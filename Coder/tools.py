@@ -9,7 +9,7 @@ from langchain_core.tools import BaseTool, tool
 from config import GitIgnoreMatcher, sanitize_and_resolve_path
 
 # ==========================================
-# CÁC CÔNG CỤ DÒ TÌM HỆ THỐNG THỰC TẾ (SENSING TOOLS) [1.2.3]
+# CÁC CÔNG CỤ DÒ TÌM HỆ THỐNG THỰC TẾ (SENSING TOOLS)
 # ==========================================
 @tool
 def get_current_working_directory() -> str:
@@ -100,7 +100,6 @@ class ReadFileLinesTool(BaseTool):
 
     def _run(self, file_path: str, start_line: int, end_line: int) -> str:
         try:
-            # Giải quyết đường dẫn tuyệt đối an toàn
             safe_path = sanitize_and_resolve_path(self.workspace_path, file_path, create_parent=False)
             if not safe_path.exists():
                 return f"Lỗi: Không tìm thấy tệp '{file_path}'"
@@ -108,22 +107,18 @@ class ReadFileLinesTool(BaseTool):
             if safe_path.is_dir():
                 return f"Lỗi: '{file_path}' là một thư mục, vui lòng truyền đường dẫn tệp tin cụ thể."
             
-            # Đọc toàn bộ dòng để xử lý cắt lát (slicing)
             content = safe_path.read_text(encoding="utf-8")
             lines = content.splitlines()
             total_lines = len(lines)
             
-            # Phòng thủ giới hạn đầu vào của Agent (bảo vệ biên)
             start = max(1, start_line)
             end = min(total_lines, end_line)
             
             if start > total_lines or start > end:
                 return f"Lỗi: Phạm vi dòng yêu cầu ({start_line} - {end_line}) vượt quá giới hạn của tệp (Tệp hiện có {total_lines} dòng)."
             
-            # Lấy các dòng được yêu cầu (mảng Python tính từ chỉ số 0)
             selected_lines = lines[start - 1 : end]
             
-            # Định dạng đầu ra đi kèm số dòng hiển thị rõ ràng
             formatted_lines = []
             for idx, line in enumerate(selected_lines, start=start):
                 formatted_lines.append(f"{idx:04d} | {line}")
@@ -137,6 +132,7 @@ class ReadFileLinesTool(BaseTool):
         
 class UniversalSearchSchema(BaseModel):
     file_path: str = Field(description="Đường dẫn tương đối của tệp tin nguồn trong workspace cần quét cấu trúc ký hiệu.")
+
 
 class UniversalSymbolSearchTool(BaseTool):
     name: str = "search_symbols_universal"
@@ -165,21 +161,14 @@ class UniversalSymbolSearchTool(BaseTool):
         Xóa sạch comment một dòng và mọi chuỗi ký tự nằm trong ngoặc đơn/kép/template literal 
         để loại bỏ hoàn toàn các dấu ngoặc nhọn { } gây nhiễu trong chuỗi.
         """
-        # 1. Xóa comment một dòng tùy theo ngôn ngữ
         if ext in [".py", ".yaml", ".yml"]:
             clean_line = re.sub(r"#.*$", "", line)
         else:
             clean_line = re.sub(r"//.*$", "", line)
 
-        # 2. Xóa các chuỗi ký tự ngoặc kép "..." (bao gồm cả xử lý ký tự escape \")
         clean_line = re.sub(r'"(?:[^"\\]|\\.)*"', '""', clean_line)
-        
-        # 3. Xóa các chuỗi ký tự ngoặc đơn '...'
         clean_line = re.sub(r"'(?:[^'\\]|\\.)*'", "''", clean_line)
-        
-        # 4. Xóa chuỗi Template Literal `...` (cho JS, TS, Dart)
         clean_line = re.sub(r"`(?:[^`\\]|\\.)*`", "``", clean_line)
-        
         return clean_line
 
     def _find_brace_block_end(self, lines: list, start_idx: int, ext: str) -> int:
@@ -188,15 +177,18 @@ class UniversalSymbolSearchTool(BaseTool):
         found_first_brace = False
         end_idx = start_idx
         
-        # Phòng thủ: Kiểm tra xem đây có phải là Arrow Function một dòng không (JS/TS/Dart)
         first_line_clean = self._strip_strings_and_line_comments(lines[start_idx], ext)
-        if "=>" in first_line_clean and first_line_clean.endswith(";"):
-            return start_idx + 1 # Hàm một dòng, kết thúc ngay tại dòng bắt đầu
+        # JS/TS/Dart Arrow Function expression check (Hàm rút gọn không ngoặc nhọn)
+        if "=>" in first_line_clean and "{" not in first_line_clean:
+            return start_idx + 1
 
         for idx in range(start_idx, len(lines)):
             line = lines[idx]
-            # Làm sạch chuỗi và comment trên dòng hiện tại trước khi đếm ngoặc
             clean_line = self._strip_strings_and_line_comments(line, ext)
+            
+            # 🛡️ CHỐT CHẶN BẢO VỆ SEMICOLON: Tránh quét trôi đối với Prototype / Abstract Declarations kết thúc bằng ';'
+            if ";" in clean_line and not found_first_brace:
+                return idx + 1
             
             for char in clean_line:
                 if char == '{':
@@ -207,22 +199,33 @@ class UniversalSymbolSearchTool(BaseTool):
                     if found_first_brace:
                         brace_count -= 1
                         if brace_count == 0:
-                            return idx + 1 # Tìm thấy ngoặc đóng khớp hoàn toàn
+                            return idx + 1
             
             if found_first_brace and brace_count == 0:
                 return idx + 1
             
             end_idx = idx
             
-        return end_idx + 1 # Fallback về cuối file nếu gặp tệp khuyết ngoặc đóng
+        return end_idx + 1
 
     def _find_python_block_end(self, lines: list, start_idx: int) -> int:
-        """Thuật toán Indentation: Nhận diện ranh giới thụt lề của Python."""
+        """Thuật toán Indentation nâng cao: Nhận diện ranh giới thụt lề của Python xử lý tốt cả Multi-line Signatures."""
+        # 🛡️ ĐỊNH VỊ ĐẦU TIÊN: Tìm dòng thực sự kết thúc signature (có chứa dấu hai chấm ':')
+        sig_end_idx = start_idx
+        for idx in range(start_idx, len(lines)):
+            clean_line = lines[idx].strip()
+            # Xóa tạm thời comment để tránh nhầm lẫn dấu ':' nằm trong comment
+            clean_line = clean_line.split("#", 1)[0].strip()
+            if clean_line.endswith(":"):
+                sig_end_idx = idx
+                break
+        
         start_line = lines[start_idx]
         start_indent = len(start_line) - len(start_line.lstrip())
         
-        end_idx = start_idx
-        for idx in range(start_idx + 1, len(lines)):
+        end_idx = sig_end_idx
+        # Quét ranh giới thụt lề từ dòng tiếp sau signature kết thúc
+        for idx in range(sig_end_idx + 1, len(lines)):
             line = lines[idx]
             clean_line = line.strip()
             
@@ -262,36 +265,27 @@ class UniversalSymbolSearchTool(BaseTool):
             return "Type Alias 🏷️"
         return "Symbol 📄"
 
-    # ==========================================
-    # CÁC HÀM TIỆN ÍCH PHỤC VỤ TRÍ TUỆ NHÂN DIỆN MỚI
-    # ==========================================
     def _extract_symbol_name(self, decl: str) -> str:
         """Trích xuất duy nhất tên của hàm, phương thức hoặc Class từ chuỗi signature thô."""
         decl_clean = decl.strip()
-        # Loại bỏ decorators/annotations ở đầu nếu có
         decl_clean = re.sub(r"^@\w+\s+", "", decl_clean)
         
-        # 1. Class / Struct / Interface / Mixin / Extension / Enum / Impl
         match_type = re.search(r"\b(class|struct|interface|mixin|extension|enum|union|namespace|impl)\s+([a-zA-Z0-9_<>]+)", decl_clean)
         if match_type:
             return match_type.group(2)
         
-        # 2. Python / Ruby 'def'
         match_def = re.search(r"\bdef\s+([a-zA-Z0-9_]+)", decl_clean)
         if match_def:
             return match_def.group(1)
             
-        # 3. Rust / Swift / Kotlin 'fn'/'func'/'fun'
         match_fn = re.search(r"\b(fn|func|fun)\s+([a-zA-Z0-9_]+)", decl_clean)
         if match_fn:
             return match_fn.group(2)
             
-        # 4. JS/TS Arrow function định nghĩa qua biến: const/let/var name = ...
         match_arrow = re.search(r"\b(const|let|var)\s+([a-zA-Z0-9_]+)\s*=", decl_clean)
         if match_arrow:
             return match_arrow.group(2)
 
-        # 5. C/C++/Java/C#/Dart Signature truyền thống: Type name(Args)
         match_method = re.search(r"\b([a-zA-Z0-9_~]+)\s*\(", decl_clean)
         if match_method:
             name = match_method.group(1)
@@ -305,11 +299,8 @@ class UniversalSymbolSearchTool(BaseTool):
         Trích xuất thông minh phần giải thích/mô tả chức năng từ Docstrings hoặc Comments.
         """
         description_lines = []
-        def_idx = start_line_1based - 1 # Chuyển về 0-indexed đại diện dòng khai báo
+        def_idx = start_line_1based - 1
 
-        # --------------------------------------------------
-        # TRƯỜNG HỢP PYTHON: Quét xuôi xuống dưới tìm nháy ba (def_idx + 1)
-        # --------------------------------------------------
         if ext == ".py":
             docstring_started = False
             quote_char = None
@@ -336,7 +327,7 @@ class UniversalSymbolSearchTool(BaseTool):
                         if content:
                             description_lines.append(content)
                     else:
-                        break # Dòng code đầu tiên không phải Docstring, kết thúc tìm kiếm
+                        break
                 else:
                     if line.endswith(quote_char):
                         content = line[:-3]
@@ -349,9 +340,6 @@ class UniversalSymbolSearchTool(BaseTool):
             if description_lines:
                 return " ".join([l.strip() for l in description_lines if l.strip()]).strip()
 
-        # --------------------------------------------------
-        # TRƯỜNG HỢP C-STYLE / DART / TS: Quét ngược lên trên để nhặt Comments (def_idx - 1)
-        # --------------------------------------------------
         up_idx = def_idx - 1
         comment_block = []
         in_block_comment = False
@@ -363,20 +351,18 @@ class UniversalSymbolSearchTool(BaseTool):
                 if comment_block:
                     break
                 up_idx -= 1
-                if def_idx - up_idx > 3: # Giới hạn không quét quá xa
+                if def_idx - up_idx > 3:
                     break
                 continue
             
-            # Xử lý Single-line comments (// hoặc ///)
             if line.startswith("///") or line.startswith("//"):
                 cleaned_comment = line.lstrip("/").strip()
                 comment_block.insert(0, cleaned_comment)
                 up_idx -= 1
-            # Xử lý kết thúc Block comment (*/) khi dò ngược từ dưới lên
             elif line.endswith("*/"):
                 in_block_comment = True
                 cleaned = line.rstrip("*/").strip()
-                if cleaned.startswith("/*"): # Trường hợp một dòng duy nhất /* comment */
+                if cleaned.startswith("/*"):
                     cleaned = cleaned.lstrip("/*").strip()
                     comment_block.insert(0, cleaned)
                     break
@@ -395,13 +381,11 @@ class UniversalSymbolSearchTool(BaseTool):
                     comment_block.insert(0, cleaned)
                 up_idx -= 1
             else:
-                break # Gặp dòng code bình thường, dừng quét ngược
+                break
                 
         if comment_block:
-            # Gộp các dòng comment thành một chuỗi duy nhất, loại bỏ khoảng trắng thừa
             return " ".join([c.strip() for c in comment_block if c.strip()]).strip()
             
-        # Thử nghiệm cuối cùng: Tìm comment cùng dòng với định nghĩa (e.g. def func(): # Mô tả)
         def_line = lines[def_idx]
         if "#" in def_line and ext == ".py":
             return def_line.split("#", 1)[1].strip()
@@ -422,23 +406,19 @@ class UniversalSymbolSearchTool(BaseTool):
             raw_content = safe_path.read_text(encoding="utf-8")
             ext = safe_path.suffix.lower()
             
-            # Tiền xử lý: Xóa sạch block comments nhưng vẫn giữ nguyên vị trí dòng
             clean_content = self._clean_block_comments(raw_content)
             lines = clean_content.splitlines()
             
-            # Bản đồ mẫu Regex của bạn (Được giữ nguyên vẹn các mẫu tối ưu hóa Dart, CPP...)
             patterns = {
+                # 🛡️ SỬA ĐỔI: Thêm (?:async\s+)? để khớp hàm async def của Python
                 ".py": [
                     r"^\s*(class\s+[a-zA-Z0-9_]+)",
-                    r"^\s*(def\s+[a-zA-Z0-9_]+)"
+                    r"^\s*(?:async\s+)?(def\s+[a-zA-Z0-9_]+)"
                 ],
                 ".dart": [
                     r"\b(class|mixin|extension)\s+[a-zA-Z0-9_<>]+",
-                    # Mẫu A: Có kiểu trả về đứng trước (bắt buộc có ít nhất 1 từ + khoảng trắng trước tên hàm)
                     r"^\s*(?:async\s+)?(?:[\w<>]+[\s\n]+)+([a-zA-Z0-9_]+)\s*\([^)]*\)\s*(?:async\s*)?\{?",
-                    # Mẫu B: Constructor hoặc phương thức không có kiểu trả về, bắt buộc kết thúc bằng {
                     r"^\s*(?:async\s+)?([a-zA-Z0-9_]+)\s*\([^)]*\)\s*(?:async\s*)?\{\s*$",
-                    # Mẫu C: Hàm rút gọn => bắt buộc có ký tự =>
                     r"^\s*(?:async\s+)?([a-zA-Z0-9_]+)\s*\([^)]*\)\s*=>"
                 ],
                 ".ts": [
@@ -467,9 +447,7 @@ class UniversalSymbolSearchTool(BaseTool):
                 ],
                 ".cpp": [
                     r"\b(class|struct|namespace)\s+[a-zA-Z0-9_]+",
-                    # Mẫu A: Có kiểu trả về đứng trước (bắt buộc có ít nhất một kiểu trả về / modifier)
                     r"^\s*(?:[\w&*<>:]+\s+)+([a-zA-Z0-9_~]+::)?([a-zA-Z0-9_~]+)\s*\([^)]*\)\s*(?:const|override|noexcept)?\s*\{?",
-                    # Mẫu B: Constructor/Destructor không có kiểu trả về, bắt buộc kết thúc bằng { (hoặc có Initializer List :)
                     r"^\s*(?:[a-zA-Z0-9_~]+::)?([a-zA-Z0-9_~]+)\s*\([^)]*\)\s*(?::\s*[a-zA-Z0-9_~]+\(.*?\))*\s*\{\s*$"
                 ],      
                 ".h": [
@@ -507,12 +485,17 @@ class UniversalSymbolSearchTool(BaseTool):
                 if not clean_line:
                     continue
                 
-                # Bỏ qua các comment một dòng thuần túy
+                # Bỏ qua các dòng comment một dòng thuần túy trước khi bắt đầu quét mẫu signature
                 if clean_line.startswith("//") or clean_line.startswith("#") or clean_line.startswith("/*") or clean_line.startswith("*"):
                     continue
                 
+                # 🛡️ NÂNG CẤP LỌC SẠCH: Chỉ quét Regex trên dòng đã xóa sạch chuỗi ký tự và comments để tránh khớp nhầm log/string
+                clean_matching_line = self._strip_strings_and_line_comments(line, ext)
+                if not clean_matching_line.strip():
+                    continue
+                
                 for pattern in selected_patterns:
-                    if re.search(pattern, line):
+                    if re.search(pattern, clean_matching_line):
                         start_line = line_no
                         
                         if ext == ".py":
@@ -520,9 +503,7 @@ class UniversalSymbolSearchTool(BaseTool):
                         else:
                             end_line = self._find_brace_block_end(lines, line_no - 1, ext)
                         
-                        # 1. Trích xuất tên hàm/class tinh gọn
                         symbol_name = self._extract_symbol_name(clean_line)
-                        # 2. Trích xuất mô tả chi tiết từ comment/docstring
                         description = self._extract_description(lines, line_no, ext)
                         
                         raw_symbols.append((start_line, end_line, symbol_name, description))
@@ -531,7 +512,6 @@ class UniversalSymbolSearchTool(BaseTool):
             if not raw_symbols:
                 return f"Thông báo: Đã quét tệp '{file_path}' nhưng không phát hiện cấu trúc đặc trưng nào."
             
-            # 📊 CẤU TRÚC LẠI THÀNH BẢNG MARKDOWN CHUẨN ĐẸP NHƯ HÌNH MINH HỌA
             table_rows = [
                 f"### 📊 DANH SÁCH CÁC HÀM TRONG `{file_path}`",
                 "",
@@ -540,7 +520,6 @@ class UniversalSymbolSearchTool(BaseTool):
             ]
             
             for stt, (start, end, name, desc) in enumerate(raw_symbols, 1):
-                # Hiển thị Tên hàm ở dạng inline code, hiển thị khoảng dòng rõ ràng
                 table_rows.append(f"| {stt} | `{name}` | {start:02d}-{end:02d} | {desc} |")
                 
             return "\n".join(table_rows)
@@ -627,7 +606,6 @@ class GitManager:
 
     def init_and_prepare_branch(self) -> str:
         git_dir = self.workspace / ".git"
-        # GIẢI PHÁP: Không tự khởi tạo git mới nếu chưa có sẵn. Báo lỗi để chuyển sang chế độ không Git.
         if not git_dir.exists():
             raise RuntimeError("Thư mục hiện tại chưa được khởi tạo Git repository.")
             
@@ -727,7 +705,6 @@ class WorkspaceTools:
             if not safe_path.exists():
                 return f"Lỗi: Không tìm thấy tệp tin '{file_path}' cần áp dụng bản vá."
                 
-            # SỬA ĐỔI: Tối ưu hóa Regex để xử lý linh hoạt khoảng trắng và ký tự xuống dòng (\r\n hoặc \n)
             pattern = r"<<<<<<<\s*SEARCH\s*[\r\n]+(.*?)(?:[\r\n]+)=======\s*[\r\n]+(.*?)(?:[\r\n]+)>>>>>>>\s*REPLACE"
             match = re.search(pattern, patch_block, re.DOTALL)
             
@@ -746,8 +723,6 @@ class WorkspaceTools:
             
             original_content = safe_path.read_text(encoding="utf-8")
             
-            # Khớp lỏng hơn bằng cách chuẩn hóa kết thúc dòng khi tìm kiếm
-            # (Giúp công cụ bền bỉ hơn khi làm việc với môi trường đa nền tảng)
             normalized_search = search_code.replace("\r\n", "\n")
             normalized_original = original_content.replace("\r\n", "\n")
             
@@ -757,10 +732,8 @@ class WorkspaceTools:
                     "Hãy chắc chắn rằng bạn đã copy chính xác từng khoảng trắng và ký tự từ nội dung gốc."
                 )
                 
-            # Thực hiện thay thế và lưu lại cấu trúc xuống dòng ban đầu của tệp
             new_content_normalized = normalized_original.replace(normalized_search, replace_code, 1)
             
-            # Trả lại định dạng dòng ban đầu của hệ điều hành
             if "\r\n" in original_content and "\r\n" not in new_content_normalized:
                 new_content = new_content_normalized.replace("\n", "\r\n")
             else:

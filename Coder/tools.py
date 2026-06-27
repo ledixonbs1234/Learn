@@ -190,7 +190,7 @@ class UniversalSymbolSearchTool(BaseTool):
         # Phòng thủ: Kiểm tra xem đây có phải là Arrow Function một dòng không (JS/TS/Dart)
         first_line_clean = self._strip_strings_and_line_comments(lines[start_idx], ext)
         if "=>" in first_line_clean and first_line_clean.endswith(";"):
-            return start_idx + 1 # Hàm một dòng, kết thúc ngay tại dòng bắt đầu [5]
+            return start_idx + 1 # Hàm một dòng, kết thúc ngay tại dòng bắt đầu
 
         for idx in range(start_idx, len(lines)):
             line = lines[idx]
@@ -213,7 +213,7 @@ class UniversalSymbolSearchTool(BaseTool):
             
             end_idx = idx
             
-        return end_idx + 1 # Fallback về cuối file nếu gặp file lỗi cú pháp bị khuyết ngoặc đóng
+        return end_idx + 1 # Fallback về cuối file nếu gặp tệp khuyết ngoặc đóng
 
     def _find_python_block_end(self, lines: list, start_idx: int) -> int:
         """Thuật toán Indentation: Nhận diện ranh giới thụt lề của Python."""
@@ -236,6 +236,34 @@ class UniversalSymbolSearchTool(BaseTool):
             
         return end_idx + 1
 
+    def _classify_symbol(self, matched_line: str, ext: str) -> str:
+        """Phân loại ký hiệu động dựa trên từ khóa khai báo để điền cột Loại Ký Hiệu."""
+        line_lower = matched_line.lower()
+        if "class " in line_lower:
+            return "Class 📁"
+        if "interface " in line_lower:
+            return "Interface 🔌"
+        if "struct " in line_lower:
+            return "Struct 📦"
+        if "namespace " in line_lower:
+            return "Namespace 🌐"
+        if "impl " in line_lower:
+            return "Implementation 🛠️"
+        if "mixin " in line_lower:
+            return "Mixin 🎛️"
+        if "extension " in line_lower:
+            return "Extension 🧩"
+        if "def " in line_lower or "fn " in line_lower or "func " in line_lower or "fun " in line_lower:
+            return "Method/Function ⚙️"
+        if "#define" in line_lower:
+            return "Macro 📌"
+        if "type " in line_lower:
+            return "Type Alias 🏷️"
+        return "Symbol 📄"
+
+    # ==========================================
+    # PHƯƠNG THỨC THỰC THI CHÍNH (RUN METHOD)
+    # ==========================================
     def _run(self, file_path: str) -> str:
         try:
             safe_path = sanitize_and_resolve_path(self.workspace_path, file_path, create_parent=False)
@@ -249,13 +277,13 @@ class UniversalSymbolSearchTool(BaseTool):
             clean_content = self._clean_block_comments(raw_content)
             lines = clean_content.splitlines()
             
-            # Bản đồ mẫu Regex hỗ trợ toàn diện các ngôn ngữ lập trình chính
+            # Bản đồ mẫu Regex của bạn (Được giữ nguyên vẹn các mẫu tối ưu hóa Dart, CPP...)
             patterns = {
                 ".py": [
                     r"^\s*(class\s+[a-zA-Z0-9_]+)",
                     r"^\s*(def\s+[a-zA-Z0-9_]+)"
                 ],
-               ".dart": [
+                ".dart": [
                     r"\b(class|mixin|extension)\s+[a-zA-Z0-9_<>]+",
                     # Mẫu A: Có kiểu trả về đứng trước (bắt buộc có ít nhất 1 từ + khoảng trắng trước tên hàm)
                     r"^\s*(?:async\s+)?(?:[\w<>]+[\s\n]+)+([a-zA-Z0-9_]+)\s*\([^)]*\)\s*(?:async\s*)?\{?",
@@ -304,22 +332,18 @@ class UniversalSymbolSearchTool(BaseTool):
                     r"\b(class|struct|namespace)\s+[a-zA-Z0-9_]+",
                     r"^\s*(?:[\w&*<>:]+\s+)*([a-zA-Z0-9_~]+::)?([a-zA-Z0-9_~]+)\s*\([^)]*\)\s*(?:const|override|noexcept)?\s*\{?"
                 ],
-                # 🛠️ THÊM MỚI: HỖ TRỢ JAVA (.java)
                 ".java": [
                     r"\b(?:public|protected|private|static|\s)+(?:class|interface|enum)\s+([a-zA-Z0-9_]+)",
                     r"^\s*(?:@\w+\s+)*(?:public|protected|private|static|final|synchronized|\s)+(?:[\w<>]+)\s+([a-zA-Z0-9_]+)\s*\([^)]*\)\s*(?:throws\s+[\w,\s]+)?\s*\{?"
                 ],
-                # 🛠️ THÊM MỚI: HỖ TRỢ C# (.cs)
                 ".cs": [
                     r"\b(?:public|protected|private|internal|static|\s)+(?:class|interface|struct|enum)\s+([a-zA-Z0-9_]+)",
                     r"^\s*(?:public|protected|private|internal|static|virtual|override|async|partial|\s)+(?:[\w<>]+)\s+([a-zA-Z0-9_]+)\s*\([^)]*\)\s*\{?"
                 ],
-                # 🛠️ THÊM MỚI: HỖ TRỢ SWIFT (.swift)
                 ".swift": [
                     r"\b(?:public|internal|private|fileprivate|open|\s)*(?:class|struct|protocol|enum|extension)\s+([a-zA-Z0-9_]+)",
                     r"\b(?:public|internal|private|fileprivate|open|static|class|override|async|\s)*func\s+([a-zA-Z0-9_]+)\s*\("
                 ],
-                # 🛠️ THÊM MỚI: HỖ TRỢ KOTLIN (.kt)
                 ".kt": [
                     r"\b(?:public|internal|private|protected|sealed|data|\s)*(?:class|interface|object)\s+([a-zA-Z0-9_]+)",
                     r"\b(?:public|internal|private|protected|override|actual|expect|inline|tailrec|\s)*fun\s+(?:\([^)]+\)\s*)?([a-zA-Z0-9_]+)\s*\("
@@ -327,7 +351,7 @@ class UniversalSymbolSearchTool(BaseTool):
             }
 
             selected_patterns = patterns.get(ext, [r"\b(class\s+\w+)", r"\b(function\s+\w+)"])
-            matched_symbols = []
+            raw_symbols = []
             
             for line_no, line in enumerate(lines, 1):
                 clean_line = line.strip()
@@ -347,16 +371,27 @@ class UniversalSymbolSearchTool(BaseTool):
                         else:
                             end_line = self._find_brace_block_end(lines, line_no - 1, ext)
                         
-                        matched_symbols.append(
-                            f"Dòng {start_line:03d} -> Dòng {end_line:03d}: {clean_line}"
-                        )
+                        # Phân loại ký hiệu động dựa trên nội dung dòng khai báo
+                        symbol_type = self._classify_symbol(clean_line, ext)
+                        raw_symbols.append((start_line, end_line, symbol_type, clean_line))
                         break
             
-            if not matched_symbols:
+            if not raw_symbols:
                 return f"Thông báo: Đã quét tệp '{file_path}' nhưng không phát hiện cấu trúc đặc trưng."
             
-            header = f"=== BẢN ĐỒ PHẠM VI KHỐI MÃ (Ngôn ngữ: {ext.upper()}): {file_path} ===\n"
-            return header + "\n".join(matched_symbols)
+            # 🛠️ CẤU TRÚC LẠI ĐẦU RA THÀNH BẢNG MARKDOWN TRỰC QUAN CHO AGENT VÀ LANGSMITH
+            table_rows = [
+                f"### 🔍 BẢN ĐỒ KÝ HIỆU PHÁT HIỆN ĐƯỢC ({ext.upper()}): `{file_path}`",
+                "",
+                "| Phạm vi dòng | Loại ký hiệu | Chi tiết khai báo |",
+                "| :--- | :--- | :--- |"
+            ]
+            
+            for start, end, sym_type, decl in raw_symbols:
+                # Định dạng bọc inline code để tăng độ tách bạch dữ liệu
+                table_rows.append(f"| Dòng `{start:03d}` -> `{end:03d}` | {sym_type} | `{decl}` |")
+                
+            return "\n".join(table_rows)
 
         except Exception as e:
             return f"Lỗi phân tích phạm vi khối mã: {str(e)}"

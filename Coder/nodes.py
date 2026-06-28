@@ -1,12 +1,12 @@
 # nodes.py
 import platform
+import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple, Union, List
+from typing import Dict, Any, Optional, Tuple, List
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_core.tools import tool
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 from config import model, sanitize_and_resolve_path
 from state import AgentState, PlanUpdate, WorkspaceDetection, TaskPlan, TaskTriage, Task, WorkspaceDiscoveryState
@@ -14,10 +14,73 @@ from tools import (
     GitManager, ReadFileLinesTool, UniversalSymbolSearchTool, WorkspaceTools, 
     ReadFilesTool, WriteFileTool, ApplyPatchTool, 
     ListDirectoryTool, RunTerminalTool,
-    get_current_working_directory, check_path_exists, find_project_root
+    get_current_working_directory, check_path_exists, find_project_root, get_markdown_language
 )
 workspace_discovery_subgraph = None
 
+def sanitize_llm_response_content(response: AIMessage) -> AIMessage:
+    """
+    Hậu xử lý tin nhắn của LLM: Loại bỏ triệt để các khối <thinking>...</thinking>
+    hoặc <thought>...</thought> nếu mô hình tự ý sinh ra để tiết kiệm token cho các vòng sau.
+    """
+    if not response or not isinstance(response, AIMessage):
+        return response
+        
+    content_str = response.content
+    if isinstance(content_str, str) and content_str.strip():
+        # Xóa sạch thẻ <thinking>...</thinking> và <thought>...</thought> kèm nội dung bên trong
+        cleaned_content = re.sub(r"<thinking>.*?</thinking>", "", content_str, flags=re.DOTALL)
+        cleaned_content = re.sub(r"<thought>.*?</thought>", "", cleaned_content, flags=re.DOTALL)
+        
+        # Cập nhật lại nội dung sạch cho tin nhắn
+        response.content = cleaned_content.strip()
+        
+    return response
+
+def compact_reading_tool_messages(messages: List[BaseMessage]) -> List[BaseMessage]:
+    """
+    Quét qua lịch sử tin nhắn và thu gọn nội dung của các ToolMessage đọc file.
+    Thay thế hàng ngàn dòng code thô bằng một thông báo định danh siêu nhẹ,
+    giúp giảm 95% lượng token lãng phí mà không phá vỡ tính toàn vẹn của chuỗi Tool Call.
+    """
+    compacted_messages = []
+    
+    for msg in messages:
+        # Chỉ can thiệp vào các ToolMessage thuộc nhóm đọc/khảo sát file
+        if msg.type == "tool" and msg.name in ["read_files", "read_file_lines", "search_symbols_universal"]:
+            content_str = str(msg.content)
+            found_files = []
+            
+            # 1. Trích xuất tên file từ cấu trúc đầu ra của read_files
+            matches_read = re.findall(r"=== TỆP TIN:\s*[`']?([^`'\n]+)[`']?\s*===", content_str)
+            if matches_read:
+                found_files.extend(matches_read)
+                
+            # 2. Trích xuất tên file từ cấu trúc đầu ra của read_file_lines
+            matches_lines = re.findall(r"=== NỘI DUNG TỆP KHOANH VÙNG:\s*([^ \n]+)", content_str)
+            if matches_lines:
+                found_files.extend(matches_lines)
+                
+            # 3. Trích xuất tên file từ cấu trúc đầu ra của search_symbols_universal
+            matches_symbols = re.findall(r"📁\s*`([^`\n]+)`", content_str)
+            if matches_symbols:
+                found_files.extend(matches_symbols)
+                
+            # Tạo chuỗi thông tin định danh ngắn gọn
+            file_info = f" của tệp {', '.join([f'`{f}`' for f in found_files])}" if found_files else ""
+            
+            # Tạo ToolMessage mới kế thừa nguyên vẹn ID nhưng có nội dung tối giản cực hạn
+            compacted_msg = ToolMessage(
+                content=f"[Đã nạp thành công dữ liệu vật lý{file_info} vào File Registry. Hãy sử dụng cấu trúc mã nguồn cập nhật mới nhất trong System Prompt để làm việc]",
+                name=msg.name,
+                tool_call_id=msg.tool_call_id,
+                id=msg.id
+            )
+            compacted_messages.append(compacted_msg)
+        else:
+            compacted_messages.append(msg)
+            
+    return compacted_messages
 # =====================================================================
 # CÁC HÀM TIỆN ÝCH BỔ TRỢ CHO BỘ KIỂM THỬ ĐA NGÔN NGỮ THÍCH ỨNG
 # =====================================================================
@@ -507,9 +570,10 @@ def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
     )
     if previous_findings_str:
         system_prompt += previous_findings_str
+    optimized_history = compact_reading_tool_messages(messages)
     
-    response = model_with_tools.invoke([SystemMessage(content=system_prompt)] + messages)
-    
+    response = model_with_tools.invoke([SystemMessage(content=system_prompt)] + optimized_history)
+    response = sanitize_llm_response_content(response)
     if not response.tool_calls:
         findings = []
         if response.content:
@@ -547,6 +611,7 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
     plan = state["plan"]
     error_logs = state.get("error_logs", "")
     workspace_context = state.get("workspace_context", "")
+    file_registry = state.get("file_registry", {})
     messages = list(state["messages"])
         
     eligible_tasks = get_eligible_tasks(plan)
@@ -562,6 +627,21 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
         for t in eligible_tasks
     ])
     
+    # ⚙️ TỰ ĐỘNG BIÊN SOẠN KHỐI NGỮ CẢNH MÃ NGUỒN MỚI NHẤT TỪ REGISTRY
+    registry_context_str = ""
+    if file_registry:
+        registry_context_str = "\n=== 📦 NỘI DUNG MÃ NGUỒN CẬP NHẬT MỚI NHẤT (SINGLE SOURCE OF TRUTH) ===\n"
+        for file_path, content in file_registry.items():
+            lang = get_markdown_language(file_path)
+            # Đánh số dòng trực tiếp và động cho mọi file trong registry để Agent áp patch chính xác
+            lines = content.splitlines()
+            formatted_lines = [f"{idx+1:04d} | {line}" for idx, line in enumerate(lines)]
+            
+            registry_context_str += (
+                f"\n--- TỆP TIN: `{file_path}` ---\n"
+                f"```{lang}\n" + "\n".join(formatted_lines) + "\n```\n"
+            )
+            
     read_files = ReadFilesTool(workspace_path=ws)
     write_file = WriteFileTool(workspace_path=ws)
     apply_patch = ApplyPatchTool(workspace_path=ws)
@@ -579,24 +659,31 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
         f"Thư mục làm việc: {ws}\n"
     )
     if workspace_context:
-        system_prompt += f"\n--- NGỮ CẢNH HỆ THỐNG HIỆN TẠI (THONGTIN.md) ---\n{workspace_context}\n"
+        system_prompt += f"\n--- TỔNG QUAN VỀ DỰ ÁN (THONGTIN.md) ---\n{workspace_context}\n"
+    
+    # Bơm trực tiếp Registry chứa mã nguồn mới nhất vào System Prompt
+    if registry_context_str:
+        system_prompt += registry_context_str
         
     system_prompt += (
-        "\nHãy sử dụng các công cụ thích hợp để giải quyết nhiệm vụ.\n"
-        "\n⚠️ QUY TẮC VÀ RÀNG BUỘC PHẠM VI (BẮT BUỘC):\n"
+        "\n⚠️ QUY TẮC PHẠM VI VÀ PHÒNG TRÁNH LỆCH DÒNG (BẮT BUỘC):\n"
+        "1. Bạn đã được cung cấp nguồn mã nguồn mới nhất (đã đánh số dòng chi tiết) trong mục 'SINGLE SOURCE OF TRUTH' ở trên.\n"
+        "2. ĐÂY LÀ NỘI DUNG MỚI NHẤT VÀ CHÍNH XÁC NHẤT. Hãy luôn sử dụng mốc dòng và nội dung từ mục này để thiết lập khối SEARCH-AND-REPLACE cho công cụ `apply_search_replace_patch`.\n"
+        "3. Nếu bạn vừa sửa đổi một file ở bước trước, nội dung file đó trong mục 'SINGLE SOURCE OF TRUTH' đã được cập nhật tự động. Bạn không cần phải gọi lại công cụ đọc trừ khi muốn kiểm tra sâu hơn.\n"
+        "\n⚠️ QUY TẮC SỬ DỤNG CÔNG CỤ:\n"
         "1. Đối với file trên 300 dòng: BẮT BUỘC dùng `apply_search_replace_patch` để áp dụng bản vá, cấm ghi đè bừa bãi.\n"
         "2. Công cụ `write_file` chỉ dùng khi tạo mới hoặc sửa các tệp ngắn dưới 300 dòng.\n"
-        "3. NGHIÊM CẤM thực hiện chạy các bộ kiểm thử tự động (như pytest, cargo test, dart test, npm test, vitest) bằng công cụ `run_terminal_command`. "
-        "Mọi hành vi chạy test, phân tích cú pháp tĩnh tự động thuộc quyền hạn ĐỘC QUYỀN của node 'tester' ở bước tiếp theo trong đồ thị. "
-        "Bạn chỉ được dùng terminal để build thử/biên dịch thử nếu thực sự cần thiết kiểm tra lỗi biên dịch."
+        "3. NGHIÊM CẤM thực hiện chạy các bộ kiểm thử tự động (như pytest, cargo test, dart test, npm test, vitest) bằng công cụ `run_terminal_command`."
     )
+    
+    optimized_history = compact_reading_tool_messages(messages)
     
     input_messages = [SystemMessage(content=system_prompt)]
     if error_logs:
         input_messages.append(HumanMessage(content=f"LƯU Ý SỬA LỖI TỪ LƯỢT CHẠY TRƯỚC:\n{error_logs}\nHãy sửa triệt để."))
         
-    response = model_with_tools.invoke(input_messages + messages)
-    
+    response = model_with_tools.invoke(input_messages + optimized_history)
+    response = sanitize_llm_response_content(response)
     if not response.tool_calls:
         updated_plan = []
         eligible_ids = {t.get("id") if isinstance(t, dict) else getattr(t, "id", None) for t in eligible_tasks}
@@ -746,6 +833,7 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
         }
 
 
+# nodes.py (Cập nhật tool_node để tự động cập nhật registry)
 def tool_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
     read_files = ReadFilesTool(workspace_path=ws)
@@ -772,11 +860,23 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         
     tool_messages = []
     modified_files = list(state.get("modified_files", []))
+    file_registry = dict(state.get("file_registry", {}))
+    
+    # Tập hợp các file bị tác động (cả đọc lẫn ghi) trong lượt này
+    impacted_files = set()
     
     for tool_call in last_message.tool_calls:
         tool_name = tool_call["name"]
         tool_args = tool_call["args"] or {}
         tool_id = tool_call["id"]
+        
+        # Trích xuất đường dẫn file từ đối số của tool
+        raw_path = tool_args.get("file_path") or tool_args.get("file_paths")
+        if raw_path:
+            if isinstance(raw_path, list):
+                impacted_files.update(raw_path)
+            else:
+                impacted_files.add(str(raw_path))
         
         tool_instance = tools_map.get(tool_name)
         if not tool_instance:
@@ -784,11 +884,10 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         else:
             try:
                 result = tool_instance.invoke(tool_args)
-                if tool_name in ["write_file", "apply_search_replace_patch"]:
-                    file_path = tool_args.get("file_path")
-                    if file_path:
+                if tool_name in ["write_file", "apply_search_replace_patch"] and "Lỗi" not in str(result):
+                    if raw_path and not isinstance(raw_path, list):
                         try:
-                            safe_path = sanitize_and_resolve_path(ws, file_path, create_parent=True)
+                            safe_path = sanitize_and_resolve_path(ws, raw_path, create_parent=True)
                             if str(safe_path) not in modified_files:
                                 modified_files.append(str(safe_path))
                         except Exception:
@@ -798,9 +897,22 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
                 
         tool_messages.append(ToolMessage(content=str(result), name=tool_name, tool_call_id=tool_id))
         
+    # ĐỒNG BỘ HÓA REGISTRY: Đọc thực tế trên đĩa cứng để cập nhật nội dung mới nhất
+    for file_path in impacted_files:
+        try:
+            safe_path = sanitize_and_resolve_path(ws, file_path, create_parent=False)
+            if safe_path.exists() and safe_path.is_file():
+                # Đọc nội dung thực tế trên đĩa
+                current_content = safe_path.read_text(encoding="utf-8")
+                # Đồng bộ vào registry
+                file_registry[file_path] = current_content
+        except Exception:
+            pass
+            
     return {
         "messages": tool_messages,
-        "modified_files": modified_files
+        "modified_files": modified_files,
+        "file_registry": file_registry
     }
 
 
@@ -956,16 +1068,32 @@ def synthesis_node(state: AgentState) -> Dict[str, Any]:
                 cleaned_md = cleaned_md[:-3]
             cleaned_md = cleaned_md.strip()
             
-            tools_mgr = WorkspaceTools(ws)
-            tools_mgr.write_file("THONGTIN.md", cleaned_md)
-            
+            # =====================================================================
+            # THAY ĐỔI: Chỉ ghi file vật lý khi môi trường có Git hoạt động
+            # =====================================================================
             if git_branch != "no_git":
+                # Thư mục có Git: Cho phép ghi file vật lý xuống đĩa cứng
+                tools_mgr = WorkspaceTools(ws)
+                tools_mgr.write_file("THONGTIN.md", cleaned_md)
+                
                 git_manager = GitManager(ws)
                 git_manager._run_cmd(["git", "add", "THONGTIN.md"], ignore_error=True)
+                
+                message_content = (
+                    "**Tổng hợp tài liệu hoàn tất:** Đã biên dịch tri thức khảo sát, "
+                    "lưu vật lý thành tệp `THONGTIN.md` và đưa vào Git staging thành công."
+                )
+            else:
+                # Chế độ Không-Git: Chỉ lưu trữ ảo trong State để tránh tạo file rác bừa bãi
+                message_content = (
+                    "**Tổng hợp tài liệu hoàn tất (Chế độ In-Memory):** Tri thức khảo sát "
+                    "đã được tổng hợp và nạp trực tiếp vào ngữ cảnh trạng thái đồ thị (`workspace_context`). "
+                    "Tệp tin `THONGTIN.md` vật lý **không** được tạo trên ổ đĩa do hệ thống phát hiện không sử dụng Git."
+                )
             
             return {
                 "workspace_context": cleaned_md,
-                "messages": [AIMessage(content="**Tổng hợp tài liệu hoàn tất:** Đã biên dịch tri thức khảo sát thành tệp `THONGTIN.md` thành công tại gốc dự án.")]
+                "messages": [AIMessage(content=message_content)]
             }
     except Exception as e:
         return {"messages": [AIMessage(content=f"Cảnh báo: Có lỗi xảy ra khi tổng hợp tệp THONGTIN.md: {str(e)}")]}

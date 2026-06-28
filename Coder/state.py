@@ -70,7 +70,12 @@ def reduce_findings(left: Union[List[str], None], right: Union[List[str], None])
     return left_list + right_list
 
 
-# Trạng thái của Đồ thị chính
+def reduce_file_registry(left: Dict[str, str], right: Dict[str, str]) -> Dict[str, str]:
+    merged = dict(left or {})
+    if right:
+        merged.update(right)
+    return merged
+
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
     workspace_path: str
@@ -80,11 +85,12 @@ class AgentState(TypedDict):
     git_branch: str
     error_logs: str
     modified_files: List[str]
+    # LƯU TRỮ NỘI DUNG MỚI NHẤT CỦA CÁC FILE ĐÃ TƯƠNG TÁC
+    file_registry: Annotated[Dict[str, str], reduce_file_registry] 
     attempts: int
     step_findings: Annotated[List[str], reduce_findings]
     last_executed_task_ids: List[str]     
     replanning_count: int
-
 
 # Trạng thái độc lập của Đồ thị con dò tìm Workspace [1.2.2]
 class WorkspaceDiscoveryState(TypedDict):

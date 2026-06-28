@@ -9,6 +9,41 @@ from langchain_core.tools import BaseTool, tool
 from config import GitIgnoreMatcher, sanitize_and_resolve_path
 
 # ==========================================
+# CÁC HÀM TIỆN ÍCH HỖ TRỢ ĐỊNH DẠNG MARKDOWN
+# ==========================================
+def get_markdown_language(file_path: str) -> str:
+    """Ánh xạ phần mở rộng của file sang ngôn ngữ định dạng Markdown tương ứng."""
+    ext = Path(file_path).suffix.lower()
+    mapping = {
+        ".py": "python",
+        ".js": "javascript",
+        ".jsx": "javascript",
+        ".ts": "typescript",
+        ".tsx": "typescript",
+        ".rs": "rust",
+        ".go": "go",
+        ".java": "java",
+        ".cpp": "cpp",
+        ".h": "cpp",
+        ".hpp": "cpp",
+        ".cs": "csharp",
+        ".dart": "dart",
+        ".sh": "bash",
+        ".bat": "batch",
+        ".ps1": "powershell",
+        ".json": "json",
+        ".yaml": "yaml",
+        ".yml": "yaml",
+        ".md": "markdown",
+        ".html": "html",
+        ".css": "css",
+        ".sql": "sql",
+        ".toml": "toml",
+        ".xml": "xml"
+    }
+    return mapping.get(ext, "text")
+
+# ==========================================
 # CÁC CÔNG CỤ DÒ TÌM HỆ THỐNG THỰC TẾ (SENSING TOOLS)
 # ==========================================
 @tool
@@ -89,6 +124,10 @@ class ReadFileLinesSchema(BaseModel):
     start_line: int = Field(description="Dòng bắt đầu đọc (đánh chỉ số từ 1).")
     end_line: int = Field(description="Dòng kết thúc đọc (bao gồm cả dòng này).")
 
+
+# ==========================================
+# CẤU TRÚC LẠI TOOL ĐỌC DÒNG FILE (READ FILE LINES TOOL)
+# ==========================================
 class ReadFileLinesTool(BaseTool):
     name: str = "read_file_lines"
     description: str = (
@@ -124,7 +163,11 @@ class ReadFileLinesTool(BaseTool):
                 formatted_lines.append(f"{idx:04d} | {line}")
                 
             header = f"=== NỘI DUNG TỆP KHOANH VÙNG: {file_path} (Dòng {start} đến {end} trên tổng số {total_lines} dòng) ===\n"
-            return header + "\n".join(formatted_lines)
+            lang = get_markdown_language(file_path)
+            
+            # Thay đổi quan trọng: Đưa nội dung dòng vào khối mã Markdown thích hợp
+            markdown_body = f"```{lang}\n" + "\n".join(formatted_lines) + "\n```"
+            return header + markdown_body
             
         except Exception as e:
             return f"Lỗi xảy ra khi đọc phân đoạn dòng của tệp tin: {str(e)}"
@@ -370,55 +413,41 @@ class UniversalSymbolSearchTool(BaseTool):
 
         return "Không có mô tả"
 
-    # ==========================================================
-    # 🛠️ ĐIỀU CHỈNH: GIỮ LẠI ĐẦY ĐỦ THAM SỐ GỐC (FULL PARAMETERS RETENTION)
-    # ==========================================================
     def _get_compact_name(self, signature: str, ext: str) -> str:
         """Lọc bỏ từ khóa thừa nhưng GIỮ NGUYÊN toàn bộ danh sách tham số khai báo."""
-        # 1. Nếu là Class, Interface, Struct
         match_class = re.search(r'\b(class|interface|struct|enum|type|union|trait|mixin|extension)\s+([a-zA-Z0-9_<>]+)', signature)
         if match_class:
             return f"🔹 {match_class.group(1)} {match_class.group(2)}"
             
         sig = signature.strip()
         
-        # 2. Định nghĩa hàm chuẩn (Python, Dart, JS, Rust, Go): "async function saveDB(a, b, c = {})"
-        # Trích xuất từ tên hàm cho đến hết ngoặc đơn đóng chứa tham số gốc
         match_func = re.search(r'\b(?:fn|func|function|def|async\s+fn|async\s+def)\s+([a-zA-Z0-9_<>]+\s*\(.*\))', sig)
         if match_func:
             return f"⚙️ {match_func.group(1)}"
             
-        # 3. Định nghĩa hàm dạng biến gán (JS/TS/JSX Arrow Functions): "const scanDir = (path, depth = 3)"
         if '=' in sig:
             parts = sig.split('=', 1)
             left = parts[0].strip()
             right = parts[1].strip()
             
-            # Làm sạch tên biến ở vế trái
             name = re.sub(r'\b(const|let|var|export|default|pub|public|static|async)\b', '', left).strip()
             
-            # Tìm cụm đóng mở ngoặc chứa tham số ở vế phải
             match_paren = re.search(r'(\(.*\))', right)
             if match_paren:
                 return f"⚡ {name}{match_paren.group(1)}"
             
-            # Trường hợp đặc biệt: arrow function chỉ có 1 tham số không ngoặc đơn (ví dụ: const fn = x =>)
             right_clean = re.sub(r'\b(async)\b', '', right).strip()
             if right_clean:
                 return f"⚡ {name}({right_clean})"
                 
             return f"⚡ {name}()"
             
-        # 4. Fallback phòng vệ chung cho các cú pháp đặc thù
         sig_clean = re.sub(r'\b(export|default|pub|public|private|protected|static|async|const|let|var|function|fn|func|def)\b', '', sig).strip()
         if '(' in sig_clean:
             return f"⚙️ {sig_clean}"
             
         return f"⚙️ {sig_clean}"
 
-    # ==========================================================
-    # 🛠️ ĐIỀU CHỈNH: TĂNG KHOẢNG ĐỆM ĐỂ TRÁNH TRÀN LỀ KHI THAM SỐ DÀI
-    # ==========================================================
     def _render_markdown_tree(self, node: SymbolNode, ext: str, indent: str = "", is_last: bool = True, is_root: bool = False) -> List[str]:
         """
         Hàm đệ quy vẽ cấu trúc cây lồng nhau chuẩn hóa.
@@ -433,10 +462,8 @@ class UniversalSymbolSearchTool(BaseTool):
             compact_name = self._get_compact_name(node.signature, ext)
             desc_part = f" # {node.description}" if node.description != "Không có mô tả" else ""
             
-            # Căn phải dòng bắt đầu/kết thúc (rộng 3 ký tự) để thẳng hàng tuyệt đối
             line_anchor = f"[Dòng {node.start:>3}-{node.end:>3}]"
             
-            # Đưa line_anchor lên đầu, compact_name và desc_part theo sau liền mạch
             lines.append(f"{indent}{marker}{line_anchor} {compact_name}{desc_part}")
             next_indent = indent + ("    " if is_last else "│   ")
             
@@ -561,7 +588,6 @@ class UniversalSymbolSearchTool(BaseTool):
             if not raw_symbols:
                 return f"Thông báo: Đã quét tệp '{file_path}' nhưng không phát hiện cấu trúc đặc trưng nào."
             
-            # Sắp xếp theo dòng bắt đầu tăng dần, dòng kết thúc giảm dần
             raw_symbols.sort(key=lambda x: (x[0], -x[1]))
             
             root_nodes: List[SymbolNode] = []
@@ -580,11 +606,9 @@ class UniversalSymbolSearchTool(BaseTool):
                 
                 stack.append(node)
             
-            # Gốc tệp tin
             virtual_root = SymbolNode(1, len(lines), f"📁 `{file_path}`", "Cấu trúc tệp tin")
             virtual_root.children = root_nodes
             
-            # 🛠️ CẬP NHẬT: Truyền thêm is_root=True cho Node gốc ảo đầu tiên
             tree_output_lines = self._render_markdown_tree(virtual_root, ext, is_root=True)
             
             header = f"### 📊 SƠ ĐỒ PHÂN CẤP CẤU TRÚC KÝ HIỆU (SCOPE TREE)\n\n"
@@ -692,6 +716,9 @@ class GitManager:
             self._run_cmd(["git", "commit", "-m", message])
 
 
+# ==========================================
+# TÁI CẤU TRÚC LỚP QUẢN LÝ THAO TÁC WORKSPACE
+# ==========================================
 class WorkspaceTools:
     def __init__(self, workspace_path: str):
         self.workspace = Path(workspace_path).expanduser().resolve()
@@ -734,6 +761,9 @@ class WorkspaceTools:
                 return [cleaned_path]
         return []
 
+    # ==========================================
+    # CẬP NHẬT: QUẤN MARKDOWN CODE BLOCK CHO READ FILES
+    # ==========================================
     def read_files(self, file_paths: Union[str, List[str]]) -> str:
         paths = self._normalize_file_paths(file_paths)
         if not paths:
@@ -751,7 +781,16 @@ class WorkspaceTools:
                     continue
                 
                 content = safe_path.read_text(encoding="utf-8")
-                results.append(f"=== BẮT ĐẦU NỘI DUNG TỆP: {path} ===\n{content}\n=== KẾT THÚC NỘI DUNG TỆP: {path} ===")
+                lang = get_markdown_language(path)
+                
+                # Tái thiết cấu trúc đầu ra với các Code Block chuẩn hóa thay cho header thô
+                block_output = (
+                    f"=== TỆP TIN: `{path}` ===\n"
+                    f"```{lang}\n"
+                    f"{content}\n"
+                    f"```"
+                )
+                results.append(block_output)
             except Exception as e:
                 results.append(f"--- THẤT BẠI: '{path}' (Lỗi đọc tệp: {str(e)}) ---")
                 
@@ -845,10 +884,13 @@ class WorkspaceTools:
                 return f"Thư mục '{sub_dir}' trống hoặc toàn bộ các tệp tin bên trong đã bị loại bỏ theo cấu hình .gitignore."
                 
             header = f"Cấu trúc thư mục tương đối của '{sub_dir}' (Đã lọc bỏ tệp tin .gitignore):\n"
-            return header + "\n".join(tree_lines)
+            return header + "```text\n" + "\n".join(tree_lines) + "\n```"
         except Exception as e:
             return f"Lỗi liệt kê thư mục: {str(e)}"
 
+    # ==========================================
+    # CẬP NHẬT: QUẤN MARKDOWN CODE BLOCK CHO RUN TERMINAL
+    # ==========================================
     def run_terminal(self, command: str, timeout: int = 60) -> str:
         try:
             res = subprocess.run(
@@ -861,10 +903,11 @@ class WorkspaceTools:
             )
             
             output = []
+            # Cập nhật: Sử dụng thẻ khối mã 'bash' để biểu diễn rõ ràng log dòng lệnh đầu ra
             if res.stdout:
-                output.append(f"[STDOUT]\n{res.stdout.strip()}")
+                output.append(f"[STDOUT]\n```bash\n{res.stdout.strip()}\n```")
             if res.stderr:
-                output.append(f"[STDERR]\n{res.stderr.strip()}")
+                output.append(f"[STDERR]\n```bash\n{res.stderr.strip()}\n```")
                 
             status_msg = f"Lệnh kết thúc với exit code: {res.returncode}"
             if not output:

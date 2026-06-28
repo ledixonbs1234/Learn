@@ -525,15 +525,17 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
         "messages": [AIMessage(content=f"Đã lập kế hoạch hành động dạng đồ thị phụ thuộc (Loại: {task_type.upper()}):\n{plan_str}")]
     }
 
-
 # =====================================================================
-# CHỈNH SỬA 2: Ràng buộc tuyệt đối phạm vi kết quả cho Analysis Executor
+# HỢP NHẤT: Executor duy nhất tự động thích ứng theo Trạng thái (Polymorphic)
 # =====================================================================
-def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
+def executor_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
     plan = state["plan"]
+    error_logs = state.get("error_logs", "")
     workspace_context = state.get("workspace_context", "")
+    file_registry = state.get("file_registry", {})
     messages = list(state["messages"])
+    task_type = state.get("task_type", "development")
     
     eligible_tasks = get_eligible_tasks(plan)
     if not eligible_tasks:
@@ -541,53 +543,107 @@ def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
         if pending_tasks:
             eligible_tasks = [pending_tasks[0]]
         else:
-            return {"messages": [AIMessage(content="Đã hoàn thành khảo sát toàn bộ các bước.")]}
+            return {"messages": [AIMessage(content=f"Đã hoàn thành khảo sát toàn bộ các bước {task_type}.")]}
          
     tasks_str = "\n".join([
         f"- [{getattr(t, 'id', None) or t.get('id')}] {getattr(t, 'description', None) or t.get('description')}"
         for t in eligible_tasks
     ])
-    
-    read_files = ReadFilesTool(workspace_path=ws)
-    list_directory = ListDirectoryTool(workspace_path=ws)
-    search_symbols = UniversalSymbolSearchTool(workspace_path=ws)
-    read_file_lines = ReadFileLinesTool(workspace_path=ws)
-    tools = [read_files, list_directory, search_symbols, read_file_lines]
+
+    # ⚙️ PHÂN TÁCH CẤU HÌNH DỰA TRÊN TASK TYPE TRONG CÙNG MỘT NODE
+    if task_type == "analysis":
+        # Công cụ chỉ đọc dành cho Khảo sát
+        read_files = ReadFilesTool(workspace_path=ws)
+        list_directory = ListDirectoryTool(workspace_path=ws)
+        search_symbols = UniversalSymbolSearchTool(workspace_path=ws)
+        read_file_lines = ReadFileLinesTool(workspace_path=ws)
+        tools = [read_files, list_directory, search_symbols, read_file_lines]
+
+        previous_findings_str = ""
+        existing_findings = state.get("step_findings", [])
+        if existing_findings:
+            previous_findings_str = "\n\n--- CÁC KẾT QUẢ KHẢO SÁT BẠN ĐÃ THU THẬP ĐƯỢC Ở CÁC BƯỚC TRƯỚC ---\n" + "\n\n".join(existing_findings)
+        
+        system_prompt = (
+            "Bạn là một kiến trúc sư chuyên khảo sát, đọc hiểu và phân tích cấu trúc mã nguồn (Read-Only Mode).\n"
+            f"Nhiệm vụ: Bạn đang thực hiện đồng thời các nhiệm vụ sau:\n{tasks_str}\n"
+            f"Thư mục làm việc: {ws}\n"
+        )
+        if workspace_context:
+            system_prompt += f"\n--- TỔNG QUAN VỀ DỰ ÁN (THONGTIN.md) ---\n{workspace_context}\n"
+            
+        system_prompt += (
+            "\nHãy sử dụng các công cụ khảo sát cấu trúc hệ thống.\n"
+            "\n⚠️ RÀNG BUỘC PHẠM VI NGHIÊM NGẶT (BẮT BUỘC):\n"
+            "1. Bạn chỉ có quyền ĐỌC dữ liệu, tuyệt đối không chỉnh sửa mã nguồn hoặc tự ý tạo tệp tin trong bước này.\n"
+            "2. KHÔNG ĐƯỢC PHÉP tự ý định dạng tài liệu báo cáo hoàn chỉnh, tổng hợp tri thức hay viết tệp THONGTIN.md. "
+            "Nhiệm vụ của bạn chỉ là thu thập thông tin thô, liệt kê các phát hiện kỹ thuật (raw findings) thực tế. "
+            "Việc tổng hợp chúng thành một tài liệu THONGTIN.md hoàn chỉnh là nhiệm vụ ĐỘC QUYỀN của node 'synthesis' tiếp theo."
+        )
+        if previous_findings_str:
+            system_prompt += previous_findings_str
+
+    else:  # development
+        # Công cụ có quyền ghi dành cho Phát triển
+        registry_context_str = ""
+        if file_registry:
+            registry_context_str = "\n=== 📦 NỘI DUNG MÃ NGUỒN CẬP NHẬT MỚI NHẤT (SINGLE SOURCE OF TRUTH) ===\n"
+            for file_path, content in file_registry.items():
+                lang = get_markdown_language(file_path)
+                lines = content.splitlines()
+                formatted_lines = [f"{idx+1:04d} | {line}" for idx, line in enumerate(lines)]
+                
+                registry_context_str += (
+                    f"\n--- TỆP TIN: `{file_path}` ---\n"
+                    f"```{lang}\n" + "\n".join(formatted_lines) + "\n```\n"
+                )
+                
+        read_files = ReadFilesTool(workspace_path=ws)
+        write_file = WriteFileTool(workspace_path=ws)
+        apply_patch = ApplyPatchTool(workspace_path=ws)
+        search_symbols = UniversalSymbolSearchTool(workspace_path=ws)
+        list_directory = ListDirectoryTool(workspace_path=ws)
+        run_terminal_command = RunTerminalTool(workspace_path=ws)
+        read_file_lines = ReadFileLinesTool(workspace_path=ws)
+        
+        tools = [read_files, write_file, apply_patch, list_directory, run_terminal_command, search_symbols, read_file_lines]
+        
+        system_prompt = (
+            "Bạn là một kỹ sư phần mềm thực thi chuyên nghiệp chuyên sửa lỗi và viết mới mã nguồn (Write-Access Mode).\n"
+            f"Nhiệm vụ: Bạn đang thực hiện đồng thời các nhiệm vụ sau:\n{tasks_str}\n"
+            f"Thư mục làm việc: {ws}\n"
+        )
+        if workspace_context:
+            system_prompt += f"\n--- TỔNG QUAN VỀ DỰ ÁN (THONGTIN.md) ---\n{workspace_context}\n"
+        
+        if registry_context_str:
+            system_prompt += registry_context_str
+            
+        system_prompt += (
+            "\n⚠️ QUY TẮC PHẠM VI VÀ PHÒNG TRÁNH LỆCH DÒNG (BẮT BUỘC):\n"
+            "1. Bạn đã được cung cấp nguồn mã nguồn mới nhất (đã đánh số dòng chi tiết) trong mục 'SINGLE SOURCE OF TRUTH' ở trên.\n"
+            "2. ĐÂY LÀ NỘI DUNG MỚI NHẤT VÀ CHÍNH XÁC NHẤT. Hãy luôn sử dụng mốc dòng và nội dung từ mục này để thiết lập khối SEARCH-AND-REPLACE cho công cụ `apply_search_replace_patch`.\n"
+            "3. Nếu bạn vừa sửa đổi một file ở bước trước, nội dung file đó trong mục 'SINGLE SOURCE OF TRUTH' đã được cập nhật tự động. Bạn không cần phải gọi lại công cụ đọc trừ khi muốn kiểm tra sâu hơn.\n"
+            "\n⚠️ QUY TẮC SỬ DỤNG CÔNG CỤ:\n"
+            "1. Đối với file trên 300 dòng: BẮT BUỘC dùng `apply_search_replace_patch` để áp dụng bản vá, cấm ghi đè bừa bãi.\n"
+            "2. Công cụ `write_file` chỉ dùng khi tạo mới hoặc sửa các tệp ngắn dưới 300 dòng.\n"
+            "3. NGHIÊM CẤM thực hiện chạy các bộ kiểm thử tự động (như pytest, cargo test, dart test, npm test, vitest) bằng công cụ `run_terminal_command`."
+        )
 
     model_with_tools = model.bind_tools(tools)
-    
-    previous_findings_str = ""
-    existing_findings = state.get("step_findings", [])
-    if existing_findings:
-        previous_findings_str = "\n\n--- CÁC KẾT QUẢ KHẢO SÁT BẠN ĐÃ THU THẬP ĐƯỢC Ở CÁC BƯỚC TRƯỚC ---\n" + "\n\n".join(existing_findings)
-    
-    system_prompt = (
-        "Bạn là một kiến trúc sư chuyên khảo sát, đọc hiểu và phân tích cấu trúc mã nguồn (Read-Only Mode).\n"
-        f"Nhiệm vụ: Bạn đang thực hiện đồng thời các nhiệm vụ sau:\n{tasks_str}\n"
-        f"Thư mục làm việc: {ws}\n"
-    )
-    if workspace_context:
-        system_prompt += f"\n--- TỔNG QUAN VỀ DỰ ÁN (THONGTIN.md) ---\n{workspace_context}\n"
-        
-    system_prompt += (
-        "\nHãy sử dụng các công cụ khảo sát cấu trúc hệ thống.\n"
-        "\n⚠️ RÀNG BUỘC PHẠM VI NGHIÊM NGẶT (BẮT BUỘC):\n"
-        "1. Bạn chỉ có quyền ĐỌC dữ liệu, tuyệt đối không chỉnh sửa mã nguồn hoặc tự ý tạo tệp tin trong bước này.\n"
-        "2. KHÔNG ĐƯỢC PHÉP tự ý định dạng tài liệu báo cáo hoàn chỉnh, tổng hợp tri thức hay viết tệp THONGTIN.md. "
-        "Nhiệm vụ của bạn chỉ là thu thập thông tin thô, liệt kê các phát hiện kỹ thuật (raw findings) thực tế. "
-        "Việc tổng hợp chúng thành một tài liệu THONGTIN.md hoàn chỉnh là nhiệm vụ ĐỘC QUYỀN của node 'synthesis' tiếp theo."
-    )
-    if previous_findings_str:
-        system_prompt += previous_findings_str
     optimized_history = compact_reading_tool_messages(messages)
     
-    response = model_with_tools.invoke([SystemMessage(content=system_prompt)] + optimized_history)
+    input_messages = [SystemMessage(content=system_prompt)]
+    if task_type == "development" and error_logs:
+        input_messages.append(HumanMessage(content=f"LƯU Ý SỬA LỖI TỪ LƯỢT CHẠY TRƯỚC:\n{error_logs}\nHãy sửa triệt để."))
+        
+    response = model_with_tools.invoke(input_messages + optimized_history)
     response = sanitize_llm_response_content(response)
+    
     if not response.tool_calls:
         findings = []
-        if response.content:
-            tasks_ids = ", ".join([str(getattr(t, "id", None) or t.get("id")) for t in eligible_tasks])
-            # Lưu lại dữ liệu thô phục vụ tổng hợp sau này
+        if task_type == "analysis" and response.content:
+            tasks_ids = ", ".join([str(getattr(t, "id", None) or t.get('id')) for t in eligible_tasks])
             findings = [f"### Kết quả khảo sát các nhiệm vụ ({tasks_ids}):\n{response.content}"]
             
         updated_plan = []
@@ -602,118 +658,19 @@ def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
                 if t_copy.id in eligible_ids:
                     t_copy.status = "completed"
             updated_plan.append(t_copy)
-            
-        return {
-            "messages": [response],
-            "plan": updated_plan,
-            "step_findings": findings
-        }
-    else:
-        return {"messages": [response]}
 
-
-# =====================================================================
-# CHỈNH SỬA 3: Ngăn chặn tuyệt đối hành vi chạy lệnh Test trong Dev Executor
-# =====================================================================
-def development_executor_node(state: AgentState) -> Dict[str, Any]:
-    ws = state["workspace_path"]
-    plan = state["plan"]
-    error_logs = state.get("error_logs", "")
-    workspace_context = state.get("workspace_context", "")
-    file_registry = state.get("file_registry", {})
-    messages = list(state["messages"])
-        
-    eligible_tasks = get_eligible_tasks(plan)
-    if not eligible_tasks:
-        pending_tasks = [t for t in plan if (t.get("status") if isinstance(t, dict) else getattr(t, "status", None)) == "pending"]
-        if pending_tasks:
-            eligible_tasks = [pending_tasks[0]]
-        else:
-            return {"messages": [AIMessage(content="Đã hoàn thành toàn bộ các bước phát triển.")]}
-         
-    tasks_str = "\n".join([
-        f"- [{getattr(t, 'id', None) or t.get('id')}] {getattr(t, 'description', None) or t.get('description')}"
-        for t in eligible_tasks
-    ])
-    
-    # ⚙️ TỰ ĐỘNG BIÊN SOẠN KHỐI NGỮ CẢNH MÃ NGUỒN MỚI NHẤT TỪ REGISTRY
-    registry_context_str = ""
-    if file_registry:
-        registry_context_str = "\n=== 📦 NỘI DUNG MÃ NGUỒN CẬP NHẬT MỚI NHẤT (SINGLE SOURCE OF TRUTH) ===\n"
-        for file_path, content in file_registry.items():
-            lang = get_markdown_language(file_path)
-            # Đánh số dòng trực tiếp và động cho mọi file trong registry để Agent áp patch chính xác
-            lines = content.splitlines()
-            formatted_lines = [f"{idx+1:04d} | {line}" for idx, line in enumerate(lines)]
-            
-            registry_context_str += (
-                f"\n--- TỆP TIN: `{file_path}` ---\n"
-                f"```{lang}\n" + "\n".join(formatted_lines) + "\n```\n"
-            )
-            
-    read_files = ReadFilesTool(workspace_path=ws)
-    write_file = WriteFileTool(workspace_path=ws)
-    apply_patch = ApplyPatchTool(workspace_path=ws)
-    search_symbols = UniversalSymbolSearchTool(workspace_path=ws)
-    list_directory = ListDirectoryTool(workspace_path=ws)
-    run_terminal_command = RunTerminalTool(workspace_path=ws)
-    read_file_lines = ReadFileLinesTool(workspace_path=ws)
-    
-    tools = [read_files, write_file, apply_patch, list_directory, run_terminal_command, search_symbols, read_file_lines]
-    model_with_tools = model.bind_tools(tools)
-    
-    system_prompt = (
-        "Bạn là một kỹ sư phần mềm thực thi chuyên nghiệp chuyên sửa lỗi và viết mới mã nguồn (Write-Access Mode).\n"
-        f"Nhiệm vụ: Bạn đang thực hiện đồng thời các nhiệm vụ sau:\n{tasks_str}\n"
-        f"Thư mục làm việc: {ws}\n"
-    )
-    if workspace_context:
-        system_prompt += f"\n--- TỔNG QUAN VỀ DỰ ÁN (THONGTIN.md) ---\n{workspace_context}\n"
-    
-    # Bơm trực tiếp Registry chứa mã nguồn mới nhất vào System Prompt
-    if registry_context_str:
-        system_prompt += registry_context_str
-        
-    system_prompt += (
-        "\n⚠️ QUY TẮC PHẠM VI VÀ PHÒNG TRÁNH LỆCH DÒNG (BẮT BUỘC):\n"
-        "1. Bạn đã được cung cấp nguồn mã nguồn mới nhất (đã đánh số dòng chi tiết) trong mục 'SINGLE SOURCE OF TRUTH' ở trên.\n"
-        "2. ĐÂY LÀ NỘI DUNG MỚI NHẤT VÀ CHÍNH XÁC NHẤT. Hãy luôn sử dụng mốc dòng và nội dung từ mục này để thiết lập khối SEARCH-AND-REPLACE cho công cụ `apply_search_replace_patch`.\n"
-        "3. Nếu bạn vừa sửa đổi một file ở bước trước, nội dung file đó trong mục 'SINGLE SOURCE OF TRUTH' đã được cập nhật tự động. Bạn không cần phải gọi lại công cụ đọc trừ khi muốn kiểm tra sâu hơn.\n"
-        "\n⚠️ QUY TẮC SỬ DỤNG CÔNG CỤ:\n"
-        "1. Đối với file trên 300 dòng: BẮT BUỘC dùng `apply_search_replace_patch` để áp dụng bản vá, cấm ghi đè bừa bãi.\n"
-        "2. Công cụ `write_file` chỉ dùng khi tạo mới hoặc sửa các tệp ngắn dưới 300 dòng.\n"
-        "3. NGHIÊM CẤM thực hiện chạy các bộ kiểm thử tự động (như pytest, cargo test, dart test, npm test, vitest) bằng công cụ `run_terminal_command`."
-    )
-    
-    optimized_history = compact_reading_tool_messages(messages)
-    
-    input_messages = [SystemMessage(content=system_prompt)]
-    if error_logs:
-        input_messages.append(HumanMessage(content=f"LƯU Ý SỬA LỖI TỪ LƯỢT CHẠY TRƯỚC:\n{error_logs}\nHãy sửa triệt để."))
-        
-    response = model_with_tools.invoke(input_messages + optimized_history)
-    response = sanitize_llm_response_content(response)
-    if not response.tool_calls:
-        updated_plan = []
-        eligible_ids = {t.get("id") if isinstance(t, dict) else getattr(t, "id", None) for t in eligible_tasks}
-        for t in plan:
-            if isinstance(t, dict):
-                t_copy = dict(t)
-                if t_copy["id"] in eligible_ids:
-                    t_copy["status"] = "completed"
-            else:
-                t_copy = t.model_copy()
-                if t_copy.id in eligible_ids:
-                    t_copy.status = "completed"
-            updated_plan.append(t_copy)
-
-        return {
+        ret_dict = {
             "messages": [response],
             "plan": updated_plan,
             "last_executed_task_ids": list(eligible_ids)
         }
+        if task_type == "analysis" and findings:
+            ret_dict["step_findings"] = findings
+            
+        return ret_dict
     else:
         return {"messages": [response]}
+
 
 
 # =====================================================================

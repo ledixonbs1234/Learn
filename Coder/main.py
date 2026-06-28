@@ -36,21 +36,20 @@ nodes.workspace_discovery_subgraph = workspace_discovery_subgraph
 # ==========================================
 builder = StateGraph(AgentState)
 
-# Đăng ký các Nodes (Bổ sung replanner node)
+# Đăng ký các Nodes (Hợp nhất các executor thành một node duy nhất)
 builder.add_node("detect_workspace", nodes.detect_workspace_wrapper_node) 
 builder.add_node("context_loader", nodes.context_loader_node)
 builder.add_node("triage", nodes.triage_node)                       
 builder.add_node("git_setup", nodes.git_setup_node)
 builder.add_node("planner", nodes.planner_node)
-builder.add_node("analysis_executor", nodes.analysis_executor_node)       
-builder.add_node("development_executor", nodes.development_executor_node) 
+builder.add_node("executor", nodes.executor_node)  # <--- HỢP NHẤT LÀM 1 NODE DUY NHẤT
 builder.add_node("tool_node", nodes.tool_node) 
-builder.add_node("replanner", nodes.replanner_node)  # <--- ĐĂNG KÝ MỚI
+builder.add_node("replanner", nodes.replanner_node)
 builder.add_node("tester", nodes.tester_node)
 builder.add_node("synthesis", nodes.synthesis_node)
 builder.add_node("commit", nodes.commit_node)
 
-# Định nghĩa các Cạnh nối (Edges) và Đinh tuyến (Routers)
+# Định nghĩa các Cạnh nối (Edges) và Định tuyến (Routers)
 
 builder.add_conditional_edges(
     START,
@@ -70,8 +69,7 @@ builder.add_conditional_edges(
     routers.git_setup_router,
     {
         "planner": "planner",
-        "analysis_executor": "analysis_executor",
-        "development_executor": "development_executor"
+        "executor": "executor"
     }
 )
 
@@ -79,71 +77,58 @@ builder.add_conditional_edges(
     "planner",
     routers.planner_router,
     {
-        "analysis_executor": "analysis_executor",      
-        "development_executor": "development_executor" 
+        "executor": "executor"
     }
 )
 
-# 🔄 ĐIỀU CHỈNH: Định tuyến analysis_executor tới tool_node hoặc replanner
+# Định tuyến từ Executor tới Tool hoặc các nút Đánh giá kế hoạch
 builder.add_conditional_edges(
-    "analysis_executor",
-    routers.analysis_router,
+    "executor",
+    routers.executor_router,
     {
         "tool_node": "tool_node",                  
         "replanner": "replanner",
-        "synthesis": "synthesis"  # <--- KHAI BÁO THÊM ĐIỂM ĐẾN TRỰC TIẾP CHO FAST-TRACK
-    }
-)
-builder.add_edge("synthesis", "commit")
-
-# 🔄 ĐIỀU CHỈNH: Định tuyến development_executor tới tool_node hoặc replanner
-builder.add_conditional_edges(
-    "development_executor",
-    routers.development_router,
-    {
-        "tool_node": "tool_node",                           
-        "replanner": "replanner",
-        "tester": "tester"        # <--- KHAI BÁO THÊM ĐIỂM ĐẾN TRỰC TIẾP CHO FAST-TRACK
+        "tester": "tester",
+        "synthesis": "synthesis"
     }
 )
 
-# Chuyển hướng từ Tool Node quay lại Executor tương ứng dựa vào task_type để giữ vòng lặp tool siêu nhanh
+# Chuyển hướng từ Tool Node quay lại Executor
 builder.add_conditional_edges(
     "tool_node",
     routers.tool_router,
     {
-        "analysis_executor": "analysis_executor",
-        "development_executor": "development_executor"
+        "executor": "executor"
     }
 )
 
-# 🔄 THÊM MỚI: Định tuyến sau replanner đi tiếp dựa vào cấu trúc DAG cập nhật
+# Định tuyến sau replanner đi tiếp dựa vào cấu trúc DAG cập nhật
 builder.add_conditional_edges(
     "replanner",
     routers.replanner_router,
     {
-        "analysis_executor": "analysis_executor",
-        "development_executor": "development_executor",
+        "executor": "executor",
         "synthesis": "synthesis",
         "tester": "tester"
     }
 )
 
-# 🔄 ĐIỀU CHỈNH: Tester thất bại sẽ đẩy ngược về replanner để sửa đổi kế hoạch thay vì quay về executor mù quáng
+# Tester thất bại sẽ đẩy ngược về replanner để sửa kế hoạch hoặc đẩy về executor nếu là Fast-Track
 builder.add_conditional_edges(
     "tester",
     routers.tester_router,
     {
         "replanner": "replanner", 
-        "development_executor": "development_executor", # <--- KHAI BÁO THÊM ĐƯỜNG QUAY LẠI TỰ SỬA CHO FAST-TRACK
+        "executor": "executor",
         "commit": "commit"                              
     }
 )
 
+builder.add_edge("synthesis", "commit")
 builder.add_edge("commit", END)
 
 memory = MemorySaver()
 app = builder.compile(checkpointer=memory)
 
 if __name__ == "__main__":
-    print("Biên dịch đồ thị LangGraph với cơ chế Re-planning thích ứng Production thành công.")
+    print("Biên dịch đồ thị LangGraph tối giản trực quan thành công.")

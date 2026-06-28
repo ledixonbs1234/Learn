@@ -134,13 +134,22 @@ class UniversalSearchSchema(BaseModel):
     file_path: str = Field(description="Đường dẫn tương đối của tệp tin nguồn trong workspace cần quét cấu trúc ký hiệu.")
 
 
+class SymbolNode:
+    """Cấu trúc dữ liệu Node phục vụ biểu diễn cây phân cấp ký hiệu."""
+    def __init__(self, start: int, end: int, signature: str, description: str):
+        self.start = start
+        self.end = end
+        self.signature = signature
+        self.description = description
+        self.children: List['SymbolNode'] = []
+
+
 class UniversalSymbolSearchTool(BaseTool):
     name: str = "search_symbols_universal"
     description: str = (
-        "Quét tệp tin nguồn để trích xuất danh sách các định nghĩa Class, Hàm, Phương thức, Struct... "
-        "Đi kèm với KHOẢNG DÒNG BẮT ĐẦU VÀ KẾT THÚC chính xác tuyệt đối, Chữ ký khai báo đầy đủ (bao gồm cả tham số và kiểu trả về) "
-        "và mô tả chức năng được trích xuất trực tiếp từ các comments/docstrings của chúng. "
-        "Hỗ trợ tất cả các ngôn ngữ phổ biến (Python, Dart, TS, JS, Go, Rust, C++, Java, C#, Swift, Kotlin)."
+        "Quét tệp tin nguồn để trích xuất danh sách và cây phân cấp cấu trúc của các định nghĩa Class, Hàm, Phương thức, Struct... "
+        "Hiển thị trực quan quan hệ lồng nhau giữa các hàm kèm đầy đủ tham số khai báo gốc."
+        "Hỗ trợ tất cả các ngôn ngữ phổ biến (Python, Dart, TS, JS, JSX, Go, Rust, C++, Java, C#, Swift, Kotlin)."
     )
     args_schema: Type[BaseModel] = UniversalSearchSchema
     workspace_path: str
@@ -226,32 +235,22 @@ class UniversalSymbolSearchTool(BaseTool):
             
         return end_idx + 1
 
-    # ==========================================
-    # 🛠️ THÊM MỚI: BỘ TRÍCH XUẤT CHỮ KÝ KHAI BÁO TOÀN DIỆN (SIGNATURE EXTRACTOR)
-    # ==========================================
     def _extract_full_signature(self, lines: list, start_idx: int, ext: str) -> str:
-        """
-        Trích xuất và định dạng chuẩn hóa toàn bộ signature khai báo (kể cả khi viết trên nhiều dòng)
-        để hiển thị nguyên vẹn kiểu dữ liệu tham số và kiểu trả về trong bảng Markdown.
-        """
+        """Trích xuất và định dạng chuẩn hóa toàn bộ signature khai báo."""
         sig_end_idx = start_idx
-        
         if ext == ".py":
-            # Python signature kết thúc bằng dấu ':'
             for idx in range(start_idx, len(lines)):
                 clean_line = lines[idx].strip().split("#", 1)[0].strip()
                 if clean_line.endswith(":"):
                     sig_end_idx = idx
                     break
         else:
-            # C-Style signature kết thúc khi gặp '{', ';' hoặc '=>'
             for idx in range(start_idx, len(lines)):
                 clean_line = self._strip_strings_and_line_comments(lines[idx], ext).strip()
                 if "{" in clean_line or ";" in clean_line or "=>" in clean_line:
                     sig_end_idx = idx
                     break
                     
-        # Gộp các dòng cấu thành signature lại làm một
         sig_parts = []
         for idx in range(start_idx, sig_end_idx + 1):
             line = lines[idx].strip()
@@ -263,22 +262,15 @@ class UniversalSymbolSearchTool(BaseTool):
                 sig_parts.append(line)
                 
         full_sig = " ".join(sig_parts)
-        
-        # Nén khoảng trắng thừa
         full_sig = re.sub(r"\s+", " ", full_sig)
-        
-        # Loại bỏ decorators/annotations ở đầu (ví dụ: @override, @tool)
         full_sig = re.sub(r"^@\w+(?:\([^)]*\))?\s+", "", full_sig)
         
-        # Làm sạch các ký hiệu mở khối code thừa thãi để tập trung vào định nghĩa kiểu
         if ext == ".py":
             if not full_sig.endswith(":"):
                 full_sig += ":"
         else:
-            # Đối với Dart arrow function, chỉ lấy phần signature trước dấu '=>'
             if "=>" in full_sig:
                 full_sig = full_sig.split("=>")[0].strip()
-            # Xóa dấu mở ngoặc nhọn hoặc chấm phẩy ở cuối chữ ký C-Style
             full_sig = full_sig.rstrip("{").rstrip(";").strip()
             
         return full_sig
@@ -295,7 +287,6 @@ class UniversalSymbolSearchTool(BaseTool):
                 line = lines[idx].strip()
                 if not line:
                     continue
-                
                 if not docstring_started:
                     if line.startswith('"""'):
                         quote_char = '"""'
@@ -323,7 +314,6 @@ class UniversalSymbolSearchTool(BaseTool):
                         break
                     else:
                         description_lines.append(line)
-            
             if description_lines:
                 return " ".join([l.strip() for l in description_lines if l.strip()]).strip()
 
@@ -380,9 +370,82 @@ class UniversalSymbolSearchTool(BaseTool):
 
         return "Không có mô tả"
 
-    # ==========================================
-    # PHƯƠNG THỨC THỰC THI CHÍNH (RUN METHOD)
-    # ==========================================
+    # ==========================================================
+    # 🛠️ ĐIỀU CHỈNH: GIỮ LẠI ĐẦY ĐỦ THAM SỐ GỐC (FULL PARAMETERS RETENTION)
+    # ==========================================================
+    def _get_compact_name(self, signature: str, ext: str) -> str:
+        """Lọc bỏ từ khóa thừa nhưng GIỮ NGUYÊN toàn bộ danh sách tham số khai báo."""
+        # 1. Nếu là Class, Interface, Struct
+        match_class = re.search(r'\b(class|interface|struct|enum|type|union|trait|mixin|extension)\s+([a-zA-Z0-9_<>]+)', signature)
+        if match_class:
+            return f"🔹 {match_class.group(1)} {match_class.group(2)}"
+            
+        sig = signature.strip()
+        
+        # 2. Định nghĩa hàm chuẩn (Python, Dart, JS, Rust, Go): "async function saveDB(a, b, c = {})"
+        # Trích xuất từ tên hàm cho đến hết ngoặc đơn đóng chứa tham số gốc
+        match_func = re.search(r'\b(?:fn|func|function|def|async\s+fn|async\s+def)\s+([a-zA-Z0-9_<>]+\s*\(.*\))', sig)
+        if match_func:
+            return f"⚙️ {match_func.group(1)}"
+            
+        # 3. Định nghĩa hàm dạng biến gán (JS/TS/JSX Arrow Functions): "const scanDir = (path, depth = 3)"
+        if '=' in sig:
+            parts = sig.split('=', 1)
+            left = parts[0].strip()
+            right = parts[1].strip()
+            
+            # Làm sạch tên biến ở vế trái
+            name = re.sub(r'\b(const|let|var|export|default|pub|public|static|async)\b', '', left).strip()
+            
+            # Tìm cụm đóng mở ngoặc chứa tham số ở vế phải
+            match_paren = re.search(r'(\(.*\))', right)
+            if match_paren:
+                return f"⚡ {name}{match_paren.group(1)}"
+            
+            # Trường hợp đặc biệt: arrow function chỉ có 1 tham số không ngoặc đơn (ví dụ: const fn = x =>)
+            right_clean = re.sub(r'\b(async)\b', '', right).strip()
+            if right_clean:
+                return f"⚡ {name}({right_clean})"
+                
+            return f"⚡ {name}()"
+            
+        # 4. Fallback phòng vệ chung cho các cú pháp đặc thù
+        sig_clean = re.sub(r'\b(export|default|pub|public|private|protected|static|async|const|let|var|function|fn|func|def)\b', '', sig).strip()
+        if '(' in sig_clean:
+            return f"⚙️ {sig_clean}"
+            
+        return f"⚙️ {sig_clean}"
+
+    # ==========================================================
+    # 🛠️ ĐIỀU CHỈNH: TĂNG KHOẢNG ĐỆM ĐỂ TRÁNH TRÀN LỀ KHI THAM SỐ DÀI
+    # ==========================================================
+    def _render_markdown_tree(self, node: SymbolNode, ext: str, indent: str = "", is_last: bool = True, is_root: bool = False) -> List[str]:
+        """
+        Hàm đệ quy vẽ cấu trúc cây lồng nhau chuẩn hóa.
+        Cố định thông tin dòng lên đầu dòng và đặt mô tả sát bên phải tên hàm.
+        """
+        lines = []
+        if is_root:
+            lines.append(f"{node.signature} | {node.description}")
+            next_indent = ""
+        else:
+            marker = "└── " if is_last else "├── "
+            compact_name = self._get_compact_name(node.signature, ext)
+            desc_part = f" # {node.description}" if node.description != "Không có mô tả" else ""
+            
+            # Căn phải dòng bắt đầu/kết thúc (rộng 3 ký tự) để thẳng hàng tuyệt đối
+            line_anchor = f"[Dòng {node.start:>3}-{node.end:>3}]"
+            
+            # Đưa line_anchor lên đầu, compact_name và desc_part theo sau liền mạch
+            lines.append(f"{indent}{marker}{line_anchor} {compact_name}{desc_part}")
+            next_indent = indent + ("    " if is_last else "│   ")
+            
+        for idx, child in enumerate(node.children):
+            child_last = (idx == len(node.children) - 1)
+            lines.extend(self._render_markdown_tree(child, ext, next_indent, child_last, is_root=False))
+            
+        return lines
+
     def _run(self, file_path: str) -> str:
         try:
             safe_path = sanitize_and_resolve_path(self.workspace_path, file_path, create_parent=False)
@@ -409,17 +472,22 @@ class UniversalSymbolSearchTool(BaseTool):
                 ".ts": [
                     r"\b(class|interface|type)\s+[a-zA-Z0-9_]+",
                     r"\b(function\s+[a-zA-Z0-9_]+)",
-                    r"\b(const|let|var)\s+([a-zA-Z0-9_]+)\s*=\s*(?:\([^)]*\)|[a-zA-Z0-9_]+)\s*=>"
+                    r"\b(const|let|var)\s+([a-zA-Z0-9_]+)\s*=\s*(?:async\s+)?(?:\([^)]*\)|[a-zA-Z0-9_]+)\s*=>"
                 ],
                 ".tsx": [
                     r"\b(class|interface)\s+[a-zA-Z0-9_]+",
                     r"\b(function\s+[a-zA-Z0-9_]+)",
-                    r"\b(const|let|var)\s+([a-zA-Z0-9_]+)\s*=\s*(?:\([^)]*\)|[a-zA-Z0-9_]+)\s*=>"
+                    r"\b(const|let|var)\s+([a-zA-Z0-9_]+)\s*=\s*(?:async\s+)?(?:\([^)]*\)|[a-zA-Z0-9_]+)\s*=>"
                 ],
                 ".js": [
                     r"\b(class\s+[a-zA-Z0-9_]+)",
                     r"\b(function\s+[a-zA-Z0-9_]+)",
-                    r"\b(const|let|var)\s+([a-zA-Z0-9_]+)\s*=\s*(?:\([^)]*\)|[a-zA-Z0-9_]+)\s*=>"
+                    r"\b(const|let|var)\s+([a-zA-Z0-9_]+)\s*=\s*(?:async\s+)?(?:\([^)]*\)|[a-zA-Z0-9_]+)\s*=>"
+                ],
+                ".jsx": [
+                    r"\b(class\s+[a-zA-Z0-9_]+)",
+                    r"\b(function\s+[a-zA-Z0-9_]+)",
+                    r"\b(const|let|var)\s+([a-zA-Z0-9_]+)\s*=\s*(?:async\s+)?(?:\([^)]*\)|[a-zA-Z0-9_]+)\s*=>"
                 ],
                 ".rs": [
                     r"\b(?:pub\s+)?(?:struct|enum|union|trait)\s+([a-zA-Z0-9_]+)",
@@ -469,7 +537,6 @@ class UniversalSymbolSearchTool(BaseTool):
                 clean_line = line.strip()
                 if not clean_line:
                     continue
-                
                 if clean_line.startswith("//") or clean_line.startswith("#") or clean_line.startswith("/*") or clean_line.startswith("*"):
                     continue
                 
@@ -480,13 +547,11 @@ class UniversalSymbolSearchTool(BaseTool):
                 for pattern in selected_patterns:
                     if re.search(pattern, clean_matching_line):
                         start_line = line_no
-                        
                         if ext == ".py":
                             end_line = self._find_python_block_end(lines, line_no - 1)
                         else:
                             end_line = self._find_brace_block_end(lines, line_no - 1, ext)
                         
-                        # ⚙️ NÂNG CẤP CHÍNH: Gọi hàm _extract_full_signature để lấy signature nguyên vẹn
                         symbol_signature = self._extract_full_signature(lines, line_no - 1, ext)
                         description = self._extract_description(lines, line_no, ext)
                         
@@ -496,18 +561,34 @@ class UniversalSymbolSearchTool(BaseTool):
             if not raw_symbols:
                 return f"Thông báo: Đã quét tệp '{file_path}' nhưng không phát hiện cấu trúc đặc trưng nào."
             
-            table_rows = [
-                f"### 📊 DANH SÁCH CÁC HÀM TRONG `{file_path}`",
-                "",
-                "| STT | Chữ ký khai báo (Signature) | Dòng | Mô tả chức năng |",
-                "| :---: | :--- | :---: | :--- |"
-            ]
+            # Sắp xếp theo dòng bắt đầu tăng dần, dòng kết thúc giảm dần
+            raw_symbols.sort(key=lambda x: (x[0], -x[1]))
             
-            for stt, (start, end, signature, desc) in enumerate(raw_symbols, 1):
-                # Hiển thị signature trong khối inline code `...` để giữ nguyên định dạng kiểu dữ liệu
-                table_rows.append(f"| {stt} | `{signature}` | {start:02d}-{end:02d} | {desc} |")
+            root_nodes: List[SymbolNode] = []
+            stack: List[SymbolNode] = []
+            
+            for start, end, signature, description in raw_symbols:
+                node = SymbolNode(start, end, signature, description)
                 
-            return "\n".join(table_rows)
+                while stack and not (stack[-1].start < node.start and node.end <= stack[-1].end):
+                    stack.pop()
+                
+                if stack:
+                    stack[-1].children.append(node)
+                else:
+                    root_nodes.append(node)
+                
+                stack.append(node)
+            
+            # Gốc tệp tin
+            virtual_root = SymbolNode(1, len(lines), f"📁 `{file_path}`", "Cấu trúc tệp tin")
+            virtual_root.children = root_nodes
+            
+            # 🛠️ CẬP NHẬT: Truyền thêm is_root=True cho Node gốc ảo đầu tiên
+            tree_output_lines = self._render_markdown_tree(virtual_root, ext, is_root=True)
+            
+            header = f"### 📊 SƠ ĐỒ PHÂN CẤP CẤU TRÚC KÝ HIỆU (SCOPE TREE)\n\n"
+            return header + "```text\n" + "\n".join(tree_output_lines) + "\n```"
 
         except Exception as e:
             return f"Lỗi phân tích phạm vi khối mã: {str(e)}"

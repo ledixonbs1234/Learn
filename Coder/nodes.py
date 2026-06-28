@@ -17,10 +17,38 @@ from tools import (
     get_current_working_directory, check_path_exists, find_project_root
 )
 workspace_discovery_subgraph = None
-# =====================================================================
-# CÁC HÀM TIỆN ÍCH BỔ TRỢ CHO BỘ KIỂM THỬ ĐA NGÔN NGỮ THÍCH ỨNG
-# =====================================================================
 
+# =====================================================================
+# CÁC HÀM TIỆN ÝCH BỔ TRỢ CHO BỘ KIỂM THỬ ĐA NGÔN NGỮ THÍCH ỨNG
+# =====================================================================
+def clear_compiler_cache(workspace_path: Path, ext: str):
+    """
+    Dọn dẹp vật lý các tệp tin cache biên dịch tạm thời trên đĩa cứng 
+    để đảm bảo kết quả kiểm thử hoàn toàn là của mã nguồn mới nhất.
+    """
+    try:
+        if ext == ".py":
+            # Dọn dẹp __pycache__ và các tệp .pyc cục bộ
+            for pycache in workspace_path.rglob("__pycache__"):
+                if pycache.is_dir():
+                    shutil.rmtree(pycache, ignore_errors=True)
+            for pyc in workspace_path.rglob("*.pyc"):
+                if pyc.is_file():
+                    pyc.unlink(missing_ok=True)
+                    
+        elif ext in [".ts", ".tsx", ".js", ".jsx"]:
+            # Dọn dẹp cache của TypeScript nếu có
+            ts_cache = workspace_path / "node_modules" / ".cache"
+            if ts_cache.exists():
+                shutil.rmtree(ts_cache, ignore_errors=True)
+                
+        elif ext == ".rs":
+            # Dọn dẹp cache thô của Cargo để cargo check luôn chạy thực tế
+            # Lưu ý: Không chạy 'cargo clean' vì sẽ tốn rất nhiều thời gian compile lại từ đầu
+            pass
+            
+    except Exception as e:
+        print(f"[Cảnh báo] Không thể dọn dẹp cache biên dịch: {str(e)}")
 def find_nearest_config(start_path: Path, config_name: str, max_depth: int = 5) -> Optional[Path]:
     """
     Quét ngược lên các thư mục cha từ start_path để tìm tệp cấu hình (ví dụ: package.json, Cargo.toml).
@@ -48,7 +76,7 @@ def execute_validation_cmd(cmd: List[str], cwd: Path, timeout: int = 30) -> Tupl
     executable = cmd[0]
     is_windows = platform.system() == "Windows"
     
-    # 🛡️ VÁ ĐIỂM KHUYẾT 2: Chuẩn hóa lệnh cho Windows (.cmd, .bat, .exe)
+    # Chuẩn hóa lệnh cho Windows (.cmd, .bat, .exe)
     resolved_executable = shutil.which(executable)
     if not resolved_executable and is_windows:
         for ext in [".cmd", ".bat", ".exe"]:
@@ -57,7 +85,7 @@ def execute_validation_cmd(cmd: List[str], cwd: Path, timeout: int = 30) -> Tupl
                 resolved_executable = shutil.which(cmd[0])
                 break
                 
-    # 🛡️ VÁ ĐIỂM KHUYẾT 3: Nếu thiếu công cụ, trả về mã lỗi đặc biệt (-99) để soft-bypass
+    # Nếu thiếu công cụ, trả về mã lỗi đặc biệt (-99) để soft-bypass
     if not resolved_executable:
         return (-99, f"Cảnh báo: Trình biên dịch/phân tích '{executable}' chưa được cài đặt trên hệ thống.")
         
@@ -108,6 +136,8 @@ def clean_compiler_logs(raw_logs: str) -> str:
         return raw_logs
         
     return "\n".join(filtered_lines)
+
+
 # ==========================================
 # NÚT WRAPPER CHO SUBGRAPH (STATE ISOLATION)
 # ==========================================
@@ -146,6 +176,7 @@ def detect_workspace_wrapper_node(state: AgentState) -> Dict[str, Any]:
         "messages": [final_msg] # Chỉ trả về 1 tin nhắn sạch sẽ, loại bỏ toàn bộ tool_calls nháp
     }
 
+
 # Hàm tiện ích nội bộ lọc các task đủ điều kiện (DAG)
 def get_eligible_tasks(plan: List[Any]) -> List[Any]:
     completed_ids = set()
@@ -165,8 +196,9 @@ def get_eligible_tasks(plan: List[Any]) -> List[Any]:
                 eligible.append(t)
     return eligible
 
+
 # ==========================================
-# CÁC NODES PHỤC VỤ ĐỒ THỊ CON DÒ TÌM WORKSPACE [1.2.2]
+# CÁC NODES PHỤC VỤ ĐỒ THỊ CON DÒ TÌM WORKSPACE
 # ==========================================
 def discovery_agent_node(state: WorkspaceDiscoveryState) -> Dict[str, Any]:
     """Node trí tuệ của Subgraph: Dùng công cụ khảo sát hệ thống để khóa mục tiêu workspace."""
@@ -190,131 +222,6 @@ def discovery_agent_node(state: WorkspaceDiscoveryState) -> Dict[str, Any]:
         
     response = model_with_tools.invoke(messages)
     return {"messages": [response]}
-
-
-def replanner_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Node trí tuệ trung gian: Đánh giá tiến độ thực tế, phát hiện rào cản 
-    và tiến hành cập nhật/thích ứng đồ thị nhiệm vụ (DAG) theo thời gian thực.
-    """
-    
-    replanning_count = state.get("replanning_count", 0)
-    
-    # 🛡️ CHỐT CHẶN BẢO VỆ: Nếu Re-plan quá 5 lần, dừng lại để tránh cạn kiệt tài nguyên
-    if replanning_count >= 5:
-        return {
-            "messages": [AIMessage(content="🚨 **[Hệ thống tự động dừng]** Phát hiện vòng lặp lập kế hoạch quá nhiều lần (Vượt giới hạn 5 lần). Chuyển tiếp tới bước tiếp theo để tránh lặp vô hạn.")]
-        }
-    ws = state["workspace_path"]
-    plan = state["plan"]
-    messages = state["messages"]
-    task_type = state.get("task_type", "development")
-    workspace_context = state.get("workspace_context", "")
-    error_logs = state.get("error_logs", "")
-    
-    # Định dạng trực quan danh sách nhiệm vụ hiện tại để LLM dễ phân tích
-    plan_str = "\n".join([
-        f"- [{t.id if isinstance(t, Task) else t.get('id')}] {t.description if isinstance(t, Task) else t.get('description')} "
-        f"(Trạng thái: {t.status if isinstance(t, Task) else t.get('status')}, "
-        f"Phụ thuộc: {t.dependencies if isinstance(t, Task) else t.get('dependencies')})"
-        for t in plan
-    ])
-    
-    system_prompt = (
-        "Bạn là một Kiến trúc sư kiêm Điều phối viên dự án phần mềm cấp cao.\n"
-        f"Nhiệm vụ: Đánh giá tiến trình thực thi kế hoạch tại thư mục làm việc '{ws}'.\n"
-        "Hãy phân tích kỹ các tin nhắn hội thoại và kết quả thực thi các công cụ gần nhất để quyết định xem kế hoạch hiện tại có cần thích ứng hay không.\n\n"
-        "⚠️ QUY TẮC CẬP NHẬT KẾ HOẠCH CHO PRODUCTION (BẮT BUỘC):\n"
-        "1. Nếu phát hiện thấy lỗi phát sinh (lỗi cú pháp, lỗi test, lỗi logic), file bị thiếu, hoặc cần thêm các bước khảo sát/phát triển bổ sung, "
-        "hãy đặt `should_modify_plan` là True và cập nhật danh sách nhiệm vụ trong `updated_tasks` để giải quyết vấn đề.\n"
-        "2. Nếu tiến trình diễn ra hoàn hảo không có lỗi và không cần bổ sung gì, hãy đặt `should_modify_plan` là False.\n"
-        "3. ĐỐI VỚI CÁC NHIỆM VỤ ĐÃ HOÀN THÀNH (status: 'completed'): Bắt buộc giữ nguyên ID, mô tả và trạng thái là 'completed'. Tuyệt đối không xóa hoặc reset trạng thái của chúng trừ khi cần thực hiện lại từ đầu.\n"
-        "4. Đảm bảo các nhiệm vụ mới (nếu có) được đặt ID mới (ví dụ: T1.1, T3_fix) và thiết lập quan hệ phụ thuộc `dependencies` chính xác."
-    )
-    
-    if workspace_context:
-        system_prompt += f"\n\n--- NGỮ CẢNH HỆ THỐNG (THONGTIN.md) ---\n{workspace_context}"
-        
-    user_prompt = f"Kế hoạch hiện tại:\n{plan_str}\n\n"
-    if error_logs:
-        user_prompt += f"🚨 PHÁT HIỆN LỖI KIỂM TRA/BIÊN DỊCH CẦN SỬA ĐỔI KẾ HOẠCH:\n{error_logs}\n\n"
-        
-    user_prompt += "Hãy đưa ra phân tích và cập nhật kế hoạch phù hợp thông qua cuộc gọi hàm."
-    
-    # Ép cấu trúc đầu ra bằng function calling tương thích local model
-    structured_llm = model.with_structured_output(PlanUpdate, method="function_calling")
-    
-    try:
-        decision = structured_llm.invoke([
-            {"role": "system", "content": system_prompt},
-            *messages,
-            {"role": "user", "content": user_prompt}
-        ])
-        
-        should_modify = getattr(decision, "should_modify_plan", False)
-        explanation = getattr(decision, "explanation", "")
-        updated_tasks = getattr(decision, "updated_tasks", plan)
-        
-        old_completed_tasks = {
-            (t.id if isinstance(t, Task) else t.get("id")): t 
-            for t in plan 
-            if (t.status if isinstance(t, Task) else t.get("status")) == "completed"
-        }
-        
-        refined_tasks = []
-        seen_ids = set()
-        
-        for task_data in updated_tasks:
-            # Chuyển đổi dict thành Pydantic Object nếu cần
-            task_obj = task_data if isinstance(task_data, Task) else Task(**task_data)
-            t_id = task_obj.id
-            
-            # Tránh trùng lặp ID tác vụ do LLM sinh sai
-            if t_id in seen_ids:
-                t_id = f"{t_id}_alt_{len(seen_ids)}"
-                task_obj.id = t_id
-            seen_ids.add(t_id)
-            
-            # KHÓA TRẠNG THÁI: Nếu tác vụ này trước đây đã hoàn thành, tuyệt đối không cho LLM reset nó về pending
-            if t_id in old_completed_tasks:
-                task_obj.status = "completed"
-                # Giữ nguyên mô tả cũ để tránh LLM sửa đổi lịch sử
-                old_task = old_completed_tasks[t_id]
-                task_obj.description = old_task.description if isinstance(old_task, Task) else old_task.get("description")
-                
-            refined_tasks.append(task_obj)
-        
-        
-        
-        # Tiền xử lý để đảm bảo dữ liệu luôn là các Pydantic Task hợp lệ
-        refined_tasks = []
-        for task_data in updated_tasks:
-            if isinstance(task_data, Task):
-                refined_tasks.append(task_data)
-            elif isinstance(task_data, dict):
-                refined_tasks.append(Task(**task_data))
-                
-        if should_modify and refined_tasks:
-            new_plan_str = "\n".join([
-                f"- [{t.id}] {t.description} (Trạng thái: {t.status}, Phụ thuộc: {t.dependencies})" 
-                for t in refined_tasks
-            ])
-            return {
-                "plan": refined_tasks,
-                "replanning_count": replanning_count + 1, # <--- TĂNG BIẾN ĐẾM
-                "messages": [AIMessage(content=f"🔄 **[Điều chỉnh kế hoạch]** {explanation}\n\nKế hoạch hành động mới:\n{new_plan_str}")]
-            }
-        else:
-            return {
-                "messages": [AIMessage(content=f"✅ **[Giữ nguyên lộ trình]** {explanation or 'Tiến trình thực thi đang bám sát kế hoạch ban đầu.'}")]
-            }
-            
-    except Exception as e:
-        # Cơ chế phòng vệ Production: Nếu LLM lỗi khi gọi hàm, giữ nguyên kế hoạch cũ để tránh treo luồng
-        print(f"[Cảnh báo] Lỗi Re-planner: {str(e)}. Tiếp tục sử dụng kế hoạch hiện có.")
-        return {
-            "messages": [AIMessage(content="⚠️ Không thể tự động điều chỉnh kế hoạch do sự cố phân tích cấu trúc từ LLM. Tiếp tục bám sát kế hoạch cũ.")]
-        }
 
 
 def discovery_tool_node(state: WorkspaceDiscoveryState) -> Dict[str, Any]:
@@ -359,7 +266,6 @@ def discovery_finalize_node(state: WorkspaceDiscoveryState) -> Dict[str, Any]:
                     workspace_path = tool_call["args"].get("workspace_path", ".")
                     break
                     
-    # Giải mã và lấy đường dẫn tuyệt đối chuẩn xác [2]
     final_path = str(Path(workspace_path).expanduser().resolve())
     return {
         "workspace_path": final_path,
@@ -452,7 +358,6 @@ def git_setup_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
     git_dir = Path(ws) / ".git"
     
-    # GIẢI PHÁP: Nếu chưa có thư mục .git, bypass toàn bộ [1]
     if not git_dir.exists():
         return {
             "git_branch": "no_git",
@@ -473,16 +378,15 @@ def git_setup_node(state: AgentState) -> Dict[str, Any]:
         }
 
 
-# ==========================================
-# Cập nhật planner_node với cơ chế bảo vệ (Fallback)
-# ==========================================
+# =====================================================================
+# CHỈNH SỬA 1: Cấu trúc lại Planner_Node để tối ưu hóa Hợp đồng Nhiệm vụ
+# =====================================================================
 def planner_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
     conversation_history = state["messages"]
     existing_plan = state.get("plan", [])
     workspace_context = state.get("workspace_context", "")
     
-    # Nếu đã có sẵn kế hoạch từ bước Triage (Fast-track), bỏ qua việc lập kế hoạch
     if existing_plan:
         return {
             "modified_files": [],
@@ -505,11 +409,13 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
         "QUY TẮC QUAN TRỌNG VỀ PHỤ THUỘC (DEPENDENCIES):\n"
         "- Thiết lập `dependencies` của từng nhiệm vụ chính xác để cho phép chạy song song (nếu không liên quan) hoặc nối tiếp (nếu cần sự liên tục).\n"
         "⚠️ LƯU Ý ĐẶC BIỆT QUAN TRỌNG ĐỂ TRÁNH TRÙNG LẶP (BẮT BUỘC):\n"
-        "- Tuyệt đối KHÔNG đưa bước 'Tổng hợp và báo cáo' hoặc 'Viết tệp THONGTIN.md' làm nhiệm vụ cuối cùng trong kế hoạch!\n"
-        "Kế hoạch của bạn chỉ tập trung hoàn toàn vào các bước thực thi khảo sát vật lý (analysis) hoặc sửa đổi mã nguồn (development)."
+        "- Tuyệt đối KHÔNG đưa bước 'Tổng hợp', 'Báo cáo', hay 'Viết tệp THONGTIN.md' làm nhiệm vụ trong kế hoạch! "
+        "Tác vụ tổng hợp đã được quản lý tự động bởi node 'synthesis' chuyên biệt ở phía sau.\n"
+        "- Tuyệt đối KHÔNG đưa bước 'Chạy test suite', 'Kiểm thử logic' (ví dụ: pytest, npm test, dart test) vào kế hoạch! "
+        "Tác vụ kiểm thử tĩnh và kiểm tra cú pháp đã được quản lý tự động bởi node 'tester' chuyên biệt ở phía sau.\n"
+        "- Kế hoạch của bạn chỉ tập trung hoàn toàn vào các bước thực thi khảo sát vật lý (analysis) hoặc sửa đổi mã nguồn (development)."
     )
     
-    # SỬA ĐỔI: Thêm khối try-except phòng thủ cho mô hình cục bộ
     try:
         plan_output = structured_llm.invoke([
             {"role": "system", "content": system_prompt},
@@ -518,7 +424,6 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
         plan_tasks = getattr(plan_output, "tasks", [])
         task_type = getattr(plan_output, "task_type", "development")
     except Exception as e:
-        # Cơ chế Fallback khi LLM gặp sự cố parse cấu trúc
         print(f"[Cảnh báo] Lỗi parse cấu trúc Planner: {str(e)}. Sử dụng kế hoạch dự phòng đơn bước.")
         user_query = "Thực hiện yêu cầu hiện tại"
         for msg in reversed(conversation_history):
@@ -547,7 +452,11 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
         "last_executed_task_ids": [],
         "messages": [AIMessage(content=f"Đã lập kế hoạch hành động dạng đồ thị phụ thuộc (Loại: {task_type.upper()}):\n{plan_str}")]
     }
-    
+
+
+# =====================================================================
+# CHỈNH SỬA 2: Ràng buộc tuyệt đối phạm vi kết quả cho Analysis Executor
+# =====================================================================
 def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
     plan = state["plan"]
@@ -571,7 +480,7 @@ def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
     list_directory = ListDirectoryTool(workspace_path=ws)
     search_symbols = UniversalSymbolSearchTool(workspace_path=ws)
     read_file_lines = ReadFileLinesTool(workspace_path=ws)
-    tools = [read_files, list_directory,search_symbols,read_file_lines]
+    tools = [read_files, list_directory, search_symbols, read_file_lines]
 
     model_with_tools = model.bind_tools(tools)
     
@@ -589,9 +498,12 @@ def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
         system_prompt += f"\n--- TỔNG QUAN VỀ DỰ ÁN (THONGTIN.md) ---\n{workspace_context}\n"
         
     system_prompt += (
-        "\nHãy sử dụng các công cụ `read_files` và `list_directory` để đọc hiểu cấu trúc hệ thống.\n"
-        "YÊU CẦU QUAN TRỌNG:\n"
-        "- Bạn chỉ có quyền ĐỌC dữ liệu, tuyệt đối không chỉnh sửa mã nguồn hoặc tự ý tạo tệp tin trong bước này."
+        "\nHãy sử dụng các công cụ khảo sát cấu trúc hệ thống.\n"
+        "\n⚠️ RÀNG BUỘC PHẠM VI NGHIÊM NGẶT (BẮT BUỘC):\n"
+        "1. Bạn chỉ có quyền ĐỌC dữ liệu, tuyệt đối không chỉnh sửa mã nguồn hoặc tự ý tạo tệp tin trong bước này.\n"
+        "2. KHÔNG ĐƯỢC PHÉP tự ý định dạng tài liệu báo cáo hoàn chỉnh, tổng hợp tri thức hay viết tệp THONGTIN.md. "
+        "Nhiệm vụ của bạn chỉ là thu thập thông tin thô, liệt kê các phát hiện kỹ thuật (raw findings) thực tế. "
+        "Việc tổng hợp chúng thành một tài liệu THONGTIN.md hoàn chỉnh là nhiệm vụ ĐỘC QUYỀN của node 'synthesis' tiếp theo."
     )
     if previous_findings_str:
         system_prompt += previous_findings_str
@@ -602,6 +514,7 @@ def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
         findings = []
         if response.content:
             tasks_ids = ", ".join([str(getattr(t, "id", None) or t.get("id")) for t in eligible_tasks])
+            # Lưu lại dữ liệu thô phục vụ tổng hợp sau này
             findings = [f"### Kết quả khảo sát các nhiệm vụ ({tasks_ids}):\n{response.content}"]
             
         updated_plan = []
@@ -626,8 +539,9 @@ def analysis_executor_node(state: AgentState) -> Dict[str, Any]:
         return {"messages": [response]}
 
 
-# nodes.py
-
+# =====================================================================
+# CHỈNH SỬA 3: Ngăn chặn tuyệt đối hành vi chạy lệnh Test trong Dev Executor
+# =====================================================================
 def development_executor_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
     plan = state["plan"]
@@ -654,10 +568,9 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
     search_symbols = UniversalSymbolSearchTool(workspace_path=ws)
     list_directory = ListDirectoryTool(workspace_path=ws)
     run_terminal_command = RunTerminalTool(workspace_path=ws)
-
     read_file_lines = ReadFileLinesTool(workspace_path=ws)
     
-    tools = [read_files, write_file, apply_patch, list_directory, run_terminal_command,search_symbols,read_file_lines]
+    tools = [read_files, write_file, apply_patch, list_directory, run_terminal_command, search_symbols, read_file_lines]
     model_with_tools = model.bind_tools(tools)
     
     system_prompt = (
@@ -669,10 +582,13 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
         system_prompt += f"\n--- NGỮ CẢNH HỆ THỐNG HIỆN TẠI (THONGTIN.md) ---\n{workspace_context}\n"
         
     system_prompt += (
-        "\nHãy sử dụng các công cụ để giải quyết nhiệm vụ.\n"
-        "\n⚠️ QUY TẮC CHỈNH SỬA TỆP (BẮT BUỘC):\n"
+        "\nHãy sử dụng các công cụ thích hợp để giải quyết nhiệm vụ.\n"
+        "\n⚠️ QUY TẮC VÀ RÀNG BUỘC PHẠM VI (BẮT BUỘC):\n"
         "1. Đối với file trên 300 dòng: BẮT BUỘC dùng `apply_search_replace_patch` để áp dụng bản vá, cấm ghi đè bừa bãi.\n"
-        "2. Công cụ `write_file` chỉ dùng khi tạo mới hoặc sửa các tệp ngắn dưới 300 dòng."
+        "2. Công cụ `write_file` chỉ dùng khi tạo mới hoặc sửa các tệp ngắn dưới 300 dòng.\n"
+        "3. NGHIÊM CẤM thực hiện chạy các bộ kiểm thử tự động (như pytest, cargo test, dart test, npm test, vitest) bằng công cụ `run_terminal_command`. "
+        "Mọi hành vi chạy test, phân tích cú pháp tĩnh tự động thuộc quyền hạn ĐỘC QUYỀN của node 'tester' ở bước tiếp theo trong đồ thị. "
+        "Bạn chỉ được dùng terminal để build thử/biên dịch thử nếu thực sự cần thiết kiểm tra lỗi biên dịch."
     )
     
     input_messages = [SystemMessage(content=system_prompt)]
@@ -695,7 +611,6 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
                     t_copy.status = "completed"
             updated_plan.append(t_copy)
 
-        # 🛡️ BẢN VÁ: Loại bỏ việc ghi đè "attempts": 0 và "error_logs": "" để bảo vệ bộ đếm của Tester
         return {
             "messages": [response],
             "plan": updated_plan,
@@ -703,6 +618,132 @@ def development_executor_node(state: AgentState) -> Dict[str, Any]:
         }
     else:
         return {"messages": [response]}
+
+
+# =====================================================================
+# CHỈNH SỬA 4: Ngăn chặn lấn ranh trong các lần điều chỉnh Kế hoạch (Replanner)
+# =====================================================================
+def replanner_node(state: AgentState) -> Dict[str, Any]:
+    """
+    Node trí tuệ trung gian: Đánh giá tiến độ thực tế, phát hiện rào cản 
+    và tiến hành cập nhật/thích ứng đồ thị nhiệm vụ (DAG) theo thời gian thực.
+    """
+    
+    replanning_count = state.get("replanning_count", 0)
+    
+    # 🛡️ CHỐT CHẶN BẢO VỆ: Nếu Re-plan quá 5 lần, dừng lại để tránh cạn kiệt tài nguyên
+    if replanning_count >= 5:
+        return {
+            "messages": [AIMessage(content="🚨 **[Hệ thống tự động dừng]** Phát hiện vòng lặp lập kế hoạch quá nhiều lần (Vượt giới hạn 5 lần). Chuyển tiếp tới bước tiếp theo để tránh lặp vô hạn.")]
+        }
+    ws = state["workspace_path"]
+    plan = state["plan"]
+    messages = state["messages"]
+    task_type = state.get("task_type", "development")
+    workspace_context = state.get("workspace_context", "")
+    error_logs = state.get("error_logs", "")
+    
+    # Định dạng trực quan danh sách nhiệm vụ hiện tại để LLM dễ phân tích
+    plan_str = "\n".join([
+        f"- [{t.id if isinstance(t, Task) else t.get('id')}] {t.description if isinstance(t, Task) else t.get('description')} "
+        f"(Trạng thái: {t.status if isinstance(t, Task) else t.get('status')}, "
+        f"Phụ thuộc: {t.dependencies if isinstance(t, Task) else t.get('dependencies')})"
+        for t in plan
+    ])
+    
+    system_prompt = (
+        "Bạn là một Kiến trúc sư kiêm Điều phối viên dự án phần mềm cấp cao.\n"
+        f"Nhiệm vụ: Đánh giá tiến trình thực thi kế hoạch tại thư mục làm việc '{ws}'.\n"
+        "Hãy phân tích kỹ các tin nhắn hội thoại và kết quả thực thi các công cụ gần nhất để quyết định xem kế hoạch hiện tại có cần thích ứng hay không.\n\n"
+        "⚠️ QUY TẮC CẬP NHẬT KẾ HOẠCH CHO PRODUCTION (BẮT BUỘC):\n"
+        "1. Nếu phát hiện thấy lỗi phát sinh (lỗi cú pháp, lỗi test, lỗi logic), file bị thiếu, hoặc cần thêm các bước khảo sát/phát triển bổ sung, "
+        "hãy đặt `should_modify_plan` là True và cập nhật danh sách nhiệm vụ trong `updated_tasks` để giải quyết vấn đề.\n"
+        "2. Nếu tiến trình diễn ra hoàn hảo không có lỗi và không cần bổ sung gì, hãy đặt `should_modify_plan` là False.\n"
+        "3. ĐỐI VỚI CÁC NHIỆM VỤ ĐÃ HOÀN THÀNH (status: 'completed'): Bắt buộc giữ nguyên ID, mô tả và trạng thái là 'completed'. Tuyệt đối không xóa hoặc reset trạng thái của chúng trừ khi cần thực hiện lại từ đầu.\n"
+        "4. Đảm bảo các nhiệm vụ mới (nếu có) được đặt ID mới (ví dụ: T1.1, T3_fix) và thiết lập quan hệ phụ thuộc `dependencies` chính xác.\n"
+        "5. RẤT QUAN TRỌNG: Nếu kế hoạch chuyển từ giai đoạn khảo sát (analysis) sang phát triển/sửa đổi code (development), hãy cập nhật giá trị `task_type` tương ứng sang 'development'."
+    )
+    
+    if workspace_context:
+        system_prompt += f"\n\n--- NGỮ CẢNH HỆ THỐNG (THONGTIN.md) ---\n{workspace_context}"
+        
+    user_prompt = f"Kế hoạch hiện tại:\n{plan_str}\n\n"
+    if error_logs:
+        user_prompt += f"🚨 PHÁT HIỆN LỖI KIỂM TRA/BIÊN DỊCH CẦN SỬA ĐỔI KẾ HOẠCH:\n{error_logs}\n\n"
+        
+    user_prompt += "Hãy đưa ra phân tích và cập nhật kế hoạch phù hợp thông qua cuộc gọi hàm."
+    
+    # Ép cấu trúc đầu ra bằng function calling tương thích local model
+    structured_llm = model.with_structured_output(PlanUpdate, method="function_calling")
+    
+    try:
+        decision = structured_llm.invoke([
+            {"role": "system", "content": system_prompt},
+            *messages,
+            {"role": "user", "content": user_prompt}
+        ])
+        
+        should_modify = getattr(decision, "should_modify_plan", False)
+        explanation = getattr(decision, "explanation", "")
+        updated_tasks = getattr(decision, "updated_tasks", plan)
+        # --- LẤY GIÁ TRỊ TASK_TYPE CẬP NHẬT TỪ LLM ---
+        updated_task_type = getattr(decision, "task_type", task_type)
+        
+        old_completed_tasks = {
+            (t.id if isinstance(t, Task) else t.get("id")): t 
+            for t in plan 
+            if (t.status if isinstance(t, Task) else t.get("status")) == "completed"
+        }
+        
+        refined_tasks = []
+        seen_ids = set()
+        
+        for task_data in updated_tasks:
+                # Chuyển đổi dict thành Pydantic Object nếu cần
+                task_obj = task_data if isinstance(task_data, Task) else Task(**task_data)
+                t_id = task_obj.id
+                
+                # Tránh trùng lặp ID tác vụ do LLM sinh sai
+                if t_id in seen_ids:
+                    t_id = f"{t_id}_alt_{len(seen_ids)}"
+                    task_obj.id = t_id
+                seen_ids.add(t_id)
+                
+                # KHÓA TRẠNG THÁI: Nếu tác vụ này trước đây đã hoàn thành, tuyệt đối không cho LLM reset nó về pending
+                if t_id in old_completed_tasks:
+                    task_obj.status = "completed"
+                    # Giữ nguyên mô tả cũ để tránh LLM sửa đổi lịch sử
+                    old_task = old_completed_tasks[t_id]
+                    task_obj.description = old_task.description if isinstance(old_task, Task) else old_task.get("description")
+                    
+                refined_tasks.append(task_obj)
+            
+        if should_modify and refined_tasks:
+            new_plan_str = "\n".join([
+                f"- [{t.id}] {t.description} (Trạng thái: {t.status}, Phụ thuộc: {t.dependencies})" 
+                for t in refined_tasks
+            ])
+            return {
+                "plan": refined_tasks,
+                "task_type": updated_task_type,
+                "replanning_count": replanning_count + 1,
+                "messages": [AIMessage(content=f"🔄 **[Điều chỉnh kế hoạch]** {explanation}\n\nKế hoạch hành động mới (Chuyển pha: {updated_task_type.upper()}):\n{new_plan_str}")]
+            }
+        else:
+            # 🛡️ VÁ LỖI MẤT ĐỒNG BỘ TIẾN ĐỘ: 
+            # Vẫn lưu refined_tasks vào plan để ghi nhận các trạng thái "completed" mà Agent đã thực hiện vượt tiến độ trong thực tế
+            return {
+                "plan": refined_tasks,
+                "task_type": updated_task_type,
+                "messages": [AIMessage(content=f"✅ **[Giữ nguyên lộ trình]** {explanation or 'Tiến trình thực thi đang bám sát kế hoạch ban đầu.'}")]
+            }
+            
+    except Exception as e:
+        # Cơ chế phòng vệ Production: Nếu LLM lỗi khi gọi hàm, giữ nguyên kế hoạch cũ để tránh treo luồng
+        print(f"[Cảnh báo] Lỗi Re-planner: {str(e)}. Tiếp tục sử dụng kế hoạch hiện có.")
+        return {
+            "messages": [AIMessage(content="⚠️ Không thể tự động điều chỉnh kế hoạch do sự cố phân tích cấu trúc từ LLM. Tiếp tục bám sát kế hoạch cũ.")]
+        }
 
 
 def tool_node(state: AgentState) -> Dict[str, Any]:
@@ -721,7 +762,7 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         "apply_search_replace_patch": apply_patch,
         "list_directory": list_directory,
         "run_terminal_command": run_terminal_command,
-        "search_symbols_universal":search_symbols,
+        "search_symbols_universal": search_symbols,
         "read_file_lines": read_file_lines
     }
     
@@ -771,10 +812,10 @@ def tester_node(state: AgentState) -> Dict[str, Any]:
     last_executed_ids = state.get("last_executed_task_ids", [])
     
     errors = []
-    warnings = [] # Chứa các cảnh báo thiếu công cụ để không phạt LLM
+    warnings = []
     workspace_root = Path(ws).expanduser().resolve()
     
-    # Phân loại tệp đã sửa
+    # Phân loại tệp đã sửa và tiến hành DỌN DẸP CACHE trước khi test
     files_by_ext: Dict[str, List[Path]] = {}
     for f_path_str in modified_files:
         try:
@@ -782,12 +823,13 @@ def tester_node(state: AgentState) -> Dict[str, Any]:
             if p.exists() and p.is_file():
                 ext = p.suffix.lower()
                 files_by_ext.setdefault(ext, []).append(p)
+                
+                # ⚙️ BỔ SUNG: Dọn dẹp cache biên dịch vật lý trước khi tiến hành phân tích
+                clear_compiler_cache(workspace_root, ext)
         except Exception:
             pass
 
     for ext, files in files_by_ext.items():
-        
-        # 1. NGÔN NGỮ PYTHON (.py)
         if ext == ".py":
             for f in files:
                 code, output = execute_validation_cmd(["python", "-m", "py_compile", str(f)], workspace_root)
@@ -796,7 +838,6 @@ def tester_node(state: AgentState) -> Dict[str, Any]:
                 elif code != 0:
                     errors.append(f"❌ [Lỗi Cú Pháp Python] tại `{f.name}`:\n{clean_compiler_logs(output)}")
 
-        # 2. DART / FLUTTER (.dart)
         elif ext == ".dart":
             for f in files:
                 target_dir = find_nearest_config(f, "pubspec.yaml") or workspace_root
@@ -807,7 +848,6 @@ def tester_node(state: AgentState) -> Dict[str, Any]:
                     errors.append(f"❌ [Lỗi Dart Analysis] tại sub-project `{target_dir.name}`:\n{clean_compiler_logs(output)}")
                     break
 
-        # 3. TYPESCRIPT / JAVASCRIPT (.ts, .tsx, .js, .jsx)
         elif ext in [".ts", ".tsx", ".js", ".jsx"]:
             for f in files:
                 target_dir = find_nearest_config(f, "package.json") or workspace_root
@@ -820,7 +860,6 @@ def tester_node(state: AgentState) -> Dict[str, Any]:
                         errors.append(f"❌ [Lỗi TypeScript Compile] tại `{target_dir.name}`:\n{clean_compiler_logs(output)}")
                         break
 
-        # 4. RUST (.rs)
         elif ext == ".rs":
             for f in files:
                 target_dir = find_nearest_config(f, "Cargo.toml") or workspace_root
@@ -831,7 +870,6 @@ def tester_node(state: AgentState) -> Dict[str, Any]:
                     errors.append(f"❌ [Lỗi Biên Dịch Rust] tại `{target_dir.name}`:\n{clean_compiler_logs(output)}")
                     break
 
-        # 5. GO (.go)
         elif ext == ".go":
             for f in files:
                 target_dir = find_nearest_config(f, "go.mod") or workspace_root
@@ -842,14 +880,10 @@ def tester_node(state: AgentState) -> Dict[str, Any]:
                     errors.append(f"❌ [Lỗi Tĩnh Go Vet] tại `{target_dir.name}`:\n{clean_compiler_logs(output)}")
                     break
 
-    # =====================================================================
-    # XỬ LÝ KẾT QUẢ VÀ TRẢ VỀ TRẠNG THÁI (ĐÃ SỬA LỖI TÍCH LŨY FILE)
-    # =====================================================================
     warning_msg = ""
     if warnings:
         warning_msg = "⚠️ **Cảnh báo môi trường:**\n" + "\n".join([f"- {w}" for w in warnings]) + "\n\n"
 
-    # Nếu có lỗi cú pháp/biên dịch thực tế từ mã nguồn
     if errors:
         combined_error = "\n\n---\n\n".join(errors)
         
@@ -876,16 +910,15 @@ def tester_node(state: AgentState) -> Dict[str, Any]:
             return {
                 "error_logs": "",
                 "attempts": 0,
-                "modified_files": [], # 🛡️ VÁ ĐIỂM KHUYẾT 1: Reset danh sách file khi bỏ qua để tránh lỗi tích lũy
+                "modified_files": [],
                 "messages": [AIMessage(content=f"{warning_msg}❌ Đã vượt quá giới hạn số lần sửa lỗi tự động. Hệ thống sẽ bỏ qua lỗi để tiếp tục tiến trình.")]
             }
                 
-    # Trường hợp thành công hoàn toàn hoặc kích hoạt Soft-Bypass thành công
     success_content = f"{warning_msg}✅ [Vòng kiểm thử thành công] Toàn bộ mã nguồn đã vượt qua kiểm tra tĩnh và biên dịch."
     return {
         "error_logs": "",
         "attempts": 0,
-        "modified_files": [], # 🛡️ VÁ ĐIỂM KHUYẾT 1: RESET SẠCH SẼ ĐỂ NHIỆM VỤ TIẾP THEO KHÔNG BỊ TRÙNG LẶP KIỂM TRA
+        "modified_files": [],
         "messages": [AIMessage(content=success_content)]
     }
 
@@ -902,8 +935,8 @@ def synthesis_node(state: AgentState) -> Dict[str, Any]:
     
     synthesis_prompt = (
         "Bạn là một Kiến trúc sư Hệ thống chuyên nghiệp chuyên biên soạn tài liệu.\n"
-        "Hãy tổng hợp thông tin khảo sát sau thành một tài liệu 'THONGTIN.md' duy nhất, thật cô đọng và súc tích.\n"
-        "TUYỆT ĐỐI KHÔNG chèn mã nguồn dài dòng."
+        "Hãy tổng hợp toàn bộ thông tin khảo sát thô được ghi nhận ở các bước trước thành một tài liệu 'THONGTIN.md' duy nhất.\n"
+        "Yêu cầu: Viết thật cô đọng, súc tích và có cấu trúc rõ ràng. TUYỆT ĐỐI KHÔNG chèn mã nguồn dài dòng."
     )
     
     try:
@@ -926,7 +959,6 @@ def synthesis_node(state: AgentState) -> Dict[str, Any]:
             tools_mgr = WorkspaceTools(ws)
             tools_mgr.write_file("THONGTIN.md", cleaned_md)
             
-            # CHỈ CHẠY LỆNH GIT KHI DỰ ÁN SỬ DỤNG GIT [1]
             if git_branch != "no_git":
                 git_manager = GitManager(ws)
                 git_manager._run_cmd(["git", "add", "THONGTIN.md"], ignore_error=True)
@@ -945,7 +977,6 @@ def commit_node(state: AgentState) -> Dict[str, Any]:
     task_type = state.get("task_type", "development")
     git_branch = state.get("git_branch", "no_git")
     
-    # GIẢI PHÁP: Nếu không dùng Git, kết thúc êm đẹp, bỏ qua Git Commit [1]
     if git_branch == "no_git":
         return {
             "messages": [AIMessage(content="Đã hoàn thành toàn bộ yêu cầu của bạn. Chế độ Không-Git được kích hoạt, bỏ qua commit [1].")]

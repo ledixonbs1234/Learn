@@ -13,23 +13,26 @@ class WorkspaceDetection(BaseModel):
 class Task(BaseModel):
     id: str = Field(description="Mã định danh duy nhất cho nhiệm vụ, ví dụ: 'T1', 'T2'")
     description: str = Field(description="Mô tả chi tiết hành động cần thực hiện")
-    dependencies: List[str] = Field(default=[], description="Danh sách ID các nhiệm vụ cần hoàn thành trước khi bắt đầu nhiệm vụ này, ví dụ: ['T1']")
-    status: Literal["pending", "completed"] = Field(default="pending", description="Trạng thái thực thi nhiệm vụ")
+    dependencies: List[str] = Field(
+        default_factory=list, # Sử dụng default_factory an toàn hơn cho Pydantic v2
+        description="Mảng chứa các ID nhiệm vụ cần hoàn thành trước. Bắt buộc phải có trường này, nếu không phụ thuộc ai hãy trả về mảng rỗng []"
+    )
+    status: Literal["pending", "completed"] = Field(
+        default="pending", 
+        description="Trạng thái thực thi nhiệm vụ. Luôn luôn khởi tạo là 'pending'"
+    )
 
 class TaskPlan(BaseModel):
-    tasks: List[Task] = Field(description="Danh sách các nhiệm vụ có thiết lập quan hệ phụ thuộc lẫn nhau (DAG).")
-    explanation: str = Field(description="Mô tả chiến lược thực hiện nhiệm vụ và cách xử lý tuần tự/song song.")
+    tasks: List[Task] = Field(
+        description="Danh sách có thứ tự của các nhiệm vụ cần thực hiện (thiết lập quan hệ DAG chặt chẽ)."
+    )
+    explanation: str = Field(
+        description="Phân tích chiến lược triển khai và giải thích cách xử lý các tác vụ."
+    )
     task_type: Literal["analysis", "development"] = Field(
-        description="Phân loại yêu cầu: 'analysis' nếu chỉ đọc/khảo sát/báo cáo thông tin, 'development' nếu có viết/sửa/nâng cấp mã nguồn."
+        description="Phân loại hướng xử lý của toàn bộ yêu cầu: 'analysis' hoặc 'development'."
     )
 
-class TaskTriage(BaseModel):
-    is_simple: bool = Field(
-        description="True nếu yêu cầu cực kỳ đơn giản (chỉ cần sửa đổi trực tiếp 1-2 file, thêm tính năng nhỏ, sửa lỗi cú pháp). False nếu yêu cầu phức tạp cần khảo sát sâu hoặc thiết kế nhiều bước."
-    )
-    task_type: Literal["analysis", "development"] = Field(
-        description="Phân loại hướng xử lý của yêu cầu."
-    )
 class PlanUpdate(BaseModel):
     should_modify_plan: bool = Field(
         description="True nếu dựa trên kết quả thực thi vừa qua, bạn thấy cần sửa đổi hoặc bổ sung thêm nhiệm vụ mới vào kế hoạch. False nếu kế hoạch hiện tại vẫn đúng đắn và có thể tiếp tục trực tiếp."
@@ -40,6 +43,20 @@ class PlanUpdate(BaseModel):
     updated_tasks: List[Task] = Field(
         description="Danh sách toàn bộ các nhiệm vụ (gồm cả nhiệm vụ cũ đã hoàn thành và nhiệm vụ mới/sửa đổi). QUY TẮC: Phải giữ nguyên ID và trạng thái 'completed' của các nhiệm vụ cũ đã hoàn tất."
     )
+    # --- THÊM TRƯỜNG NÀY ĐỂ LLM CẬP NHẬT ĐỘNG TRẠNG THÁI ---
+    task_type: Literal["analysis", "development"] = Field(
+        default="development",
+        description="Phân loại hướng xử lý tiếp theo của kế hoạch: chuyển thành 'development' nếu kế hoạch cập nhật có chứa các bước viết hoặc sửa đổi mã nguồn, giữ nguyên 'analysis' nếu chỉ tiếp tục khảo sát/đọc hiểu hệ thống."
+    )
+
+class TaskTriage(BaseModel):
+    is_simple: bool = Field(
+        description="True nếu yêu cầu cực kỳ đơn giản (chỉ cần sửa đổi trực tiếp 1-2 file, thêm tính năng nhỏ, sửa lỗi cú pháp). False nếu yêu cầu phức tạp cần khảo sát sâu hoặc thiết kế nhiều bước."
+    )
+    task_type: Literal["analysis", "development"] = Field(
+        description="Phân loại hướng xử lý của yêu cầu."
+    )
+
 # ==========================================
 # CUSTOM REDUCERS VÀ STATE GRAPH
 # ==========================================

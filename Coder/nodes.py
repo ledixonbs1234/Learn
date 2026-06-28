@@ -1,4 +1,5 @@
 # nodes.py
+import os
 import platform
 import re
 import shutil
@@ -153,12 +154,19 @@ def execute_validation_cmd(cmd: List[str], cwd: Path, timeout: int = 30) -> Tupl
         return (-99, f"Cảnh báo: Trình biên dịch/phân tích '{executable}' chưa được cài đặt trên hệ thống.")
         
     try:
+        
+        env_copy = os.environ.copy()
+        env_copy["PYTHONIOENCODING"] = "utf-8"
+        env_copy["PYTHONUTF8"] = "1"
         # Thực thi lệnh trên terminal
         res = subprocess.run(
             cmd,
             cwd=str(cwd),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env_copy, 
             timeout=timeout
         )
         combined_output = (res.stdout or "") + "\n" + (res.stderr or "")
@@ -410,9 +418,10 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
         "last_executed_task_ids": [],
         "messages": messages_to_append,
         "replanning_count": 0,
-        "modified_files": [],     # Khởi tạo mặc định
-        "error_logs": "",         # Khởi tạo mặc định
-        "step_findings": [],      # Khởi tạo mặc định
+        "modified_files": [],     
+        "error_logs": "",         
+        "step_findings": [],      
+        "is_simple": is_simple,  # <--- TRẢ VỀ GIÁ TRỊ STATE ĐỂ LƯU TRỮ
     }
 
 
@@ -715,7 +724,6 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
     Node trí tuệ trung gian: Đánh giá tiến độ thực tế, phát hiện rào cản 
     và tiến hành cập nhật/thích ứng đồ thị nhiệm vụ (DAG) theo thời gian thực.
     """
-    
     replanning_count = state.get("replanning_count", 0)
     
     # 🛡️ CHỐT CHẶN BẢO VỆ: Nếu Re-plan quá 5 lần, dừng lại để tránh cạn kiệt tài nguyên
@@ -748,7 +756,13 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
         "2. Nếu tiến trình diễn ra hoàn hảo không có lỗi và không cần bổ sung gì, hãy đặt `should_modify_plan` là False.\n"
         "3. ĐỐI VỚI CÁC NHIỆM VỤ ĐÃ HOÀN THÀNH (status: 'completed'): Bắt buộc giữ nguyên ID, mô tả và trạng thái là 'completed'. Tuyệt đối không xóa hoặc reset trạng thái của chúng trừ khi cần thực hiện lại từ đầu.\n"
         "4. Đảm bảo các nhiệm vụ mới (nếu có) được đặt ID mới (ví dụ: T1.1, T3_fix) và thiết lập quan hệ phụ thuộc `dependencies` chính xác.\n"
-        "5. RẤT QUAN TRỌNG: Nếu kế hoạch chuyển từ giai đoạn khảo sát (analysis) sang phát triển/sửa đổi code (development), hãy cập nhật giá trị `task_type` tương ứng sang 'development'."
+        "5. RẤT QUAN TRỌNG: Nếu kế hoạch chuyển từ giai đoạn khảo sát (analysis) sang phát triển/sửa đổi code (development), hãy cập nhật giá trị `task_type` tương ứng sang 'development'.\n\n"
+        "⚠️ QUY TẮC CẤM ĐOÁN ĐẶC BIỆT QUAN TRỌNG ĐỂ TRÁNH TRÙNG LẶP (BẮT BUỘC):\n"
+        "- Tuyệt đối KHÔNG đưa bước 'Tổng hợp', 'Báo cáo', hay 'Viết tệp THONGTIN.md' làm nhiệm vụ trong kế hoạch! "
+        "Tác vụ tổng hợp đã được quản lý tự động bởi node 'synthesis' chuyên biệt ở phía sau.\n"
+        "- Tuyệt đối KHÔNG đưa bước 'Chạy test suite', 'Kiểm thử logic' (ví dụ: pytest, npm test, chạy file test_*.py) vào kế hoạch! "
+        "Tác vụ kiểm thử tĩnh và kiểm tra động đã được quản lý tự động bởi node 'tester' chuyên biệt ở phía sau sau khi toàn bộ kế hoạch phát triển hoàn tất.\n"
+        "- Kế hoạch cập nhật của bạn chỉ tập trung hoàn toàn vào các bước thực thi khảo sát vật lý (analysis) hoặc sửa đổi mã nguồn (development)."
     )
     
     if workspace_context:
@@ -773,7 +787,6 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
         should_modify = getattr(decision, "should_modify_plan", False)
         explanation = getattr(decision, "explanation", "")
         updated_tasks = getattr(decision, "updated_tasks", plan)
-        # --- LẤY GIÁ TRỊ TASK_TYPE CẬP NHẬT TỪ LLM ---
         updated_task_type = getattr(decision, "task_type", task_type)
         
         old_completed_tasks = {
@@ -786,24 +799,20 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
         seen_ids = set()
         
         for task_data in updated_tasks:
-                # Chuyển đổi dict thành Pydantic Object nếu cần
-                task_obj = task_data if isinstance(task_data, Task) else Task(**task_data)
-                t_id = task_obj.id
+            task_obj = task_data if isinstance(task_data, Task) else Task(**task_data)
+            t_id = task_obj.id
+            
+            if t_id in seen_ids:
+                t_id = f"{t_id}_alt_{len(seen_ids)}"
+                task_obj.id = t_id
+            seen_ids.add(t_id)
+            
+            if t_id in old_completed_tasks:
+                task_obj.status = "completed"
+                old_task = old_completed_tasks[t_id]
+                task_obj.description = old_task.description if isinstance(old_task, Task) else old_task.get("description")
                 
-                # Tránh trùng lặp ID tác vụ do LLM sinh sai
-                if t_id in seen_ids:
-                    t_id = f"{t_id}_alt_{len(seen_ids)}"
-                    task_obj.id = t_id
-                seen_ids.add(t_id)
-                
-                # KHÓA TRẠNG THÁI: Nếu tác vụ này trước đây đã hoàn thành, tuyệt đối không cho LLM reset nó về pending
-                if t_id in old_completed_tasks:
-                    task_obj.status = "completed"
-                    # Giữ nguyên mô tả cũ để tránh LLM sửa đổi lịch sử
-                    old_task = old_completed_tasks[t_id]
-                    task_obj.description = old_task.description if isinstance(old_task, Task) else old_task.get("description")
-                    
-                refined_tasks.append(task_obj)
+            refined_tasks.append(task_obj)
             
         if should_modify and refined_tasks:
             new_plan_str = "\n".join([
@@ -817,8 +826,6 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
                 "messages": [AIMessage(content=f"🔄 **[Điều chỉnh kế hoạch]** {explanation}\n\nKế hoạch hành động mới (Chuyển pha: {updated_task_type.upper()}):\n{new_plan_str}")]
             }
         else:
-            # 🛡️ VÁ LỖI MẤT ĐỒNG BỘ TIẾN ĐỘ: 
-            # Vẫn lưu refined_tasks vào plan để ghi nhận các trạng thái "completed" mà Agent đã thực hiện vượt tiến độ trong thực tế
             return {
                 "plan": refined_tasks,
                 "task_type": updated_task_type,
@@ -826,7 +833,6 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
             }
             
     except Exception as e:
-        # Cơ chế phòng vệ Production: Nếu LLM lỗi khi gọi hàm, giữ nguyên kế hoạch cũ để tránh treo luồng
         print(f"[Cảnh báo] Lỗi Re-planner: {str(e)}. Tiếp tục sử dụng kế hoạch hiện có.")
         return {
             "messages": [AIMessage(content="⚠️ Không thể tự động điều chỉnh kế hoạch do sự cố phân tích cấu trúc từ LLM. Tiếp tục bám sát kế hoạch cũ.")]
@@ -935,20 +941,28 @@ def tester_node(state: AgentState) -> Dict[str, Any]:
             if p.exists() and p.is_file():
                 ext = p.suffix.lower()
                 files_by_ext.setdefault(ext, []).append(p)
-                
-                # ⚙️ BỔ SUNG: Dọn dẹp cache biên dịch vật lý trước khi tiến hành phân tích
                 clear_compiler_cache(workspace_root, ext)
         except Exception:
             pass
 
     for ext, files in files_by_ext.items():
         if ext == ".py":
+            import sys # 🌟 THÊM MỚI: Import sys để lấy trình thông dịch hiện tại
             for f in files:
-                code, output = execute_validation_cmd(["python", "-m", "py_compile", str(f)], workspace_root)
-                if code == -99:
-                    warnings.append(output)
-                elif code != 0:
-                    errors.append(f"❌ [Lỗi Cú Pháp Python] tại `{f.name}`:\n{clean_compiler_logs(output)}")
+                if f.name.startswith("test_") or f.name.endswith("_test.py"):
+                    # 🌟 THAY ĐỔI: Dùng sys.executable thay vì "python" để giữ đúng môi trường venv
+                    code, output = execute_validation_cmd([sys.executable, str(f)], workspace_root)
+                    if code == -99:
+                        warnings.append(output)
+                    elif code != 0:
+                        errors.append(f"❌ [Lỗi Thực Thi Unit Test Python] tại tệp `{f.name}`:\n{clean_compiler_logs(output)}")
+                else:
+                    # Tương tự cho lệnh kiểm tra cú pháp py_compile
+                    code, output = execute_validation_cmd([sys.executable, "-m", "py_compile", str(f)], workspace_root)
+                    if code == -99:
+                        warnings.append(output)
+                    elif code != 0:
+                        errors.append(f"❌ [Lỗi Cú Pháp Python] tại tệp `{f.name}`:\n{clean_compiler_logs(output)}")
 
         elif ext == ".dart":
             for f in files:

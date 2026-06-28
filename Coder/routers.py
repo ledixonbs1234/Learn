@@ -47,29 +47,46 @@ def planner_router(state: AgentState) -> Literal["analysis_executor", "developme
 
 
 # 🔄 ĐIỀU CHỈNH: analysis_router chuyển tiếp tới replanner thay vì synthesis trực tiếp
-def analysis_router(state: AgentState) -> Literal["tool_node", "replanner"]:
+def analysis_router(state: AgentState) -> Literal["tool_node", "replanner", "synthesis"]:
     messages = state["messages"]
     if not messages:
-        return "replanner"
+        return "synthesis" if state.get("is_simple") else "replanner"
           
     last_message = messages[-1]
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
         return "tool_node"
         
+    # 🚀 TỐI ƯU HÓA: Nếu là nhiệm vụ đơn giản, bỏ qua replanner, đi thẳng tới synthesis
+    if state.get("is_simple"):
+        return "synthesis"
     return "replanner"
 
 
-# 🔄 ĐIỀU CHỈNH: development_router chuyển tiếp tới replanner thay vì tester trực tiếp
-def development_router(state: AgentState) -> Literal["tool_node", "replanner"]:
+def development_router(state: AgentState) -> Literal["tool_node", "replanner", "tester"]:
     messages = state["messages"]
     if not messages:
-        return "replanner"
+        return "tester" if state.get("is_simple") else "replanner"
         
     last_message = messages[-1]
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
         return "tool_node"
         
+    # 🚀 TỐI ƯU HÓA: Nếu là nhiệm vụ đơn giản, bỏ qua replanner, đi thẳng tới bộ kiểm thử tester
+    if state.get("is_simple"):
+        return "tester"
     return "replanner"
+
+
+def tester_router(state: AgentState) -> Literal["replanner", "development_executor", "commit"]:
+    error = state.get("error_logs", "")
+    attempts = state.get("attempts", 0)
+    
+    if error and attempts < 3:
+        # 🚀 TỐI ƯU HÓA: Nếu nhiệm vụ đơn giản bị lỗi, quay thẳng về executor để sửa lỗi thay vì qua replanner
+        if state.get("is_simple"):
+            return "development_executor"
+        return "replanner"
+    return "commit"
 
 
 # 🔄 THÊM MỚI: Định tuyến thông minh sau khi lập kế hoạch thích ứng
@@ -95,16 +112,6 @@ def replanner_router(state: AgentState) -> Literal["analysis_executor", "develop
             return "synthesis"
         return "tester"
 
-
-# 🔄 ĐIỀU CHỈNH: tester_router gửi lỗi về replanner để lập kế hoạch sửa đổi (Self-Healing)
-def tester_router(state: AgentState) -> Literal["replanner", "commit"]:
-    error = state.get("error_logs", "")
-    attempts = state.get("attempts", 0)
-    
-    if error and attempts < 3:
-        # Thay vì gửi thẳng về development_executor, chúng ta cho qua replanner để phân tích lỗi lầm
-        return "replanner"
-    return "commit"
 
 
 def tool_router(state: AgentState) -> Literal["analysis_executor", "development_executor"]:

@@ -90,7 +90,8 @@ builder.add_conditional_edges(
     routers.analysis_router,
     {
         "tool_node": "tool_node",                  
-        "replanner": "replanner"                  
+        "replanner": "replanner",
+        "synthesis": "synthesis"  # <--- KHAI BÁO THÊM ĐIỂM ĐẾN TRỰC TIẾP CHO FAST-TRACK
     }
 )
 builder.add_edge("synthesis", "commit")
@@ -101,7 +102,8 @@ builder.add_conditional_edges(
     routers.development_router,
     {
         "tool_node": "tool_node",                           
-        "replanner": "replanner"                              
+        "replanner": "replanner",
+        "tester": "tester"        # <--- KHAI BÁO THÊM ĐIỂM ĐẾN TRỰC TIẾP CHO FAST-TRACK
     }
 )
 
@@ -133,6 +135,7 @@ builder.add_conditional_edges(
     routers.tester_router,
     {
         "replanner": "replanner", 
+        "development_executor": "development_executor", # <--- KHAI BÁO THÊM ĐƯỜNG QUAY LẠI TỰ SỬA CHO FAST-TRACK
         "commit": "commit"                              
     }
 )

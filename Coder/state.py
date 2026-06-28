@@ -91,7 +91,7 @@ class AgentState(TypedDict):
     step_findings: Annotated[List[str], reduce_findings]
     last_executed_task_ids: List[str]     
     replanning_count: int
-
+    is_simple: bool
 # Trạng thái độc lập của Đồ thị con dò tìm Workspace [1.2.2]
 class WorkspaceDiscoveryState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]

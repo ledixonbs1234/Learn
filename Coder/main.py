@@ -27,9 +27,7 @@ sub_builder.add_conditional_edges(
 sub_builder.add_edge("discovery_tool_node", "discovery_agent_node")
 sub_builder.add_edge("discovery_finalize_node", END)
 
-# Biên dịch Subgraph thành một thực thể thực thi độc lập
 workspace_discovery_subgraph = sub_builder.compile()
-# Xuất subgraph để nodes.py có thể gọi thủ công (Isolate State)
 nodes.workspace_discovery_subgraph = workspace_discovery_subgraph
 
 
@@ -38,7 +36,7 @@ nodes.workspace_discovery_subgraph = workspace_discovery_subgraph
 # ==========================================
 builder = StateGraph(AgentState)
 
-# Đăng ký các Nodes (Đã chuyển detect_workspace thành node wrapper cô lập trạng thái)
+# Đăng ký các Nodes (Bổ sung replanner node)
 builder.add_node("detect_workspace", nodes.detect_workspace_wrapper_node) 
 builder.add_node("context_loader", nodes.context_loader_node)
 builder.add_node("triage", nodes.triage_node)                       
@@ -47,13 +45,13 @@ builder.add_node("planner", nodes.planner_node)
 builder.add_node("analysis_executor", nodes.analysis_executor_node)       
 builder.add_node("development_executor", nodes.development_executor_node) 
 builder.add_node("tool_node", nodes.tool_node) 
+builder.add_node("replanner", nodes.replanner_node)  # <--- ĐĂNG KÝ MỚI
 builder.add_node("tester", nodes.tester_node)
 builder.add_node("synthesis", nodes.synthesis_node)
 builder.add_node("commit", nodes.commit_node)
 
 # Định nghĩa các Cạnh nối (Edges) và Đinh tuyến (Routers)
 
-# SỬA ĐỔI: Kích hoạt định tuyến thông minh ngay từ điểm START
 builder.add_conditional_edges(
     START,
     routers.start_router,
@@ -67,7 +65,6 @@ builder.add_edge("detect_workspace", "context_loader")
 builder.add_edge("context_loader", "triage")
 builder.add_edge("triage", "git_setup")
 
-# SỬA ĐỔI: Định tuyến sau git_setup để bỏ qua Planner nếu đang ở chế độ Fast-Track
 builder.add_conditional_edges(
     "git_setup",
     routers.git_setup_router,
@@ -87,28 +84,28 @@ builder.add_conditional_edges(
     }
 )
 
+# 🔄 ĐIỀU CHỈNH: Định tuyến analysis_executor tới tool_node hoặc replanner
 builder.add_conditional_edges(
     "analysis_executor",
     routers.analysis_router,
     {
         "tool_node": "tool_node",                  
-        "analysis_executor": "analysis_executor", 
-        "synthesis": "synthesis"                  
+        "replanner": "replanner"                  
     }
 )
 builder.add_edge("synthesis", "commit")
 
+# 🔄 ĐIỀU CHỈNH: Định tuyến development_executor tới tool_node hoặc replanner
 builder.add_conditional_edges(
     "development_executor",
     routers.development_router,
     {
         "tool_node": "tool_node",                           
-        "development_executor": "development_executor", 
-        "tester": "tester"                              
+        "replanner": "replanner"                              
     }
 )
 
-# Chuyển hướng từ Tool Node quay lại Executor tương ứng dựa vào task_type
+# Chuyển hướng từ Tool Node quay lại Executor tương ứng dựa vào task_type để giữ vòng lặp tool siêu nhanh
 builder.add_conditional_edges(
     "tool_node",
     routers.tool_router,
@@ -118,20 +115,32 @@ builder.add_conditional_edges(
     }
 )
 
+# 🔄 THÊM MỚI: Định tuyến sau replanner đi tiếp dựa vào cấu trúc DAG cập nhật
+builder.add_conditional_edges(
+    "replanner",
+    routers.replanner_router,
+    {
+        "analysis_executor": "analysis_executor",
+        "development_executor": "development_executor",
+        "synthesis": "synthesis",
+        "tester": "tester"
+    }
+)
+
+# 🔄 ĐIỀU CHỈNH: Tester thất bại sẽ đẩy ngược về replanner để sửa đổi kế hoạch thay vì quay về executor mù quáng
 builder.add_conditional_edges(
     "tester",
     routers.tester_router,
     {
-        "development_executor": "development_executor", 
+        "replanner": "replanner", 
         "commit": "commit"                              
     }
 )
 
 builder.add_edge("commit", END)
 
-# Kích hoạt lưu trữ phiên làm việc qua MemorySaver
 memory = MemorySaver()
 app = builder.compile(checkpointer=memory)
 
 if __name__ == "__main__":
-    print("Khởi tạo và biên dịch đồ thị phân tầng LangGraph tối ưu thành công.")
+    print("Biên dịch đồ thị LangGraph với cơ chế Re-planning thích ứng Production thành công.")

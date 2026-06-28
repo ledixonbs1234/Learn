@@ -9,7 +9,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langchain_core.tools import tool
 
 from config import model, sanitize_and_resolve_path
-from state import AgentState, WorkspaceDetection, TaskPlan, TaskTriage, Task, WorkspaceDiscoveryState
+from state import AgentState, PlanUpdate, WorkspaceDetection, TaskPlan, TaskTriage, Task, WorkspaceDiscoveryState
 from tools import (
     GitManager, ReadFileLinesTool, UniversalSymbolSearchTool, WorkspaceTools, 
     ReadFilesTool, WriteFileTool, ApplyPatchTool, 
@@ -192,6 +192,131 @@ def discovery_agent_node(state: WorkspaceDiscoveryState) -> Dict[str, Any]:
     return {"messages": [response]}
 
 
+def replanner_node(state: AgentState) -> Dict[str, Any]:
+    """
+    Node trí tuệ trung gian: Đánh giá tiến độ thực tế, phát hiện rào cản 
+    và tiến hành cập nhật/thích ứng đồ thị nhiệm vụ (DAG) theo thời gian thực.
+    """
+    
+    replanning_count = state.get("replanning_count", 0)
+    
+    # 🛡️ CHỐT CHẶN BẢO VỆ: Nếu Re-plan quá 5 lần, dừng lại để tránh cạn kiệt tài nguyên
+    if replanning_count >= 5:
+        return {
+            "messages": [AIMessage(content="🚨 **[Hệ thống tự động dừng]** Phát hiện vòng lặp lập kế hoạch quá nhiều lần (Vượt giới hạn 5 lần). Chuyển tiếp tới bước tiếp theo để tránh lặp vô hạn.")]
+        }
+    ws = state["workspace_path"]
+    plan = state["plan"]
+    messages = state["messages"]
+    task_type = state.get("task_type", "development")
+    workspace_context = state.get("workspace_context", "")
+    error_logs = state.get("error_logs", "")
+    
+    # Định dạng trực quan danh sách nhiệm vụ hiện tại để LLM dễ phân tích
+    plan_str = "\n".join([
+        f"- [{t.id if isinstance(t, Task) else t.get('id')}] {t.description if isinstance(t, Task) else t.get('description')} "
+        f"(Trạng thái: {t.status if isinstance(t, Task) else t.get('status')}, "
+        f"Phụ thuộc: {t.dependencies if isinstance(t, Task) else t.get('dependencies')})"
+        for t in plan
+    ])
+    
+    system_prompt = (
+        "Bạn là một Kiến trúc sư kiêm Điều phối viên dự án phần mềm cấp cao.\n"
+        f"Nhiệm vụ: Đánh giá tiến trình thực thi kế hoạch tại thư mục làm việc '{ws}'.\n"
+        "Hãy phân tích kỹ các tin nhắn hội thoại và kết quả thực thi các công cụ gần nhất để quyết định xem kế hoạch hiện tại có cần thích ứng hay không.\n\n"
+        "⚠️ QUY TẮC CẬP NHẬT KẾ HOẠCH CHO PRODUCTION (BẮT BUỘC):\n"
+        "1. Nếu phát hiện thấy lỗi phát sinh (lỗi cú pháp, lỗi test, lỗi logic), file bị thiếu, hoặc cần thêm các bước khảo sát/phát triển bổ sung, "
+        "hãy đặt `should_modify_plan` là True và cập nhật danh sách nhiệm vụ trong `updated_tasks` để giải quyết vấn đề.\n"
+        "2. Nếu tiến trình diễn ra hoàn hảo không có lỗi và không cần bổ sung gì, hãy đặt `should_modify_plan` là False.\n"
+        "3. ĐỐI VỚI CÁC NHIỆM VỤ ĐÃ HOÀN THÀNH (status: 'completed'): Bắt buộc giữ nguyên ID, mô tả và trạng thái là 'completed'. Tuyệt đối không xóa hoặc reset trạng thái của chúng trừ khi cần thực hiện lại từ đầu.\n"
+        "4. Đảm bảo các nhiệm vụ mới (nếu có) được đặt ID mới (ví dụ: T1.1, T3_fix) và thiết lập quan hệ phụ thuộc `dependencies` chính xác."
+    )
+    
+    if workspace_context:
+        system_prompt += f"\n\n--- NGỮ CẢNH HỆ THỐNG (THONGTIN.md) ---\n{workspace_context}"
+        
+    user_prompt = f"Kế hoạch hiện tại:\n{plan_str}\n\n"
+    if error_logs:
+        user_prompt += f"🚨 PHÁT HIỆN LỖI KIỂM TRA/BIÊN DỊCH CẦN SỬA ĐỔI KẾ HOẠCH:\n{error_logs}\n\n"
+        
+    user_prompt += "Hãy đưa ra phân tích và cập nhật kế hoạch phù hợp thông qua cuộc gọi hàm."
+    
+    # Ép cấu trúc đầu ra bằng function calling tương thích local model
+    structured_llm = model.with_structured_output(PlanUpdate, method="function_calling")
+    
+    try:
+        decision = structured_llm.invoke([
+            {"role": "system", "content": system_prompt},
+            *messages,
+            {"role": "user", "content": user_prompt}
+        ])
+        
+        should_modify = getattr(decision, "should_modify_plan", False)
+        explanation = getattr(decision, "explanation", "")
+        updated_tasks = getattr(decision, "updated_tasks", plan)
+        
+        old_completed_tasks = {
+            (t.id if isinstance(t, Task) else t.get("id")): t 
+            for t in plan 
+            if (t.status if isinstance(t, Task) else t.get("status")) == "completed"
+        }
+        
+        refined_tasks = []
+        seen_ids = set()
+        
+        for task_data in updated_tasks:
+            # Chuyển đổi dict thành Pydantic Object nếu cần
+            task_obj = task_data if isinstance(task_data, Task) else Task(**task_data)
+            t_id = task_obj.id
+            
+            # Tránh trùng lặp ID tác vụ do LLM sinh sai
+            if t_id in seen_ids:
+                t_id = f"{t_id}_alt_{len(seen_ids)}"
+                task_obj.id = t_id
+            seen_ids.add(t_id)
+            
+            # KHÓA TRẠNG THÁI: Nếu tác vụ này trước đây đã hoàn thành, tuyệt đối không cho LLM reset nó về pending
+            if t_id in old_completed_tasks:
+                task_obj.status = "completed"
+                # Giữ nguyên mô tả cũ để tránh LLM sửa đổi lịch sử
+                old_task = old_completed_tasks[t_id]
+                task_obj.description = old_task.description if isinstance(old_task, Task) else old_task.get("description")
+                
+            refined_tasks.append(task_obj)
+        
+        
+        
+        # Tiền xử lý để đảm bảo dữ liệu luôn là các Pydantic Task hợp lệ
+        refined_tasks = []
+        for task_data in updated_tasks:
+            if isinstance(task_data, Task):
+                refined_tasks.append(task_data)
+            elif isinstance(task_data, dict):
+                refined_tasks.append(Task(**task_data))
+                
+        if should_modify and refined_tasks:
+            new_plan_str = "\n".join([
+                f"- [{t.id}] {t.description} (Trạng thái: {t.status}, Phụ thuộc: {t.dependencies})" 
+                for t in refined_tasks
+            ])
+            return {
+                "plan": refined_tasks,
+                "replanning_count": replanning_count + 1, # <--- TĂNG BIẾN ĐẾM
+                "messages": [AIMessage(content=f"🔄 **[Điều chỉnh kế hoạch]** {explanation}\n\nKế hoạch hành động mới:\n{new_plan_str}")]
+            }
+        else:
+            return {
+                "messages": [AIMessage(content=f"✅ **[Giữ nguyên lộ trình]** {explanation or 'Tiến trình thực thi đang bám sát kế hoạch ban đầu.'}")]
+            }
+            
+    except Exception as e:
+        # Cơ chế phòng vệ Production: Nếu LLM lỗi khi gọi hàm, giữ nguyên kế hoạch cũ để tránh treo luồng
+        print(f"[Cảnh báo] Lỗi Re-planner: {str(e)}. Tiếp tục sử dụng kế hoạch hiện có.")
+        return {
+            "messages": [AIMessage(content="⚠️ Không thể tự động điều chỉnh kế hoạch do sự cố phân tích cấu trúc từ LLM. Tiếp tục bám sát kế hoạch cũ.")]
+        }
+
+
 def discovery_tool_node(state: WorkspaceDiscoveryState) -> Dict[str, Any]:
     """Node thực thi các công cụ khảo sát hệ thống thực tế cho Subgraph."""
     last_msg = state["messages"][-1]
@@ -314,7 +439,11 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
         "plan": plan_tasks,
         "task_type": task_type,
         "last_executed_task_ids": [],
-        "messages": messages_to_append
+        "messages": messages_to_append,
+        "replanning_count": 0,
+        "modified_files": [],     # Khởi tạo mặc định
+        "error_logs": "",         # Khởi tạo mặc định
+        "step_findings": [],      # Khởi tạo mặc định
     }
 
 

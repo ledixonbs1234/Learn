@@ -30,7 +30,16 @@ class TaskTriage(BaseModel):
     task_type: Literal["analysis", "development"] = Field(
         description="Phân loại hướng xử lý của yêu cầu."
     )
-
+class PlanUpdate(BaseModel):
+    should_modify_plan: bool = Field(
+        description="True nếu dựa trên kết quả thực thi vừa qua, bạn thấy cần sửa đổi hoặc bổ sung thêm nhiệm vụ mới vào kế hoạch. False nếu kế hoạch hiện tại vẫn đúng đắn và có thể tiếp tục trực tiếp."
+    )
+    explanation: str = Field(
+        description="Giải thích chi tiết lý do tại sao quyết định điều chỉnh hoặc giữ nguyên kế hoạch hành động."
+    )
+    updated_tasks: List[Task] = Field(
+        description="Danh sách toàn bộ các nhiệm vụ (gồm cả nhiệm vụ cũ đã hoàn thành và nhiệm vụ mới/sửa đổi). QUY TẮC: Phải giữ nguyên ID và trạng thái 'completed' của các nhiệm vụ cũ đã hoàn tất."
+    )
 # ==========================================
 # CUSTOM REDUCERS VÀ STATE GRAPH
 # ==========================================
@@ -57,6 +66,7 @@ class AgentState(TypedDict):
     attempts: int
     step_findings: Annotated[List[str], reduce_findings]
     last_executed_task_ids: List[str]     
+    replanning_count: int
 
 
 # Trạng thái độc lập của Đồ thị con dò tìm Workspace [1.2.2]

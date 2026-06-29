@@ -326,41 +326,75 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
             user_msg = msg
             break
             
-    # SỬA TẠI ĐÂY: Trích xuất phần text an toàn từ tin nhắn
-    user_query_raw = user_msg.content if user_msg else ""
-    user_query_text = get_text_content_safely(user_query_raw)
+    user_query_text = get_text_content_safely(user_msg.content) if user_msg else ""
     
-    # Sử dụng chuỗi văn bản đã chuẩn hóa để quét đường dẫn
+    # 1. Kiểm tra xem người dùng có chỉ định đường dẫn cụ thể trong câu lệnh không
     detected_path_str = extract_path_from_text(user_query_text)
+    
     workspace_path = None
-    detect_messages = []
+    is_fallback_workspace = False
     
     if detected_path_str:
+        # Nếu có đường dẫn cụ thể, định vị Project Root và bypass qua AI
         start_path = Path(detected_path_str)
         resolved_root = find_project_root_heuristic(start_path)
         workspace_path = str(resolved_root)
+    else:
+        # Nếu không có đường dẫn cụ thể, chạy qua AI để lấy thư mục làm việc mặc định
+        # Mặc định lúc này discover_workspace_direct sẽ trả về CWD (H:\DATA\LANGGRAPH\Learn)
+        detect_res = discover_workspace_direct(user_query_text, state.get("workspace_path", "."))
+        workspace_path = detect_res.get("workspace_path", state.get("workspace_path", "."))
+        is_fallback_workspace = True
+        
+    # 2. ÁP DỤNG CƠ CHẾ SỬA ĐỔI THEO Ý TƯỞNG CỦA BẠN:
+    # Nếu hệ thống rơi vào chế độ mặc định (không có đường dẫn chỉ định)
+    if is_fallback_workspace:
+        base_path = Path(workspace_path).resolve()
+        temp_dir = base_path / "temp"
+        
+        # MỞ RỘNG A: Dọn dẹp thư mục Temp cũ để có một phiên làm việc sạch sẽ
+        if temp_dir.exists():
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception:
+                pass
+                
+        # Khởi tạo lại thư mục Temp mới
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        workspace_path = str(temp_dir)
+        
+        # MỞ RỘNG B: Tự động đưa "temp/" vào .gitignore của dự án gốc để tránh làm bẩn Git
+        root_gitignore = base_path / ".gitignore"
+        try:
+            if root_gitignore.exists():
+                gitignore_content = root_gitignore.read_text(encoding="utf-8")
+                if "temp/" not in gitignore_content:
+                    # Thêm dòng temp/ vào cuối file gitignore
+                    with open(root_gitignore, "a", encoding="utf-8") as f:
+                        f.write("\n# AI Generated Sandbox\ntemp/\n")
+            else:
+                # Nếu chưa có .gitignore, tạo mới
+                root_gitignore.write_text("# AI Generated Sandbox\ntemp/\n", encoding="utf-8")
+        except Exception:
+            pass
+            
+    # 3. Chạy phân loại tác vụ (Triage) bình thường
+    triage_res = triage_node(state)
+    
+    # Chuẩn bị tin nhắn hiển thị
+    detect_messages = []
+    if is_fallback_workspace:
         detect_messages.append(
-            AIMessage(content=f"🔍 Hệ thống đã phát hiện đường dẫn trực tiếp: `{detected_path_str}`. "
-                              f"Đã tự động xác định thư mục gốc dự án tại: `{workspace_path}` (Bypass Detection Loop).")
+            AIMessage(content="ℹ️ Không phát hiện đường dẫn làm việc cụ thể trong yêu cầu.\n"
+                              f"Hệ thống đã tự động kích hoạt thư mục Sandbox cách ly tại: `temp/` để tiến hành xử lý.")
+        )
+    else:
+        detect_messages.append(
+            AIMessage(content=f"🔍 Hệ thống đã phát hiện đường dẫn chỉ định và thiết lập workspace tại: `{workspace_path}`.")
         )
         
-        triage_res = triage_node(state)
-        merged_messages = detect_messages + triage_res.get("messages", [])
-    else:
-        # Truyền phần text đã chuẩn hóa vào luồng dò tìm Workspace để tránh truyền cả payload ảnh
-        with ThreadPoolExecutor() as executor:
-            future_detect = executor.submit(discover_workspace_direct, user_query_text, state.get("workspace_path", "."))
-            future_triage = executor.submit(triage_node, state)
-            detect_res = future_detect.result()
-            triage_res = future_triage.result()
-            
-        workspace_path = detect_res.get("workspace_path", state.get("workspace_path", "."))
-        merged_messages = []
-        if "messages" in detect_res:
-            merged_messages.extend(detect_res["messages"])
-        if "messages" in triage_res:
-            merged_messages.extend(triage_res["messages"])
-            
+    merged_messages = detect_messages + triage_res.get("messages", [])
+    
     return {
         "workspace_path": workspace_path,
         "plan": triage_res.get("plan", []),

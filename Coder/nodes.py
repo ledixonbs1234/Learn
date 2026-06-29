@@ -225,95 +225,6 @@ def extract_path_from_text(text: str) -> Optional[str]:
                 
     return None
 
-# =====================================================================
-# HÀM DIRECT REACT LOOP THAY THẾ SUBGRAPH (TRỰC QUAN, DỄ DEBUG)
-# =====================================================================
-def discover_workspace_direct(user_query: str, initial_workspace: str) -> Dict[str, Any]:
-    """
-    Vòng lặp ReAct tuần tự trực tiếp sử dụng Python để xác định Workspace.
-    Loại bỏ hoàn toàn các cấu trúc phức tạp của Subgraph cũ.
-    """
-    system_prompt = (
-        "Bạn là một Agent chuyên nghiệp định vị thư mục làm việc (Workspace).\n"
-        "Nhiệm vụ: Sử dụng các công cụ hệ thống để định vị chính xác đường dẫn vật lý tuyệt đối của thư mục dự án.\n"
-        "⚠️ QUY TẮC CẤM ĐOÁN MÒ:\n"
-        "1. Bạn tuyệt đối không được đoán mò đường dẫn. Hãy sử dụng các công cụ kiểm tra để khảo sát thực tế.\n"
-        "2. Đầu tiên, hãy gọi `get_current_working_directory` để biết môi trường Agent đang đứng.\n"
-        "3. Nếu người dùng nhập đường dẫn (ví dụ: 'Desktop', '~/Desktop'), hãy gọi `check_path_exists` để kiểm định vật lý.\n"
-        "4. Nếu muốn tìm gốc dự án hiện tại, hãy sử dụng `find_project_root`.\n"
-        "5. Khi đã định vị và xác minh chắc chắn đường dẫn tồn tại, hãy gọi công cụ kết thúc `WorkspaceDetection`."
-    )
-    
-    messages = [
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=user_query)
-    ]
-    
-    discovery_tools = [get_current_working_directory, check_path_exists, find_project_root]
-    model_with_tools = model.bind_tools(discovery_tools + [WorkspaceDetection])
-    
-    tools_map = {
-        # "get_current_working_directory": get_current_working_directory,
-        "check_path_exists": check_path_exists,
-        "find_project_root": find_project_root
-    }
-    
-    workspace_path = initial_workspace
-    max_steps = 5
-    
-    for step in range(max_steps):
-        try:
-            response = model_with_tools.invoke(messages)
-            messages.append(response)
-            
-            if not response.tool_calls:
-                break
-                
-            has_finalized = False
-            tool_messages = []
-            
-            for tool_call in response.tool_calls:
-                tool_name = tool_call["name"]
-                tool_args = tool_call["args"] or {}
-                tool_id = tool_call["id"]
-                
-                if tool_name == "WorkspaceDetection":
-                    workspace_path = tool_args.get("workspace_path", workspace_path)
-                    has_finalized = True
-                    tool_messages.append(ToolMessage(
-                        content=f"Đã ghi nhận đường dẫn Workspace thành công: {workspace_path}", 
-                        name=tool_name, 
-                        tool_call_id=tool_id
-                    ))
-                elif tool_name in tools_map:
-                    tool_instance = tools_map[tool_name]
-                    result = tool_instance.invoke(tool_args)
-                    tool_messages.append(ToolMessage(
-                        content=str(result), 
-                        name=tool_name, 
-                        tool_call_id=tool_id
-                    ))
-                else:
-                    tool_messages.append(ToolMessage(
-                        content=f"Lỗi: Không tìm thấy công cụ '{tool_name}'", 
-                        name=tool_name, 
-                        tool_call_id=tool_id
-                    ))
-            
-            messages.extend(tool_messages)
-            if has_finalized:
-                break
-        except Exception as e:
-            return {
-                "workspace_path": workspace_path,
-                "messages": [AIMessage(content=f"⚠️ Gặp sự cố khi tự động định vị Workspace trực tiếp: {str(e)}")]
-            }
-            
-    final_path = str(Path(workspace_path).expanduser().resolve())
-    return {
-        "workspace_path": final_path,
-        "messages": [AIMessage(content=f"🔍 Hệ thống đã xác minh thực tế và thiết lập workspace tại: `{final_path}`")]
-    }
 
 # =====================================================================
 # CẬP NHẬT DETECT_AND_TRIAGE_NODE SỬ DỤNG FUNCTION ĐỂ DUY TRÌ HIỆU NĂNG
@@ -328,66 +239,87 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
             
     user_query_text = get_text_content_safely(user_msg.content) if user_msg else ""
     
-    # 1. Kiểm tra xem người dùng có chỉ định đường dẫn cụ thể trong câu lệnh không
+    # 1. PHÂN TÍCH TĨNH: Tìm kiếm đường dẫn vật lý trong yêu cầu (KHÔNG dùng AI)
     detected_path_str = extract_path_from_text(user_query_text)
     
     workspace_path = None
     is_fallback_workspace = False
     
     if detected_path_str:
-        # Nếu có đường dẫn cụ thể, định vị Project Root và bypass qua AI
+        # Nếu tìm thấy đường dẫn cụ thể -> Xác định gốc dự án một cách tự động
         start_path = Path(detected_path_str)
         resolved_root = find_project_root_heuristic(start_path)
         workspace_path = str(resolved_root)
     else:
-        # Nếu không có đường dẫn cụ thể, chạy qua AI để lấy thư mục làm việc mặc định
-        # Mặc định lúc này discover_workspace_direct sẽ trả về CWD (H:\DATA\LANGGRAPH\Learn)
-        detect_res = discover_workspace_direct(user_query_text, state.get("workspace_path", "."))
-        workspace_path = detect_res.get("workspace_path", state.get("workspace_path", "."))
+        # Nếu KHÔNG tìm thấy, hoãn việc thiết lập đường dẫn và đánh dấu chế độ Fallback
         is_fallback_workspace = True
+        # Gán tạm thời là thư mục hiện tại để phục vụ chạy phân loại trước
+        workspace_path = state.get("workspace_path", ".")
         
-    # 2. ÁP DỤNG CƠ CHẾ SỬA ĐỔI THEO Ý TƯỞNG CỦA BẠN:
-    # Nếu hệ thống rơi vào chế độ mặc định (không có đường dẫn chỉ định)
-    if is_fallback_workspace:
-        base_path = Path(workspace_path).resolve()
-        temp_dir = base_path / "temp"
-        
-        # MỞ RỘNG A: Dọn dẹp thư mục Temp cũ để có một phiên làm việc sạch sẽ
-        if temp_dir.exists():
-            try:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-            except Exception:
-                pass
-                
-        # Khởi tạo lại thư mục Temp mới
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        workspace_path = str(temp_dir)
-        
-        # MỞ RỘNG B: Tự động đưa "temp/" vào .gitignore của dự án gốc để tránh làm bẩn Git
-        root_gitignore = base_path / ".gitignore"
-        try:
-            if root_gitignore.exists():
-                gitignore_content = root_gitignore.read_text(encoding="utf-8")
-                if "temp/" not in gitignore_content:
-                    # Thêm dòng temp/ vào cuối file gitignore
-                    with open(root_gitignore, "a", encoding="utf-8") as f:
-                        f.write("\n# AI Generated Sandbox\ntemp/\n")
-            else:
-                # Nếu chưa có .gitignore, tạo mới
-                root_gitignore.write_text("# AI Generated Sandbox\ntemp/\n", encoding="utf-8")
-        except Exception:
-            pass
-            
-    # 3. Chạy phân loại tác vụ (Triage) bình thường
+    # 2. CHẠY PHÂN LOẠI TRƯỚC (Triage) để hiểu bản chất của tác vụ
     triage_res = triage_node(state)
     
-    # Chuẩn bị tin nhắn hiển thị
+    # Cơ chế phòng vệ (Defensive programming): Đảm bảo triage_res luôn hợp lệ
+    if triage_res is None:
+        triage_res = {
+            "plan": [],
+            "task_type": "development",
+            "last_executed_task_ids": [],
+            "messages": [AIMessage(content="⚠️ Không thể phân loại tác vụ. Đang chạy ở chế độ mặc định.")],
+            "replanning_count": 0,
+            "modified_files": [],     
+            "error_logs": "",         
+            "step_findings": [],      
+            "is_simple": False
+        }
+        
+    is_simple = triage_res.get("is_simple", False)
+    
+    # 3. ĐIỀU CHỈNH WORKSPACE DỰA TRÊN KẾT QUẢ PHÂN LOẠI
+    if is_fallback_workspace:
+        base_path = Path(workspace_path).resolve()
+        
+        # Nếu là tác vụ đơn giản/hướng ngoại (như web automation hoặc terminal độc lập)
+        if is_simple:
+            # Chỉ cần khởi tạo và gán thư mục Sandbox "temp/" cách ly, không cần quét toàn bộ mã nguồn làm gì
+            temp_dir = base_path / "temp"
+            if temp_dir.exists():
+                try:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                except Exception:
+                    pass
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            workspace_path = str(temp_dir)
+            
+            # Thêm temp/ vào .gitignore của thư mục chạy để tránh làm bẩn git dự án lớn
+            try:
+                root_gitignore = base_path / ".gitignore"
+                if root_gitignore.exists():
+                    gitignore_content = root_gitignore.read_text(encoding="utf-8")
+                    if "temp/" not in gitignore_content:
+                        with open(root_gitignore, "a", encoding="utf-8") as f:
+                            f.write("\n# AI Generated Sandbox\ntemp/\n")
+                else:
+                    root_gitignore.write_text("# AI Generated Sandbox\ntemp/\n", encoding="utf-8")
+            except Exception:
+                pass
+        else:
+            # Nếu là tác vụ lập trình phức tạp nhưng người dùng quên chỉ định đường dẫn
+            # Tự động gán gốc dự án mặc định tại Project Root của thư mục hiện tại
+            resolved_root = find_project_root_heuristic(base_path)
+            workspace_path = str(resolved_root)
+            
+    # 4. CHUẨN BỊ TIN NHẮN HIỂN THỊ TRỰC QUAN
     detect_messages = []
     if is_fallback_workspace:
-        detect_messages.append(
-            AIMessage(content="ℹ️ Không phát hiện đường dẫn làm việc cụ thể trong yêu cầu.\n"
-                              f"Hệ thống đã tự động kích hoạt thư mục Sandbox cách ly tại: `temp/` để tiến hành xử lý.")
-        )
+        if is_simple:
+            detect_messages.append(
+                AIMessage(content=f"ℹ️ Phát hiện tác vụ Sandbox độc lập. Kích hoạt môi trường cách ly tại: `{workspace_path}`.")
+            )
+        else:
+            detect_messages.append(
+                AIMessage(content=f"🔍 Không chỉ định đường dẫn. Tự động thiết lập gốc dự án làm việc tại: `{workspace_path}`.")
+            )
     else:
         detect_messages.append(
             AIMessage(content=f"🔍 Hệ thống đã phát hiện đường dẫn chỉ định và thiết lập workspace tại: `{workspace_path}`.")
@@ -404,7 +336,7 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         "modified_files": triage_res.get("modified_files", []),
         "error_logs": triage_res.get("error_logs", ""),
         "step_findings": triage_res.get("step_findings", []),
-        "is_simple": triage_res.get("is_simple", False),
+        "is_simple": is_simple,
         "messages": merged_messages
     }
 
@@ -474,53 +406,38 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
     if not user_msg:
         user_msg = messages[0]
         
-    # SỬA TẠI ĐÂY: Trích xuất text an toàn để gửi lên mô hình phân loại
     user_query_text = get_text_content_safely(user_msg.content)
     
     structured_llm = fast_model.with_structured_output(TaskTriage, method="function_calling")
     
     system_prompt = (
-        "Bạn là một điều phối viên Agent thông minh. Hãy phân tích yêu cầu của người dùng "
-        "để xác định xem đây là một yêu cầu đơn giản (chỉ cần chỉnh sửa trực tiếp 1-2 file) "
-        "hay một yêu cầu phức tạp (cần lên kế hoạch khảo sát, phát triển nhiều bước)."
+        "Bạn là một điều phối viên Agent thông minh cấp cao (Triage Supervisor).\n"
+        "Nhiệm vụ của bạn là phân tích yêu cầu của người dùng để xác định xem yêu cầu đó nên được xử lý qua luồng Fast-Track (Đơn giản) hay luồng Lập kế hoạch (Phức tạp).\n\n"
+        "Hãy dựa trên các tiêu chí phân loại nghiêm ngặt sau:\n\n"
+        "1. KIỂM TRA TÁC VỤ ĐƠN GIẢN (is_simple = True):\n"
+        "   - Tương tác Web trực tiếp: Các yêu cầu truy cập website, nhấp nút, điền form, chụp ảnh màn hình hoặc chạy thử JS trên một trang cụ thể (ví dụ: 'vào trang web abc.com và nhấn...', 'chụp màn hình web...'). Các tác vụ này có thể thực thi trực tiếp bằng công cụ 'web_interact_and_test' mà không cần lập kế hoạch viết mã nguồn.\n"
+        "   - Khảo sát hệ thống đơn giản: Đọc nội dung 1-2 tệp tin cụ thể, liệt kê thư mục, hoặc tìm kiếm symbol.\n"
+        "   - Thực thi Terminal trực tiếp: Chạy một lệnh terminal đơn lẻ (ví dụ: kiểm tra phiên bản, chạy thử một tệp tin script có sẵn).\n"
+        "   - Chỉnh sửa nhỏ: Sửa đổi nhanh chỉ một vài dòng mã hoặc ghi đè một tệp tin ngắn dưới 100 dòng.\n\n"
+        "2. KIỂM TRA TÁC VỤ PHỨC TẠP (is_simple = False):\n"
+        "   - Phát triển tính năng mới (Feature Development): Yêu cầu viết mới hoặc can thiệp chỉnh sửa logic phức tạp trên nhiều tệp tin nguồn khác nhau.\n"
+        "   - Sửa lỗi hệ thống diện rộng (Complex Bug Fixing): Đòi hỏi phải phân tích kiến trúc, tìm kiếm ký hiệu xuyên suốt mã nguồn trước khi đưa ra phương án sửa đổi.\n"
+        "   - Phân tích & Viết tài liệu tổng thể dự án: Khảo sát sâu toàn bộ workspace lớn để viết báo cáo kỹ thuật (chọn task_type = 'analysis').\n\n"
+        "QUY TẮC CHỌN TASK_TYPE:\n"
+        "   - Chọn 'analysis' nếu yêu cầu thuần túy chỉ là đọc hiểu, giải thích cấu trúc mã nguồn hoặc khảo sát dự án (không viết/sửa code trên ổ đĩa).\n"
+        "   - Chọn 'development' cho các trường hợp còn lại (có viết code, sửa code, chạy terminal, hoặc tương tác trình duyệt web)."
     )
     
     try:
         triage_output = structured_llm.invoke([
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_query_text} # Truyền text sạch
+            {"role": "user", "content": user_query_text}
         ])
         is_simple = getattr(triage_output, "is_simple", False)
         task_type = getattr(triage_output, "task_type", "development")
     except Exception:
         is_simple = False
         task_type = "development"
-        
-    plan_tasks = []
-    messages_to_append = []
-    
-    if is_simple:
-        plan_tasks = [Task(
-            id="T1", 
-            description=f"Xử lý trực tiếp yêu cầu của người dùng: {user_query_text}", 
-            dependencies=[], 
-            status="pending"
-        )]
-        messages_to_append.append(AIMessage(content="📋 Kích hoạt chế độ **Fast-Track (Nhiệm vụ đơn giản)**. Bỏ qua bước lập kế hoạch chi tiết."))
-    else:
-        messages_to_append.append(AIMessage(content="📋 Nhận diện tác vụ phức tạp, chuẩn bị chuyển tiếp tới Planner."))
-        
-    return {
-        "plan": plan_tasks,
-        "task_type": task_type,
-        "last_executed_task_ids": [],
-        "messages": messages_to_append,
-        "replanning_count": 0,
-        "modified_files": [],     
-        "error_logs": "",         
-        "step_findings": [],      
-        "is_simple": is_simple,  
-    }
 
 
 def planner_node(state: AgentState) -> Dict[str, Any]:
@@ -672,7 +589,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         run_terminal_command = RunTerminalTool(workspace_path=ws)
         read_file_lines = ReadFileLinesTool(workspace_path=ws)
         
-        tools = [read_files, write_file, apply_patch, list_directory, run_terminal_command, search_symbols, read_file_lines,web_interact_tool]
+        tools = [read_files, write_file, apply_patch, list_directory, run_terminal_command, search_symbols, read_file_lines, web_interact_tool]
         
         system_prompt = (
             "Bạn là một kỹ sư phần mềm thực thi chuyên nghiệp chuyên sửa lỗi và viết mới mã nguồn (Write-Access Mode).\n"
@@ -688,7 +605,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         system_prompt += (
             "\n⚠️ QUY TẮC PHẠM VI VÀ PHÒNG TRÁNH LỆCH DÒNG (BẮT BUỘC):\n"
             "1. Bạn đã được cung cấp nguồn mã nguồn mới nhất (đã đánh số dòng chi tiết) trong mục 'SINGLE SOURCE OF TRUTH' ở trên.\n"
-            "2. ĐÂY LÀ NỘI DUNG MỚI NHẤT VÀ CHÍNH XÁC NHẤT. Hãy luôn sử dụng mốc dòng và nội dung từ mục này để thiết lập khối SEARCH-AND-REPLACE cho công cụ `apply_search_replace_patch`.\n"
+            "2. ĐÂY LÀ NỘI DUNG MỚI NHẤT VÀ CHÍNA XÁC NHẤT. Hãy luôn sử dụng mốc dòng và nội dung từ mục này để thiết lập khối SEARCH-AND-REPLACE cho công cụ `apply_search_replace_patch`.\n"
             "3. Nếu bạn vừa sửa đổi một file ở bước trước, nội dung file đó trong mục 'SINGLE SOURCE OF TRUTH' đã được cập nhật tự động. Bạn không cần phải gọi lại công cụ đọc trừ khi muốn kiểm tra sâu hơn.\n"
             "\n⚠️ QUY TẮC SỬ DỤNG CÔNG CỤ:\n"
             "1. Đối với file trên 300 dòng: BẮT BUỘC dùng `apply_search_replace_patch` để áp dụng bản vá, cấm ghi đè bừa bãi.\n"
@@ -867,7 +784,7 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
     run_terminal_command = RunTerminalTool(workspace_path=ws)
     search_symbols = UniversalSymbolSearchTool(workspace_path=ws)
     read_file_lines = ReadFileLinesTool(workspace_path=ws)
-    
+    web_interact_tool = WebInteractAndTestTool(workspace_path=ws)
     tools_map = {
         "read_files": read_files,
         "write_file": write_file,
@@ -875,7 +792,8 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         "list_directory": list_directory,
         "run_terminal_command": run_terminal_command,
         "search_symbols_universal": search_symbols,
-        "read_file_lines": read_file_lines
+        "read_file_lines": read_file_lines,
+        "web_interact_and_test": web_interact_tool
     }
     
     last_message = state["messages"][-1]

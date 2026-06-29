@@ -1,5 +1,6 @@
 # tools.py
 import json
+from logging import config
 import subprocess
 import re
 from pathlib import Path
@@ -8,6 +9,7 @@ from pydantic import BaseModel, Field
 from langchain_core.tools import BaseTool, tool
 from config import GitIgnoreMatcher, find_project_root_heuristic, sanitize_and_resolve_path
 from browser_subgraph import web_subgraph
+from langchain_core.callbacks import CallbackManagerForToolRun
 # ==========================================
 # CÁC HÀM TIỆN ÍCH HỖ TRỢ ĐỊNH DẠNG MARKDOWN
 # ==========================================
@@ -734,7 +736,7 @@ class WebInteractAndTestTool(BaseTool):
     args_schema: Type[BaseModel] = WebInteractSchema
     workspace_path: str
 
-    def _run(self, url: str, action_type: str, target_description: str, js_code_to_test: Optional[str] = None) -> str:
+    def _run(self, url: str, action_type: str, target_description: str, js_code_to_test: Optional[str] = None,run_manager: Optional[CallbackManagerForToolRun] = None) -> str:
         # Thiết lập input cho Subgraph
         sub_input = {
             "url": url,
@@ -747,7 +749,9 @@ class WebInteractAndTestTool(BaseTool):
         try:
             # Gọi Subgraph chạy hoàn toàn đồng bộ
             output = web_subgraph.invoke(sub_input)
-            
+            if run_manager:
+                config["callbacks"] = run_manager.get_child()
+            output = web_subgraph.invoke(sub_input, config=config)
             if output.get("error"):
                 return f"❌ [Thất bại] Gặp sự cố trong quá trình xử lý: {output['error']}"
                 

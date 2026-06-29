@@ -3,11 +3,11 @@ import json
 import subprocess
 import re
 from pathlib import Path
-from typing import List, Union, Type
+from typing import List, Literal, Optional, Union, Type
 from pydantic import BaseModel, Field
 from langchain_core.tools import BaseTool, tool
-from config import GitIgnoreMatcher, sanitize_and_resolve_path
-
+from config import GitIgnoreMatcher, find_project_root_heuristic, sanitize_and_resolve_path
+from browser_subgraph import web_subgraph
 # ==========================================
 # CÁC HÀM TIỆN ÍCH HỖ TRỢ ĐỊNH DẠNG MARKDOWN
 # ==========================================
@@ -70,27 +70,23 @@ def check_path_exists(path_str: str) -> str:
 
 @tool
 def find_project_root(start_path: str) -> str:
-    """Tìm kiếm ngược lên trên (upwards) từ một đường dẫn bắt đầu để tìm kiếm các tệp tin đánh dấu gốc dự án như '.git', 'package.json', 'pyproject.toml', 'requirements.txt', 'THONGTIN.md'."""
+    """
+    Tìm kiếm ngược lên trên (upwards) từ một đường dẫn bắt đầu để tìm kiếm các tệp tin đánh dấu gốc dự án.
+    Đã được nâng cấp để định vị chính xác phân hệ trong Monorepo và chống sập luồng hệ thống.
+    """
     try:
-        current = Path(start_path).expanduser().resolve()
-        markers = [".git", "package.json", "pyproject.toml", "requirements.txt", "THONGTIN.md", "main.py"]
-        
-        # Quét ngược lên tối đa 5 cấp thư mục cha
-        for _ in range(5):
-            for marker in markers:
-                if (current / marker).exists():
-                    return json.dumps({
-                        "found": True,
-                        "project_root": str(current),
-                        "matched_marker": marker
-                    }, ensure_ascii=False)
-            if current.parent == current:
-                break
-            current = current.parent
-            
-        return json.dumps({"found": False, "message": "Không tìm thấy file đánh dấu dự án nào ở các thư mục cha."}, ensure_ascii=False)
+        start_p = Path(start_path)
+        resolved_root = find_project_root_heuristic(start_p)
+        return json.dumps({
+            "found": True,
+            "project_root": str(resolved_root),
+            "message": "Đã định vị thành công gốc dự án bằng thuật toán Production Heuristics."
+        }, ensure_ascii=False)
     except Exception as e:
-        return f"Lỗi tìm kiếm dự án gốc: {str(e)}"
+        return json.dumps({
+            "found": False,
+            "message": f"Gặp lỗi vật lý khi truy cập đĩa cứng: {str(e)}"
+        }, ensure_ascii=False)
 
 # ==========================================
 # SCHEMAS PHỤC VỤ TOOL CALLING
@@ -715,7 +711,68 @@ class GitManager:
         if status and not status.startswith("ERROR"):
             self._run_cmd(["git", "commit", "-m", message])
 
+class WebInteractSchema(BaseModel):
+    url: str = Field(description="Đường dẫn URL của trang web cần xử lý.")
+    action_type: Literal["explore", "test_js"] = Field(
+        description="Chọn 'explore' để lấy cấu trúc selector của phần tử, hoặc 'test_js' để chạy thử một đoạn mã JS điều khiển."
+    )
+    target_description: str = Field(
+        description="Mô tả nút/phần tử cần thao tác (ví dụ: 'Nút System Instructions' hoặc 'Switch Grounding with Google Search')."
+    )
+    js_code_to_test: Optional[str] = Field(
+        default=None,
+        description="Đoạn mã Javascript cần chạy thử nghiệm trên trang (bắt buộc truyền nếu action_type là 'test_js')."
+    )
 
+class WebInteractAndTestTool(BaseTool):
+    name: str = "web_interact_and_test"
+    description: str = (
+        "Công cụ chuyên dụng để mở trình duyệt, thăm dò tìm kiếm các CSS Selector bền vững, "
+        "hoặc chạy thử nghiệm và xác thực các đoạn mã Javascript điều khiển trên trang web thật. "
+        "Giúp Agent kiểm tra tính chính xác của mã nguồn trước khi viết file extension hoàn chỉnh."
+    )
+    args_schema: Type[BaseModel] = WebInteractSchema
+    workspace_path: str
+
+    def _run(self, url: str, action_type: str, target_description: str, js_code_to_test: Optional[str] = None) -> str:
+        # Thiết lập input cho Subgraph
+        sub_input = {
+            "url": url,
+            "action_type": action_type,
+            "target_description": target_description,
+            "js_code_to_test": js_code_to_test,
+            "attempts": 0
+        }
+        
+        try:
+            # Gọi Subgraph chạy hoàn toàn đồng bộ
+            output = web_subgraph.invoke(sub_input)
+            
+            if output.get("error"):
+                return f"❌ [Thất bại] Gặp sự cố trong quá trình xử lý: {output['error']}"
+                
+            if action_type == "explore":
+                sel = output.get("detected_selectors", {})
+                return (
+                    f"✅ [Thành công] Đã định vị xong phần tử mục tiêu:\n"
+                    f"- **Tag Name:** `{sel.get('tagName')}`\n"
+                    f"- **Selector khuyến nghị:** `{sel.get('proposed_selector')}`\n"
+                    f"- **Văn bản hiển thị:** '{sel.get('text')}'\n"
+                    f"- **Aria-Label:** '{sel.get('aria_label')}'\n"
+                    f"👉 Hãy sử dụng selector này để xây dựng kịch bản điều khiển cho Chrome Extension."
+                )
+                
+            elif action_type == "test_js":
+                state_after = output.get("dom_state_after", {})
+                return (
+                    f"✅ [Thành công] Đã thực thi và chạy thử nghiệm mã Javascript điều khiển trên trang web thật.\n"
+                    f"- **Kết quả thực thi:** Thành công (Không phát sinh lỗi JS runtime)\n"
+                    f"- **Ảnh chụp màn hình kết quả:** Đã lưu tại `{output.get('screenshot_path')}`\n"
+                    f"- **Trạng thái URL sau thực thi:** `{state_after.get('url_after')}`\n"
+                    f"👉 Mã JS này đã được xác thực hoạt động ổn định trên môi trường thực tế."
+                )
+        except Exception as e:
+            return f"❌ Lỗi hệ thống khi kích hoạt Web Subgraph: {str(e)}"
 # ==========================================
 # TÁI CẤU TRÚC LỚP QUẢN LÝ THAO TÁC WORKSPACE
 # ==========================================
@@ -810,7 +867,8 @@ class WorkspaceTools:
             if not safe_path.exists():
                 return f"Lỗi: Không tìm thấy tệp tin '{file_path}' cần áp dụng bản vá."
                 
-            pattern = r"<<<<<<<\s*SEARCH\s*[\r\n]+(.*?)(?:[\r\n]+)=======\s*[\r\n]+(.*?)(?:[\r\n]+)>>>>>>>\s*REPLACE"
+            # FUZZY REGEX: Cho phép số lượng ký tự < hoặc > dao động từ 5 trở lên, không phân biệt chữ hoa chữ thường
+            pattern = r"<+{5,}\s*[sS][eE][aA][rR][cC][hH]\s*[\r\n]+(.*?)(?:[\r\n]+)=+{5,}\s*[\r\n]+(.*?)(?:[\r\n]+)>+{5,}\s*[rR][eE][pP][lL][aA][cC][eE]"
             match = re.search(pattern, patch_block, re.DOTALL)
             
             if not match:
@@ -832,10 +890,15 @@ class WorkspaceTools:
             normalized_original = original_content.replace("\r\n", "\n")
             
             if normalized_search not in normalized_original:
-                return (
-                    f"Lỗi: Không tìm thấy phân đoạn mã SEARCH được chỉ định trong tệp '{file_path}'.\n"
-                    "Hãy chắc chắn rằng bạn đã copy chính xác từng khoảng trắng và ký tự từ nội dung gốc."
-                )
+                # Thêm cơ chế Fuzzy loại bỏ khoảng trắng thừa đầu dòng để tăng tỉ lệ khớp
+                stripped_search = "\n".join([line.strip() for line in normalized_search.splitlines() if line.strip()])
+                stripped_original = "\n".join([line.strip() for line in normalized_original.splitlines() if line.strip()])
+                
+                if stripped_search not in stripped_original:
+                    return (
+                        f"Lỗi: Không tìm thấy phân đoạn mã SEARCH được chỉ định trong tệp '{file_path}'.\n"
+                        "Hãy chắc chắn rằng bạn đã sao chép chính xác từng khoảng trắng và ký tự từ nội dung gốc."
+                    )
                 
             new_content_normalized = normalized_original.replace(normalized_search, replace_code, 1)
             

@@ -2,6 +2,7 @@
 import os
 import fnmatch
 from pathlib import Path
+from typing import Dict, List, Set
 
 # ==========================================
 # CẤU HÌNH TRACING LANGSMITH
@@ -103,3 +104,97 @@ def sanitize_and_resolve_path(workspace: str, raw_target_path: str, create_paren
     if create_parent:
         final_path.parent.mkdir(parents=True, exist_ok=True)
     return final_path
+
+
+
+# =====================================================================
+# CẤU HÌNH MỐC ĐÁNH DẤU HỆ THỐNG CẤP ĐỘ PRODUCTION
+# =====================================================================
+VCS_MARKERS: Set[str] = {".git", ".hg", ".svn"}
+WORKSPACE_MARKERS: Set[str] = {"pnpm-workspace.yaml", "lerna.json", "nx.json", "turbo.json", "bun.lockb"}
+LANGUAGE_MARKERS: Set[str] = {
+    "pyproject.toml", "setup.py", "poetry.lock", "requirements.txt",
+    "package.json", "tsconfig.json", "yarn.lock", "package-lock.json",
+    "Cargo.toml", "Cargo.lock", "go.mod", "go.sum", "pubspec.yaml",
+    "pom.xml", "build.gradle", "settings.gradle", "CMakeLists.txt", "Makefile", "project.godot"
+}
+FALLBACK_MARKERS: Set[str] = {"THONGTIN.md", "README.md", "main.py", "index.js", ".env", "docker-compose.yml"}
+SANDBOX_BLACK_LIST: Set[str] = {"node_modules", ".venv", "venv", "env", "build", "dist", ".gradle", ".git", ".idea", ".vscode"}
+SYSTEM_DIR_NAMES: Set[str] = {"usr", "lib", "lib64", "bin", "sbin", "etc", "var", "opt", "sys", "proc", "dev", "System", "Windows", "Program Files", "Program Files (x86)", "Users"}
+
+def find_project_root_heuristic(start_path: Path) -> Path:
+    """Thuật toán định vị gốc dự án (Project Root) cấp độ Production."""
+    try:
+        current_dir = start_path.expanduser().resolve()
+        if current_dir.is_file():
+            current_dir = current_dir.parent
+
+        parts = current_dir.parts
+        escape_idx = -1
+        for idx, part in enumerate(parts):
+            if part in SANDBOX_BLACK_LIST:
+                escape_idx = idx
+                break
+                
+        if escape_idx != -1:
+            escaped_path = Path(*parts[:escape_idx])
+            if escaped_path.anchor != str(escaped_path):
+                current_dir = escaped_path
+
+        candidates: Dict[str, List[Path]] = {
+            "project_roots": [],
+            "workspace_roots": [],
+            "fallback_roots": []
+        }
+
+        user_home = Path.home().resolve()
+        max_depth = 25
+        depth = 0
+
+        while depth < max_depth:
+            if len(current_dir.parts) > 1:
+                first_level = current_dir.parts[1] if current_dir.parts[0] in ("/", "C:", "D:", "E:") else current_dir.parts[0]
+                if first_level in SYSTEM_DIR_NAMES:
+                    break
+
+            try:
+                existing_items = {item.name for item in current_dir.iterdir()}
+            except (PermissionError, OSError):
+                break
+
+            has_project_marker = any(marker in existing_items for marker in LANGUAGE_MARKERS)
+            has_workspace_marker = (
+                any(marker in existing_items for marker in WORKSPACE_MARKERS) or
+                any(marker in existing_items for marker in VCS_MARKERS)
+            )
+            has_fallback_marker = any(marker in existing_items for marker in FALLBACK_MARKERS)
+
+            if has_project_marker:
+                candidates["project_roots"].append(current_dir)
+            if has_workspace_marker:
+                candidates["workspace_roots"].append(current_dir)
+            if has_fallback_marker:
+                candidates["fallback_roots"].append(current_dir)
+
+            if current_dir.parent == current_dir or current_dir == user_home:
+                break
+
+            current_dir = current_dir.parent
+            depth += 1
+
+        if candidates["project_roots"]:
+            return candidates["project_roots"][0]
+        if candidates["workspace_roots"]:
+            return candidates["workspace_roots"][0]
+        if candidates["fallback_roots"]:
+            return candidates["fallback_roots"][0]
+
+        fallback_path = start_path.expanduser().resolve()
+        return fallback_path.parent if fallback_path.is_file() else fallback_path
+
+    except Exception as e:
+        print(f"[Cảnh báo hệ thống] Lỗi trong quá trình tìm project root: {str(e)}")
+        try:
+            return start_path.parent if start_path.is_file() else start_path
+        except Exception:
+            return Path(".").resolve()

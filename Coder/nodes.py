@@ -5,73 +5,75 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional,  Tuple, List
 from concurrent.futures import ThreadPoolExecutor
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
-from config import model, sanitize_and_resolve_path,fast_model
-from state import AgentState, PlanUpdate, WorkspaceDetection, TaskPlan, TaskTriage, Task, WorkspaceDiscoveryState
+from config import find_project_root_heuristic, model, sanitize_and_resolve_path, fast_model
+from state import AgentState, PlanUpdate, WorkspaceDetection, TaskPlan, TaskTriage, Task
 from tools import (
-    GitManager, ReadFileLinesTool, UniversalSymbolSearchTool, WorkspaceTools, 
+    GitManager, ReadFileLinesTool, UniversalSymbolSearchTool, WebInteractAndTestTool, WorkspaceTools, 
     ReadFilesTool, WriteFileTool, ApplyPatchTool, 
     ListDirectoryTool, RunTerminalTool,
     get_current_working_directory, check_path_exists, find_project_root, get_markdown_language
 )
-workspace_discovery_subgraph = None
-
+def get_text_content_safely(content: Any) -> str:
+    """
+    Trích xuất văn bản (text content) an toàn từ tin nhắn của người dùng.
+    Hỗ trợ cả trường hợp tin nhắn dạng chuỗi (str) hoặc danh sách đa phương tiện (list).
+    """
+    if isinstance(content, str):
+        return content.strip()
+        
+    elif isinstance(content, list):
+        text_parts = []
+        for item in content:
+            if isinstance(item, dict):
+                # Trường hợp cấu trúc chuẩn: {"type": "text", "text": "..."}
+                if item.get("type") == "text":
+                    text_parts.append(item.get("text", ""))
+                # Trường hợp cấu trúc rút gọn: {"text": "..."}
+                elif "text" in item and "type" not in item:
+                    text_parts.append(item["text"])
+            elif isinstance(item, str):
+                text_parts.append(item)
+        return " ".join(text_parts).strip()
+        
+    return ""
 def sanitize_llm_response_content(response: AIMessage) -> AIMessage:
-    """
-    Hậu xử lý tin nhắn của LLM: Loại bỏ triệt để các khối <thinking>...</thinking>
-    hoặc <thought>...</thought> nếu mô hình tự ý sinh ra để tiết kiệm token cho các vòng sau.
-    """
     if not response or not isinstance(response, AIMessage):
         return response
         
     content_str = response.content
     if isinstance(content_str, str) and content_str.strip():
-        # Xóa sạch thẻ <thinking>...</thinking> và <thought>...</thought> kèm nội dung bên trong
         cleaned_content = re.sub(r"<thinking>.*?</thinking>", "", content_str, flags=re.DOTALL)
         cleaned_content = re.sub(r"<thought>.*?</thought>", "", cleaned_content, flags=re.DOTALL)
-        
-        # Cập nhật lại nội dung sạch cho tin nhắn
         response.content = cleaned_content.strip()
         
     return response
 
 def compact_reading_tool_messages(messages: List[BaseMessage]) -> List[BaseMessage]:
-    """
-    Quét qua lịch sử tin nhắn và thu gọn nội dung của các ToolMessage đọc file.
-    Thay thế hàng ngàn dòng code thô bằng một thông báo định danh siêu nhẹ,
-    giúp giảm 95% lượng token lãng phí mà không phá vỡ tính toàn vẹn của chuỗi Tool Call.
-    """
     compacted_messages = []
-    
     for msg in messages:
-        # Chỉ can thiệp vào các ToolMessage thuộc nhóm đọc/khảo sát file
         if msg.type == "tool" and msg.name in ["read_files", "read_file_lines", "search_symbols_universal"]:
             content_str = str(msg.content)
             found_files = []
             
-            # 1. Trích xuất tên file từ cấu trúc đầu ra của read_files
             matches_read = re.findall(r"=== TỆP TIN:\s*[`']?([^`'\n]+)[`']?\s*===", content_str)
             if matches_read:
                 found_files.extend(matches_read)
                 
-            # 2. Trích xuất tên file từ cấu trúc đầu ra của read_file_lines
             matches_lines = re.findall(r"=== NỘI DUNG TỆP KHOANH VÙNG:\s*([^ \n]+)", content_str)
             if matches_lines:
                 found_files.extend(matches_lines)
                 
-            # 3. Trích xuất tên file từ cấu trúc đầu ra của search_symbols_universal
             matches_symbols = re.findall(r"📁\s*`([^`\n]+)`", content_str)
             if matches_symbols:
                 found_files.extend(matches_symbols)
                 
-            # Tạo chuỗi thông tin định danh ngắn gọn
             file_info = f" của tệp {', '.join([f'`{f}`' for f in found_files])}" if found_files else ""
             
-            # Tạo ToolMessage mới kế thừa nguyên vẹn ID nhưng có nội dung tối giản cực hạn
             compacted_msg = ToolMessage(
                 content=f"[Đã nạp thành công dữ liệu vật lý{file_info} vào File Registry. Hãy sử dụng cấu trúc mã nguồn cập nhật mới nhất trong System Prompt để làm việc]",
                 name=msg.name,
@@ -83,42 +85,24 @@ def compact_reading_tool_messages(messages: List[BaseMessage]) -> List[BaseMessa
             compacted_messages.append(msg)
             
     return compacted_messages
-# =====================================================================
-# CÁC HÀM TIỆN ÝCH BỔ TRỢ CHO BỘ KIỂM THỬ ĐA NGÔN NGỮ THÍCH ỨNG
-# =====================================================================
+
 def clear_compiler_cache(workspace_path: Path, ext: str):
-    """
-    Dọn dẹp vật lý các tệp tin cache biên dịch tạm thời trên đĩa cứng 
-    để đảm bảo kết quả kiểm thử hoàn toàn là của mã nguồn mới nhất.
-    """
     try:
         if ext == ".py":
-            # Dọn dẹp __pycache__ và các tệp .pyc cục bộ
             for pycache in workspace_path.rglob("__pycache__"):
                 if pycache.is_dir():
                     shutil.rmtree(pycache, ignore_errors=True)
             for pyc in workspace_path.rglob("*.pyc"):
                 if pyc.is_file():
                     pyc.unlink(missing_ok=True)
-                    
         elif ext in [".ts", ".tsx", ".js", ".jsx"]:
-            # Dọn dẹp cache của TypeScript nếu có
             ts_cache = workspace_path / "node_modules" / ".cache"
             if ts_cache.exists():
                 shutil.rmtree(ts_cache, ignore_errors=True)
-                
-        elif ext == ".rs":
-            # Dọn dẹp cache thô của Cargo để cargo check luôn chạy thực tế
-            # Lưu ý: Không chạy 'cargo clean' vì sẽ tốn rất nhiều thời gian compile lại từ đầu
-            pass
-            
     except Exception as e:
         print(f"[Cảnh báo] Không thể dọn dẹp cache biên dịch: {str(e)}")
+
 def find_nearest_config(start_path: Path, config_name: str, max_depth: int = 5) -> Optional[Path]:
-    """
-    Quét ngược lên các thư mục cha từ start_path để tìm tệp cấu hình (ví dụ: package.json, Cargo.toml).
-    Giúp xác định đúng gốc của sub-project trong monorepo hoặc dự án phân tầng.
-    """
     current = start_path.resolve()
     if current.is_file():
         current = current.parent
@@ -127,21 +111,15 @@ def find_nearest_config(start_path: Path, config_name: str, max_depth: int = 5) 
         target = current / config_name
         if target.exists() and target.is_file():
             return current
-        if current.parent == current: # Đã chạm gốc hệ thống ổ đĩa
+        if current.parent == current:
             break
         current = current.parent
     return None
 
-
 def execute_validation_cmd(cmd: List[str], cwd: Path, timeout: int = 30) -> Tuple[int, str]:
-    """
-    Thực thi lệnh kiểm thử đa nền tảng an toàn. 
-    Tự động xử lý bẫy đuôi tệp tin lệnh (.cmd/.bat) trên Windows.
-    """
     executable = cmd[0]
     is_windows = platform.system() == "Windows"
     
-    # Chuẩn hóa lệnh cho Windows (.cmd, .bat, .exe)
     resolved_executable = shutil.which(executable)
     if not resolved_executable and is_windows:
         for ext in [".cmd", ".bat", ".exe"]:
@@ -150,16 +128,13 @@ def execute_validation_cmd(cmd: List[str], cwd: Path, timeout: int = 30) -> Tupl
                 resolved_executable = shutil.which(cmd[0])
                 break
                 
-    # Nếu thiếu công cụ, trả về mã lỗi đặc biệt (-99) để soft-bypass
     if not resolved_executable:
         return (-99, f"Cảnh báo: Trình biên dịch/phân tích '{executable}' chưa được cài đặt trên hệ thống.")
         
     try:
-        
         env_copy = os.environ.copy()
         env_copy["PYTHONIOENCODING"] = "utf-8"
         env_copy["PYTHONUTF8"] = "1"
-        # Thực thi lệnh trên terminal
         res = subprocess.run(
             cmd,
             cwd=str(cwd),
@@ -178,23 +153,15 @@ def execute_validation_cmd(cmd: List[str], cwd: Path, timeout: int = 30) -> Tupl
     except Exception as e:
         return (-3, f"Lỗi hệ thống khi chạy lệnh kiểm thử: {str(e)}")
 
-
 def clean_compiler_logs(raw_logs: str) -> str:
-    """
-    Nén log lỗi để giữ lại các thông tin giá trị nhất cho LLM, loại bỏ các dòng log thông tin rác.
-    """
     lines = raw_logs.splitlines()
     filtered_lines = []
-    
-    # Danh sách các từ khóa báo lỗi phổ biến của các trình biên dịch khác nhau
     error_keywords = ["error", "fail", "exception", "cause", "unhandled", "invalid", "undefined"]
     
     for line in lines:
         clean_line = line.strip()
         if not clean_line:
             continue
-            
-        # Ưu tiên các dòng chứa từ khóa báo lỗi hoặc chỉ định số dòng (ví dụ: :25:10 hoặc .dart:40)
         has_error_kw = any(kw in clean_line.lower() for kw in error_keywords)
         has_line_indicator = ":" in clean_line or ".dart" in clean_line or ".py" in clean_line or ".ts" in clean_line
         
@@ -202,72 +169,200 @@ def clean_compiler_logs(raw_logs: str) -> str:
             filtered_lines.append(line)
             
     if not filtered_lines:
-        # Nếu bộ lọc quá chặt làm mất hết thông tin, trả về 20 dòng đầu và cuối để đảm bảo an toàn
         if len(lines) > 40:
             return "\n".join(lines[:20] + ["... [Đã lược bớt các dòng ở giữa] ..."] + lines[-20:])
         return raw_logs
         
     return "\n".join(filtered_lines)
 
+def extract_path_from_text(text: str) -> Optional[str]:
+    if not text:
+        return None
+        
+    quoted_paths = re.findall(r'["\']([^"\']+)["\']', text)
+    for qp in quoted_paths:
+        qp_clean = qp.strip()
+        if qp_clean:
+            try:
+                resolved = Path(qp_clean).expanduser().resolve()
+                if resolved.exists():
+                    return str(resolved)
+            except Exception:
+                pass
 
-# ==========================================
-# NÚT WRAPPER CHO SUBGRAPH (STATE ISOLATION)
-# ==========================================
-def detect_workspace_wrapper_node(state: AgentState) -> Dict[str, Any]:
+    code_paths = re.findall(r'`([^`]+)`', text)
+    for cp in code_paths:
+        cp_clean = cp.strip()
+        if cp_clean:
+            try:
+                resolved = Path(cp_clean).expanduser().resolve()
+                if resolved.exists():
+                    return str(resolved)
+            except Exception:
+                pass
+
+    words = text.split()
+    for word in words:
+        cleaned = word.strip('`\'".,;()[]{}*')
+        if not cleaned:
+            continue
+            
+        is_path_like = (
+            cleaned.startswith('/') or 
+            cleaned.startswith('~/') or 
+            cleaned.startswith('./') or 
+            cleaned.startswith('.\\') or
+            (len(cleaned) > 1 and cleaned[1] == ':' and (cleaned[2] == '/' or cleaned[2] == '\\'))
+        )
+        
+        if is_path_like:
+            try:
+                resolved = Path(cleaned).expanduser().resolve()
+                if resolved.exists():
+                    return str(resolved)
+            except Exception:
+                pass
+                
+    return None
+
+# =====================================================================
+# HÀM DIRECT REACT LOOP THAY THẾ SUBGRAPH (TRỰC QUAN, DỄ DEBUG)
+# =====================================================================
+def discover_workspace_direct(user_query: str, initial_workspace: str) -> Dict[str, Any]:
     """
-    Node wrapper kích hoạt Subgraph một cách độc lập.
-    Giúp cô lập lịch sử hội thoại, tránh đưa các message gọi tool khảo sát hệ thống vào Parent State.
+    Vòng lặp ReAct tuần tự trực tiếp sử dụng Python để xác định Workspace.
+    Loại bỏ hoàn toàn các cấu trúc phức tạp của Subgraph cũ.
     """
-    if workspace_discovery_subgraph is None:
-        raise RuntimeError("workspace_discovery_subgraph chưa được liên kết.")
+    system_prompt = (
+        "Bạn là một Agent chuyên nghiệp định vị thư mục làm việc (Workspace).\n"
+        "Nhiệm vụ: Sử dụng các công cụ hệ thống để định vị chính xác đường dẫn vật lý tuyệt đối của thư mục dự án.\n"
+        "⚠️ QUY TẮC CẤM ĐOÁN MÒ:\n"
+        "1. Bạn tuyệt đối không được đoán mò đường dẫn. Hãy sử dụng các công cụ kiểm tra để khảo sát thực tế.\n"
+        "2. Đầu tiên, hãy gọi `get_current_working_directory` để biết môi trường Agent đang đứng.\n"
+        "3. Nếu người dùng nhập đường dẫn (ví dụ: 'Desktop', '~/Desktop'), hãy gọi `check_path_exists` để kiểm định vật lý.\n"
+        "4. Nếu muốn tìm gốc dự án hiện tại, hãy sử dụng `find_project_root`.\n"
+        "5. Khi đã định vị và xác minh chắc chắn đường dẫn tồn tại, hãy gọi công cụ kết thúc `WorkspaceDetection`."
+    )
     
-    # Lấy tin nhắn cuối cùng của người dùng để làm đầu vào cho Subgraph
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_query)
+    ]
+    
+    discovery_tools = [get_current_working_directory, check_path_exists, find_project_root]
+    model_with_tools = model.bind_tools(discovery_tools + [WorkspaceDetection])
+    
+    tools_map = {
+        # "get_current_working_directory": get_current_working_directory,
+        "check_path_exists": check_path_exists,
+        "find_project_root": find_project_root
+    }
+    
+    workspace_path = initial_workspace
+    max_steps = 5
+    
+    for step in range(max_steps):
+        try:
+            response = model_with_tools.invoke(messages)
+            messages.append(response)
+            
+            if not response.tool_calls:
+                break
+                
+            has_finalized = False
+            tool_messages = []
+            
+            for tool_call in response.tool_calls:
+                tool_name = tool_call["name"]
+                tool_args = tool_call["args"] or {}
+                tool_id = tool_call["id"]
+                
+                if tool_name == "WorkspaceDetection":
+                    workspace_path = tool_args.get("workspace_path", workspace_path)
+                    has_finalized = True
+                    tool_messages.append(ToolMessage(
+                        content=f"Đã ghi nhận đường dẫn Workspace thành công: {workspace_path}", 
+                        name=tool_name, 
+                        tool_call_id=tool_id
+                    ))
+                elif tool_name in tools_map:
+                    tool_instance = tools_map[tool_name]
+                    result = tool_instance.invoke(tool_args)
+                    tool_messages.append(ToolMessage(
+                        content=str(result), 
+                        name=tool_name, 
+                        tool_call_id=tool_id
+                    ))
+                else:
+                    tool_messages.append(ToolMessage(
+                        content=f"Lỗi: Không tìm thấy công cụ '{tool_name}'", 
+                        name=tool_name, 
+                        tool_call_id=tool_id
+                    ))
+            
+            messages.extend(tool_messages)
+            if has_finalized:
+                break
+        except Exception as e:
+            return {
+                "workspace_path": workspace_path,
+                "messages": [AIMessage(content=f"⚠️ Gặp sự cố khi tự động định vị Workspace trực tiếp: {str(e)}")]
+            }
+            
+    final_path = str(Path(workspace_path).expanduser().resolve())
+    return {
+        "workspace_path": final_path,
+        "messages": [AIMessage(content=f"🔍 Hệ thống đã xác minh thực tế và thiết lập workspace tại: `{final_path}`")]
+    }
+
+# =====================================================================
+# CẬP NHẬT DETECT_AND_TRIAGE_NODE SỬ DỤNG FUNCTION ĐỂ DUY TRÌ HIỆU NĂNG
+# =====================================================================
+def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
+    messages = state["messages"]
     user_msg = None
-    for msg in reversed(state["messages"]):
+    for msg in reversed(messages):
         if isinstance(msg, HumanMessage) or getattr(msg, "type", None) == "human":
             user_msg = msg
             break
-    if not user_msg:
-        user_msg = HumanMessage(content="Xác định thư mục làm việc hiện tại.")
-
-    # Khởi tạo trạng thái riêng biệt cho Subgraph
-    sub_state = {
-        "messages": [user_msg],
-        "workspace_path": state.get("workspace_path", ".")
-    }
+            
+    # SỬA TẠI ĐÂY: Trích xuất phần text an toàn từ tin nhắn
+    user_query_raw = user_msg.content if user_msg else ""
+    user_query_text = get_text_content_safely(user_query_raw)
     
-    # Thực thi Subgraph một cách cô lập
-    result = workspace_discovery_subgraph.invoke(sub_state)
+    # Sử dụng chuỗi văn bản đã chuẩn hóa để quét đường dẫn
+    detected_path_str = extract_path_from_text(user_query_text)
+    workspace_path = None
+    detect_messages = []
     
-    # Chỉ trích xuất kết quả cần thiết trả lại cho Parent Graph
-    final_path = result.get("workspace_path", ".")
-    final_msg = AIMessage(content=f"🔍 Định vị không gian làm việc thành công: `{final_path}`")
-    
-    return {
-        "workspace_path": final_path,
-        "messages": [final_msg] # Chỉ trả về 1 tin nhắn sạch sẽ, loại bỏ toàn bộ tool_calls nháp
-    }
-
-
-def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
-    """
-    🌟 TỐI ƯU HÓA: Chạy song song detect_workspace và triage bằng ThreadPoolExecutor 
-    ở tầng Python để đạt tốc độ tối đa và tránh lỗi race condition/lặp nút của LangGraph.
-    """
-    with ThreadPoolExecutor() as executor:
-        future_detect = executor.submit(detect_workspace_wrapper_node, state)
-        future_triage = executor.submit(triage_node, state)
-        detect_res = future_detect.result()
-        triage_res = future_triage.result()
+    if detected_path_str:
+        start_path = Path(detected_path_str)
+        resolved_root = find_project_root_heuristic(start_path)
+        workspace_path = str(resolved_root)
+        detect_messages.append(
+            AIMessage(content=f"🔍 Hệ thống đã phát hiện đường dẫn trực tiếp: `{detected_path_str}`. "
+                              f"Đã tự động xác định thư mục gốc dự án tại: `{workspace_path}` (Bypass Detection Loop).")
+        )
         
-    merged_messages = []
-    if "messages" in detect_res:
-        merged_messages.extend(detect_res["messages"])
-    if "messages" in triage_res:
-        merged_messages.extend(triage_res["messages"])
-        
+        triage_res = triage_node(state)
+        merged_messages = detect_messages + triage_res.get("messages", [])
+    else:
+        # Truyền phần text đã chuẩn hóa vào luồng dò tìm Workspace để tránh truyền cả payload ảnh
+        with ThreadPoolExecutor() as executor:
+            future_detect = executor.submit(discover_workspace_direct, user_query_text, state.get("workspace_path", "."))
+            future_triage = executor.submit(triage_node, state)
+            detect_res = future_detect.result()
+            triage_res = future_triage.result()
+            
+        workspace_path = detect_res.get("workspace_path", state.get("workspace_path", "."))
+        merged_messages = []
+        if "messages" in detect_res:
+            merged_messages.extend(detect_res["messages"])
+        if "messages" in triage_res:
+            merged_messages.extend(triage_res["messages"])
+            
     return {
-        "workspace_path": detect_res.get("workspace_path", state.get("workspace_path", ".")),
+        "workspace_path": workspace_path,
         "plan": triage_res.get("plan", []),
         "task_type": triage_res.get("task_type", "development"),
         "last_executed_task_ids": triage_res.get("last_executed_task_ids", []),
@@ -280,7 +375,6 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
     }
 
 
-# Hàm tiện ích nội bộ lọc các task đủ điều kiện (DAG)
 def get_eligible_tasks(plan: List[Any]) -> List[Any]:
     completed_ids = set()
     for t in plan:
@@ -300,106 +394,42 @@ def get_eligible_tasks(plan: List[Any]) -> List[Any]:
     return eligible
 
 
-# ==========================================
-# CÁC NODES PHỤC VỤ ĐỒ THỊ CON DÒ TÌM WORKSPACE
-# ==========================================
-def discovery_agent_node(state: WorkspaceDiscoveryState) -> Dict[str, Any]:
-    """Node trí tuệ của Subgraph: Dùng công cụ khảo sát hệ thống để khóa mục tiêu workspace."""
-    discovery_tools = [get_current_working_directory, check_path_exists, find_project_root]
-    model_with_tools = model.bind_tools(discovery_tools + [WorkspaceDetection])
-    
-    system_prompt = (
-        "Bạn là một Agent chuyên nghiệp định vị thư mục làm việc (Workspace).\n"
-        "Nhiệm vụ: Sử dụng các công cụ hệ thống để định vị chính xác đường dẫn vật lý tuyệt đối của thư mục dự án.\n"
-        "⚠️ QUY TẮC CẤM ĐOÁN MÒ:\n"
-        "1. Bạn tuyệt đối không được đoán mò đường dẫn. Hãy sử dụng các công cụ kiểm tra để khảo sát thực tế.\n"
-        "2. Đầu tiên, hãy gọi `get_current_working_directory` để biết môi trường Agent đang đứng.\n"
-        "3. Nếu người dùng nhập đường dẫn (ví dụ: 'Desktop', '~/Desktop'), hãy gọi `check_path_exists` để kiểm định vật lý.\n"
-        "4. Nếu muốn tìm gốc dự án hiện tại, hãy sử dụng `find_project_root`.\n"
-        "5. Khi đã định vị và xác minh chắc chắn đường dẫn tồn tại, hãy gọi công cụ kết thúc `WorkspaceDetection`."
-    )
-    
-    messages = list(state["messages"])
-    if not any(isinstance(m, SystemMessage) for m in messages):
-        messages = [SystemMessage(content=system_prompt)] + messages
-        
-    response = model_with_tools.invoke(messages)
-    return {"messages": [response]}
-
-
-def discovery_tool_node(state: WorkspaceDiscoveryState) -> Dict[str, Any]:
-    """Node thực thi các công cụ khảo sát hệ thống thực tế cho Subgraph."""
-    last_msg = state["messages"][-1]
-    if not isinstance(last_msg, AIMessage) or not last_msg.tool_calls:
-        return {}
-        
-    tools_map = {
-        "get_current_working_directory": get_current_working_directory,
-        "check_path_exists": check_path_exists,
-        "find_project_root": find_project_root
-    }
-    
-    tool_messages = []
-    for tool_call in last_msg.tool_calls:
-        tool_name = tool_call["name"]
-        tool_args = tool_call["args"] or {}
-        tool_id = tool_call["id"]
-        
-        tool_instance = tools_map.get(tool_name)
-        if not tool_instance:
-            result = f"Lỗi: Không tìm thấy công cụ khảo sát hệ thống '{tool_name}'."
-        else:
-            try:
-                result = tool_instance.invoke(tool_args)
-            except Exception as e:
-                result = f"Lỗi thực thi công cụ '{tool_name}': {str(e)}"
-                
-        tool_messages.append(ToolMessage(content=str(result), name=tool_name, tool_call_id=tool_id))
-        
-    return {"messages": tool_messages}
-
-
-def discovery_finalize_node(state: WorkspaceDiscoveryState) -> Dict[str, Any]:
-    """Node hoàn tất: Trích xuất kết quả cuối cùng từ cuộc gọi WorkspaceDetection và đóng gói."""
-    workspace_path = "."
-    for msg in reversed(state["messages"]):
-        if isinstance(msg, AIMessage) and msg.tool_calls:
-            for tool_call in msg.tool_calls:
-                if tool_call["name"] == "WorkspaceDetection":
-                    workspace_path = tool_call["args"].get("workspace_path", ".")
-                    break
-                    
-    final_path = str(Path(workspace_path).expanduser().resolve())
-    return {
-        "workspace_path": final_path,
-        "finished": True,
-        "messages": [AIMessage(content=f"🔍 Hệ thống đã xác minh thực tế và thiết lập workspace tại: `{final_path}`")]
-    }
-
-
-# ==========================================
-# CÁC NODES PHỤC VỤ ĐỒ THỊ CHÍNH (MAIN GRAPH)
-# ==========================================
 def context_loader_node(state: AgentState) -> Dict[str, Any]:
-    """Node tải ngữ cảnh: Chỉ thực hiện I/O đọc tệp tin THONGTIN.md để lấy thông tin hệ thống."""
     ws = state["workspace_path"]
+    
+    git_dir = Path(ws) / ".git"
+    git_branch = "no_git"
+    git_msg = "ℹ️ Không phát hiện Git repository. Kích hoạt chế độ Sửa đổi trực tiếp (Bypass Git)."
+    
+    if git_dir.exists():
+        try:
+            git_manager = GitManager(ws)
+            git_branch = git_manager.init_and_prepare_branch()
+            git_msg = f"Đã cấu hình nhánh Git hoạt động: `{git_branch}`"
+        except Exception as e:
+            git_branch = "no_git"
+            git_msg = f"⚠️ Có lỗi xảy ra khi nạp Git ({str(e)}). Tự động chuyển sang chế độ Sửa đổi trực tiếp."
+            
     workspace_context = ""
     thongtin_path = Path(ws) / "THONGTIN.md"
+    context_msg = "📋 Không tìm thấy tệp cấu hình `THONGTIN.md`."
+    
     if thongtin_path.exists():
         try:
             workspace_context = thongtin_path.read_text(encoding="utf-8")
+            context_msg = "📋 Đã tải xong ngữ cảnh thông tin dự án từ tệp `THONGTIN.md`."
         except Exception as e:
             workspace_context = f"Lỗi khi đọc file THONGTIN.md: {str(e)}"
+            context_msg = f"⚠️ Gặp sự cố khi đọc tệp `THONGTIN.md`: {str(e)}"
             
     return {
         "workspace_context": workspace_context,
-        "git_branch": "no_git",  # Mặc định là no_git để an toàn [1]
-        "messages": [AIMessage(content="📋 Đã tải xong ngữ cảnh thông tin dự án từ tệp `THONGTIN.md`.")]
+        "git_branch": git_branch,
+        "messages": [AIMessage(content=f"{git_msg}\n{context_msg}")]
     }
 
 
 def triage_node(state: AgentState) -> Dict[str, Any]:
-    """Node phân loại (Triage): Gọi LLM tách biệt để định hướng nhiệm vụ đơn giản / phức tạp."""
     messages = state["messages"]
     user_msg = None
     for msg in reversed(messages):
@@ -410,7 +440,9 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
     if not user_msg:
         user_msg = messages[0]
         
-    user_query = user_msg.content
+    # SỬA TẠI ĐÂY: Trích xuất text an toàn để gửi lên mô hình phân loại
+    user_query_text = get_text_content_safely(user_msg.content)
+    
     structured_llm = fast_model.with_structured_output(TaskTriage, method="function_calling")
     
     system_prompt = (
@@ -422,7 +454,7 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
     try:
         triage_output = structured_llm.invoke([
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_query}
+            {"role": "user", "content": user_query_text} # Truyền text sạch
         ])
         is_simple = getattr(triage_output, "is_simple", False)
         task_type = getattr(triage_output, "task_type", "development")
@@ -436,7 +468,7 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
     if is_simple:
         plan_tasks = [Task(
             id="T1", 
-            description=f"Xử lý trực tiếp yêu cầu của người dùng: {user_query}", 
+            description=f"Xử lý trực tiếp yêu cầu của người dùng: {user_query_text}", 
             dependencies=[], 
             status="pending"
         )]
@@ -453,38 +485,10 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
         "modified_files": [],     
         "error_logs": "",         
         "step_findings": [],      
-        "is_simple": is_simple,  # <--- TRẢ VỀ GIÁ TRỊ STATE ĐỂ LƯU TRỮ
+        "is_simple": is_simple,  
     }
 
 
-def git_setup_node(state: AgentState) -> Dict[str, Any]:
-    """Node thiết lập Git: Kiểm tra chủ động sự tồn tại của .git. Nếu không có, bypass an toàn [1]."""
-    ws = state["workspace_path"]
-    git_dir = Path(ws) / ".git"
-    
-    if not git_dir.exists():
-        return {
-            "git_branch": "no_git",
-            "messages": [AIMessage(content="ℹ️ Không phát hiện Git repository. Kích hoạt chế độ Sửa đổi trực tiếp (Bypass Git) [1].")]
-        }
-        
-    try:
-        git_manager = GitManager(ws)
-        branch = git_manager.init_and_prepare_branch()
-        return {
-            "git_branch": branch,
-            "messages": [AIMessage(content=f"Đã cấu hình nhánh Git hoạt động: `{branch}`")]
-        }
-    except Exception as e:
-        return {
-            "git_branch": "no_git",
-            "messages": [AIMessage(content=f"⚠️ Có lỗi xảy ra khi nạp Git ({str(e)}). Tự động chuyển sang chế độ Sửa đổi trực tiếp [1].")]
-        }
-
-
-# =====================================================================
-# CHỈNH SỬA 1: Cấu trúc lại Planner_Node để tối ưu hóa Hợp đồng Nhiệm vụ
-# =====================================================================
 def planner_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
     conversation_history = state["messages"]
@@ -517,7 +521,7 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
         "Tác vụ tổng hợp đã được quản lý tự động bởi node 'synthesis' chuyên biệt ở phía sau.\n"
         "- Tuyệt đối KHÔNG đưa bước 'Chạy test suite', 'Kiểm thử logic' (ví dụ: pytest, npm test, dart test) vào kế hoạch! "
         "Tác vụ kiểm thử tĩnh và kiểm tra cú pháp đã được quản lý tự động bởi node 'tester' chuyên biệt ở phía sau.\n"
-        "- Kế hoạch của bạn chỉ tập trung hoàn toàn vào các bước thực thi khảo sát vật lý (analysis) hoặc sửa đổi mã nguồn (development)."
+        "- Kế hoạch của bạn chỉ tập quan tâm hoàn toàn vào các bước thực thi khảo sát vật lý (analysis) hoặc sửa đổi mã nguồn (development)."
     )
     
     try:
@@ -557,9 +561,7 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
         "messages": [AIMessage(content=f"Đã lập kế hoạch hành động dạng đồ thị phụ thuộc (Loại: {task_type.upper()}):\n{plan_str}")]
     }
 
-# =====================================================================
-# HỢP NHẤT: Executor duy nhất tự động thích ứng theo Trạng thái (Polymorphic)
-# =====================================================================
+
 def executor_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
     plan = state["plan"]
@@ -582,9 +584,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         for t in eligible_tasks
     ])
 
-    # ⚙️ PHÂN TÁCH CẤU HÌNH DỰA TRÊN TASK TYPE TRONG CÙNG MỘT NODE
     if task_type == "analysis":
-        # Công cụ chỉ đọc dành cho Khảo sát
         read_files = ReadFilesTool(workspace_path=ws)
         list_directory = ListDirectoryTool(workspace_path=ws)
         search_symbols = UniversalSymbolSearchTool(workspace_path=ws)
@@ -616,7 +616,6 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             system_prompt += previous_findings_str
 
     else:  # development
-        # Công cụ có quyền ghi dành cho Phát triển
         registry_context_str = ""
         if file_registry:
             registry_context_str = "\n=== 📦 NỘI DUNG MÃ NGUỒN CẬP NHẬT MỚI NHẤT (SINGLE SOURCE OF TRUTH) ===\n"
@@ -630,6 +629,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
                     f"```{lang}\n" + "\n".join(formatted_lines) + "\n```\n"
                 )
                 
+        web_interact_tool = WebInteractAndTestTool(workspace_path=ws)
         read_files = ReadFilesTool(workspace_path=ws)
         write_file = WriteFileTool(workspace_path=ws)
         apply_patch = ApplyPatchTool(workspace_path=ws)
@@ -638,7 +638,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         run_terminal_command = RunTerminalTool(workspace_path=ws)
         read_file_lines = ReadFileLinesTool(workspace_path=ws)
         
-        tools = [read_files, write_file, apply_patch, list_directory, run_terminal_command, search_symbols, read_file_lines]
+        tools = [read_files, write_file, apply_patch, list_directory, run_terminal_command, search_symbols, read_file_lines,web_interact_tool]
         
         system_prompt = (
             "Bạn là một kỹ sư phần mềm thực thi chuyên nghiệp chuyên sửa lỗi và viết mới mã nguồn (Write-Access Mode).\n"
@@ -704,21 +704,12 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         return {"messages": [response]}
 
 
-
-# =====================================================================
-# CHỈNH SỬA 4: Ngăn chặn lấn ranh trong các lần điều chỉnh Kế hoạch (Replanner)
-# =====================================================================
 def replanner_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Node trí tuệ trung gian: Đánh giá tiến độ thực tế, phát hiện rào cản 
-    và tiến hành cập nhật/thích ứng đồ thị nhiệm vụ (DAG) theo thời gian thực.
-    """
     replanning_count = state.get("replanning_count", 0)
     
-    # 🛡️ CHỐT CHẶN BẢO VỆ: Nếu Re-plan quá 5 lần, dừng lại để tránh cạn kiệt tài nguyên
     if replanning_count >= 5:
         return {
-            "messages": [AIMessage(content="🚨 **[Hệ thống tự động dừng]** Phát hiện vòng lặp lập kế hoạch quá nhiều lần (Vượt giới hạn 5 lần). Chuyển tiếp tới bước tiếp theo để tránh lặp vô hạn.")]
+            "messages": [AIMessage(content="🚨 **[Hệ thống tự động dừng]** Phát hiện vòng lặp lập kế hoạch quá nhiều lần. Chuyển tiếp tới bước tiếp theo.")]
         }
     ws = state["workspace_path"]
     plan = state["plan"]
@@ -727,7 +718,6 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
     workspace_context = state.get("workspace_context", "")
     error_logs = state.get("error_logs", "")
     
-    # 🌟 TỐI ƯU HÓA: Tự động bypass cuộc gọi LLM nếu tiến trình bình thường và không có lỗi
     if not error_logs:
         return {
             "plan": plan,
@@ -735,7 +725,6 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
             "messages": [AIMessage(content="🔄 [Bypass Replanner] Không phát hiện lỗi phát sinh. Tiếp tục thực hiện kế hoạch.")]
         }
     
-    # Định dạng trực quan danh sách nhiệm vụ hiện tại để LLM dễ phân tích
     plan_str = "\n".join([
         f"- [{t.id if isinstance(t, Task) else t.get('id')}] {t.description if isinstance(t, Task) else t.get('description')} "
         f"(Trạng thái: {t.status if isinstance(t, Task) else t.get('status')}, "
@@ -771,7 +760,6 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
         
     user_prompt += "Hãy đưa ra phân tích và cập nhật kế hoạch phù hợp thông qua cuộc gọi hàm."
     
-    # Ép cấu trúc đầu ra bằng function calling tương thích local model
     structured_llm = model.with_structured_output(PlanUpdate, method="function_calling")
     
     try:
@@ -836,7 +824,6 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
         }
 
 
-# nodes.py (Cập nhật tool_node để tự động cập nhật registry)
 def tool_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
     read_files = ReadFilesTool(workspace_path=ws)
@@ -865,7 +852,6 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
     modified_files = list(state.get("modified_files", []))
     file_registry = dict(state.get("file_registry", {}))
     
-    # Tập hợp các file bị tác động (cả đọc lẫn ghi) trong lượt này
     impacted_files = set()
     
     for tool_call in last_message.tool_calls:
@@ -873,7 +859,6 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         tool_args = tool_call["args"] or {}
         tool_id = tool_call["id"]
         
-        # Trích xuất đường dẫn file từ đối số của tool
         raw_path = tool_args.get("file_path") or tool_args.get("file_paths")
         if raw_path:
             if isinstance(raw_path, list):
@@ -900,14 +885,11 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
                 
         tool_messages.append(ToolMessage(content=str(result), name=tool_name, tool_call_id=tool_id))
         
-    # ĐỒNG BỘ HÓA REGISTRY: Đọc thực tế trên đĩa cứng để cập nhật nội dung mới nhất
     for file_path in impacted_files:
         try:
             safe_path = sanitize_and_resolve_path(ws, file_path, create_parent=False)
             if safe_path.exists() and safe_path.is_file():
-                # Đọc nội dung thực tế trên đĩa
                 current_content = safe_path.read_text(encoding="utf-8")
-                # Đồng bộ vào registry
                 file_registry[file_path] = current_content
         except Exception:
             pass
@@ -930,7 +912,6 @@ def tester_node(state: AgentState) -> Dict[str, Any]:
     warnings = []
     workspace_root = Path(ws).expanduser().resolve()
     
-    # Phân loại tệp đã sửa và tiến hành DỌN DẸP CACHE trước khi test
     files_by_ext: Dict[str, List[Path]] = {}
     for f_path_str in modified_files:
         try:
@@ -944,17 +925,15 @@ def tester_node(state: AgentState) -> Dict[str, Any]:
 
     for ext, files in files_by_ext.items():
         if ext == ".py":
-            import sys # 🌟 THÊM MỚI: Import sys để lấy trình thông dịch hiện tại
+            import sys
             for f in files:
                 if f.name.startswith("test_") or f.name.endswith("_test.py"):
-                    # 🌟 THAY ĐỔI: Dùng sys.executable thay vì "python" để giữ đúng môi trường venv
                     code, output = execute_validation_cmd([sys.executable, str(f)], workspace_root)
                     if code == -99:
                         warnings.append(output)
                     elif code != 0:
                         errors.append(f"❌ [Lỗi Thực Thi Unit Test Python] tại tệp `{f.name}`:\n{clean_compiler_logs(output)}")
                 else:
-                    # Tương tự cho lệnh kiểm tra cú pháp py_compile
                     code, output = execute_validation_cmd([sys.executable, "-m", "py_compile", str(f)], workspace_root)
                     if code == -99:
                         warnings.append(output)
@@ -1079,11 +1058,7 @@ def synthesis_node(state: AgentState) -> Dict[str, Any]:
                 cleaned_md = cleaned_md[:-3]
             cleaned_md = cleaned_md.strip()
             
-            # =====================================================================
-            # THAY ĐỔI: Chỉ ghi file vật lý khi môi trường có Git hoạt động
-            # =====================================================================
             if git_branch != "no_git":
-                # Thư mục có Git: Cho phép ghi file vật lý xuống đĩa cứng
                 tools_mgr = WorkspaceTools(ws)
                 tools_mgr.write_file("THONGTIN.md", cleaned_md)
                 
@@ -1095,7 +1070,6 @@ def synthesis_node(state: AgentState) -> Dict[str, Any]:
                     "lưu vật lý thành tệp `THONGTIN.md` và đưa vào Git staging thành công."
                 )
             else:
-                # Chế độ Không-Git: Chỉ lưu trữ ảo trong State để tránh tạo file rác bừa bãi
                 message_content = (
                     "**Tổng hợp tài liệu hoàn tất (Chế độ In-Memory):** Tri thức khảo sát "
                     "đã được tổng hợp và nạp trực tiếp vào ngữ cảnh trạng thái đồ thị (`workspace_context`). "
@@ -1118,7 +1092,7 @@ def commit_node(state: AgentState) -> Dict[str, Any]:
     
     if git_branch == "no_git":
         return {
-            "messages": [AIMessage(content="Đã hoàn thành toàn bộ yêu cầu của bạn. Chế độ Không-Git được kích hoạt, bỏ qua commit [1].")]
+            "messages": [AIMessage(content="Đã hoàn thành toàn bộ yêu cầu của bạn. Chế độ Không-Git được kích hoạt, bỏ qua commit.")]
         }
         
     git_manager = GitManager(ws)

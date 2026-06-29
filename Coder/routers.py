@@ -1,30 +1,11 @@
 # routers.py
 from typing import Literal
 from langchain_core.messages import AIMessage
-from state import AgentState, WorkspaceDiscoveryState, Task
-
-# ==========================================
-# ĐỊNH TUYẾN CHO ĐỒ THỊ CON DÒ TÌM WORKSPACE
-# ==========================================
-def discovery_router(state: WorkspaceDiscoveryState) -> Literal["discovery_tool_node", "discovery_finalize_node"]:
-    messages = state["messages"]
-    if not messages:
-        return "discovery_finalize_node"
-        
-    last_message = messages[-1]
-    if isinstance(last_message, AIMessage) and last_message.tool_calls:
-        for tool_call in last_message.tool_calls:
-            if tool_call["name"] == "WorkspaceDetection":
-                return "discovery_finalize_node"
-        return "discovery_tool_node"
-        
-    return "discovery_finalize_node"
-
+from state import AgentState, Task
 
 # ==========================================
 # ĐỊNH TUYẾN CHO ĐỒ THỊ CHÍNH (MAIN GRAPH)
 # ==========================================
-
 
 def context_loader_router(state: AgentState) -> Literal["planner", "executor"]:
     if state.get("plan"):
@@ -36,7 +17,6 @@ def planner_router(state: AgentState) -> Literal["executor"]:
     return "executor"
 
 
-# HỢP NHẤT: Định tuyến cho Executor duy nhất
 def executor_router(state: AgentState) -> Literal["tool_node", "replanner", "tester", "synthesis"]:
     messages = state["messages"]
     if not messages:
@@ -53,12 +33,10 @@ def executor_router(state: AgentState) -> Literal["tool_node", "replanner", "tes
     return "replanner"
 
 
-# HỢP NHẤT: Định tuyến quay lại sau khi cập nhật kế hoạch thích ứng
 def replanner_router(state: AgentState) -> Literal["executor", "synthesis", "tester"]:
     plan = state["plan"]
     task_type = state.get("task_type", "development")
     
-    # Lọc tìm các nhiệm vụ chưa hoàn thành (pending)
     pending_tasks = []
     for t in plan:
         status = t.status if isinstance(t, Task) else t.get("status")

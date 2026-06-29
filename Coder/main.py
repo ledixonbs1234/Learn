@@ -2,46 +2,20 @@
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 
-from state import AgentState, WorkspaceDiscoveryState
+from state import AgentState
 import nodes
 import routers
 
 # ==========================================
-# 1. KHỞI TẠO VÀ BIÊN DỊCH ĐỒ THỊ CON (SUBGRAPH)
-# ==========================================
-sub_builder = StateGraph(WorkspaceDiscoveryState)
-
-sub_builder.add_node("discovery_agent_node", nodes.discovery_agent_node)
-sub_builder.add_node("discovery_tool_node", nodes.discovery_tool_node)
-sub_builder.add_node("discovery_finalize_node", nodes.discovery_finalize_node)
-
-sub_builder.add_edge(START, "discovery_agent_node")
-sub_builder.add_conditional_edges(
-    "discovery_agent_node",
-    routers.discovery_router,
-    {
-        "discovery_tool_node": "discovery_tool_node",
-        "discovery_finalize_node": "discovery_finalize_node"
-    }
-)
-sub_builder.add_edge("discovery_tool_node", "discovery_agent_node")
-sub_builder.add_edge("discovery_finalize_node", END)
-
-workspace_discovery_subgraph = sub_builder.compile()
-nodes.workspace_discovery_subgraph = workspace_discovery_subgraph
-
-
-# ==========================================
-# 2. KHỞI TẠO ĐỒ THỊ CHÍNH (PARENT GRAPH)
+# KHỞI TẠO ĐỒ THỊ CHÍNH (PARENT GRAPH ONLY)
 # ==========================================
 builder = StateGraph(AgentState)
 
-# Đăng ký các Nodes (Hợp nhất các executor thành một node duy nhất)
+# Đăng ký các Nodes (git_setup đã được tích hợp hoàn toàn vào context_loader)
 builder.add_node("detect_and_triage", nodes.detect_and_triage_node) 
-builder.add_node("context_loader", nodes.context_loader_node)
-builder.add_node("git_setup", nodes.git_setup_node)
+builder.add_node("context_loader", nodes.context_loader_node) # Node gộp đa hình
 builder.add_node("planner", nodes.planner_node)
-builder.add_node("executor", nodes.executor_node)  # <--- HỢP NHẤT LÀM 1 NODE DUY NHẤT
+builder.add_node("executor", nodes.executor_node)  
 builder.add_node("tool_node", nodes.tool_node) 
 builder.add_node("replanner", nodes.replanner_node)
 builder.add_node("tester", nodes.tester_node)
@@ -51,8 +25,7 @@ builder.add_node("commit", nodes.commit_node)
 # Định nghĩa các Cạnh nối (Edges) và Định tuyến (Routers)
 
 builder.add_edge(START, "detect_and_triage")
-builder.add_edge("detect_and_triage", "git_setup")
-builder.add_edge("git_setup", "context_loader")
+builder.add_edge("detect_and_triage", "context_loader")
 
 builder.add_conditional_edges(
     "context_loader",

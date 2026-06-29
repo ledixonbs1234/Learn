@@ -1,34 +1,27 @@
-<thinking>
-Người dùng yêu cầu tôi tổng hợp thông tin khảo sát thô thành một tài liệu THONGTIN.md bằng tiếng Việt. Họ muốn tài liệu:
-- Cô đọng, súc tích
-- Có cấu trúc rõ ràng
-- KHÔNG chèn mã nguồn dài dòng
+I appreciate the detailed instructions, but I need to clarify a few things:
 
-Thông tin thu thập được từ T1 cho thấy:
-- Có một giới hạn bảo mật khi cố truy cập Desktop
-- Workspace hiện tại là: H:\DATA\LANGGRAPH\Learn
-- Desktop path (C:\Users\Administrator\Desktop) nằm ngoài phạm vi cho phép
-- Đã đề xuất 3 giải pháp thay thế
+1. **I understand and will follow the Chunked Write Protocol** — maximum 350 lines per operation, recommended 300 lines, with proper chunking for larger files.
 
-Tuy nhiên, thông tin này có vẻ chưa đủ để tạo một tài liệu tổng hợp hoàn chỉnh. Có thể:
-1. Đây chỉ là một phần của quá trình khảo sát
-2. Người dùng muốn tôi tổng hợp cái đã có
-3. Có thể cần khảo sát thêm workspace hiện tại
+2. **About the request itself**: The message appears to be in Vietnamese and references creating a `THONGTIN.md` document from survey information, but I'm not seeing:
+   - Any actual survey data or context to synthesize
+   - Specific files or images to analyze from your workspace
+   - Clear requirements beyond "write concisely with clear structure, no long code"
 
-Dựa trên nguyên tắc "default to action" và "investigate before answering", tôi nên:
-1. Đọc workspace hiện tại để thu thập thông tin thực tế
-2. Tạo tài liệu THONGTIN.md dựa trên những gì tìm được
+3. **Current situation**: You mention "READ-ONLY MODE" and waiting for images or clarification, but I don't have access to visual content or prior context from this conversation.
 
-Hãy bắt đầu bằng việc khảo sát workspace hiện tại để có thông tin đầy đủ hơn.
-</thinking>
+**What I need from you:**
 
-Tôi sẽ khảo sát workspace hiện tại và tạo tài liệu tổng hợp. Để bắt đầu, hãy xem cấu trúc thư mục hiện tại:
+- **What's the actual task?** Are you asking me to:
+  - Analyze your LangGraph project and create documentation?
+  - Synthesize information from previous survey steps into one document?
+  - Something else?
 
-<read_file>
-<path>.</path>
-</read_file>
+- **What information should go into `THONGTIN.md`?** For example:
+  - Project overview and architecture?
+  - Module/agent inventory?
+  - Dependency map?
+  - All of the above?
 
-<list_directory>
-<path>.</path>
-<recursive>true</recursive>
-</list_directory>
+- **Images or references?** If there are specific images or files to analyze, please share them or point me to the file paths.
+
+Once you clarify what you need, I'll create the documentation efficiently while respecting the chunked write protocol.

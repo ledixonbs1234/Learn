@@ -6,6 +6,7 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
+from concurrent.futures import ThreadPoolExecutor
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
@@ -248,6 +249,37 @@ def detect_workspace_wrapper_node(state: AgentState) -> Dict[str, Any]:
     }
 
 
+def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
+    """
+    🌟 TỐI ƯU HÓA: Chạy song song detect_workspace và triage bằng ThreadPoolExecutor 
+    ở tầng Python để đạt tốc độ tối đa và tránh lỗi race condition/lặp nút của LangGraph.
+    """
+    with ThreadPoolExecutor() as executor:
+        future_detect = executor.submit(detect_workspace_wrapper_node, state)
+        future_triage = executor.submit(triage_node, state)
+        detect_res = future_detect.result()
+        triage_res = future_triage.result()
+        
+    merged_messages = []
+    if "messages" in detect_res:
+        merged_messages.extend(detect_res["messages"])
+    if "messages" in triage_res:
+        merged_messages.extend(triage_res["messages"])
+        
+    return {
+        "workspace_path": detect_res.get("workspace_path", state.get("workspace_path", ".")),
+        "plan": triage_res.get("plan", []),
+        "task_type": triage_res.get("task_type", "development"),
+        "last_executed_task_ids": triage_res.get("last_executed_task_ids", []),
+        "replanning_count": triage_res.get("replanning_count", 0),
+        "modified_files": triage_res.get("modified_files", []),
+        "error_logs": triage_res.get("error_logs", ""),
+        "step_findings": triage_res.get("step_findings", []),
+        "is_simple": triage_res.get("is_simple", False),
+        "messages": merged_messages
+    }
+
+
 # Hàm tiện ích nội bộ lọc các task đủ điều kiện (DAG)
 def get_eligible_tasks(plan: List[Any]) -> List[Any]:
     completed_ids = set()
@@ -274,7 +306,7 @@ def get_eligible_tasks(plan: List[Any]) -> List[Any]:
 def discovery_agent_node(state: WorkspaceDiscoveryState) -> Dict[str, Any]:
     """Node trí tuệ của Subgraph: Dùng công cụ khảo sát hệ thống để khóa mục tiêu workspace."""
     discovery_tools = [get_current_working_directory, check_path_exists, find_project_root]
-    model_with_tools = fast_model.bind_tools(discovery_tools + [WorkspaceDetection])
+    model_with_tools = model.bind_tools(discovery_tools + [WorkspaceDetection])
     
     system_prompt = (
         "Bạn là một Agent chuyên nghiệp định vị thư mục làm việc (Workspace).\n"
@@ -695,6 +727,14 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
     workspace_context = state.get("workspace_context", "")
     error_logs = state.get("error_logs", "")
     
+    # 🌟 TỐI ƯU HÓA: Tự động bypass cuộc gọi LLM nếu tiến trình bình thường và không có lỗi
+    if not error_logs:
+        return {
+            "plan": plan,
+            "task_type": task_type,
+            "messages": [AIMessage(content="🔄 [Bypass Replanner] Không phát hiện lỗi phát sinh. Tiếp tục thực hiện kế hoạch.")]
+        }
+    
     # Định dạng trực quan danh sách nhiệm vụ hiện tại để LLM dễ phân tích
     plan_str = "\n".join([
         f"- [{t.id if isinstance(t, Task) else t.get('id')}] {t.description if isinstance(t, Task) else t.get('description')} "
@@ -1023,7 +1063,7 @@ def synthesis_node(state: AgentState) -> Dict[str, Any]:
     )
     
     try:
-        response = model.invoke([
+        response = fast_model.invoke([
             SystemMessage(content=synthesis_prompt),
             HumanMessage(content=f"Thông tin thu thập:\n\n{compiled_data}")
         ])

@@ -37,9 +37,8 @@ nodes.workspace_discovery_subgraph = workspace_discovery_subgraph
 builder = StateGraph(AgentState)
 
 # Đăng ký các Nodes (Hợp nhất các executor thành một node duy nhất)
-builder.add_node("detect_workspace", nodes.detect_workspace_wrapper_node) 
+builder.add_node("detect_and_triage", nodes.detect_and_triage_node) 
 builder.add_node("context_loader", nodes.context_loader_node)
-builder.add_node("triage", nodes.triage_node)                       
 builder.add_node("git_setup", nodes.git_setup_node)
 builder.add_node("planner", nodes.planner_node)
 builder.add_node("executor", nodes.executor_node)  # <--- HỢP NHẤT LÀM 1 NODE DUY NHẤT
@@ -51,22 +50,13 @@ builder.add_node("commit", nodes.commit_node)
 
 # Định nghĩa các Cạnh nối (Edges) và Định tuyến (Routers)
 
-builder.add_conditional_edges(
-    START,
-    routers.start_router,
-    {
-        "detect_workspace": "detect_workspace",
-        "context_loader": "context_loader"
-    }
-)
-
-builder.add_edge("detect_workspace", "context_loader")
-builder.add_edge("context_loader", "triage")
-builder.add_edge("triage", "git_setup")
+builder.add_edge(START, "detect_and_triage")
+builder.add_edge("detect_and_triage", "git_setup")
+builder.add_edge("git_setup", "context_loader")
 
 builder.add_conditional_edges(
-    "git_setup",
-    routers.git_setup_router,
+    "context_loader",
+    routers.context_loader_router,
     {
         "planner": "planner",
         "executor": "executor"

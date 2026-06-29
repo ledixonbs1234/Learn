@@ -24,13 +24,9 @@ def discovery_router(state: WorkspaceDiscoveryState) -> Literal["discovery_tool_
 # ==========================================
 # ĐỊNH TUYẾN CHO ĐỒ THỊ CHÍNH (MAIN GRAPH)
 # ==========================================
-def start_router(state: AgentState) -> Literal["detect_workspace", "context_loader"]:
-    if not state.get("workspace_path"):
-        return "detect_workspace"
-    return "context_loader"
 
 
-def git_setup_router(state: AgentState) -> Literal["planner", "executor"]:
+def context_loader_router(state: AgentState) -> Literal["planner", "executor"]:
     if state.get("plan"):
         return "executor"
     return "planner"

@@ -18,6 +18,13 @@ model = ChatOpenAI(
     model="kiro",
     temperature=0.1
 )
+fast_model = ChatOpenAI(
+    base_url="http://localhost:20128/v1",
+    api_key="khongco",  # type: ignore
+    model="kiro",
+    temperature=0.1,
+    reasoning_effort=None
+)
 
 class GitIgnoreMatcher:
     """Phân tích cú pháp .gitignore để xác định xem một đường dẫn có bị bỏ qua hay không."""

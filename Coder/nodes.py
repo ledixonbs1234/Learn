@@ -9,7 +9,7 @@ from typing import Dict, Any, Optional, Tuple, List
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
-from config import model, sanitize_and_resolve_path
+from config import model, sanitize_and_resolve_path,fast_model
 from state import AgentState, PlanUpdate, WorkspaceDetection, TaskPlan, TaskTriage, Task, WorkspaceDiscoveryState
 from tools import (
     GitManager, ReadFileLinesTool, UniversalSymbolSearchTool, WorkspaceTools, 
@@ -274,7 +274,7 @@ def get_eligible_tasks(plan: List[Any]) -> List[Any]:
 def discovery_agent_node(state: WorkspaceDiscoveryState) -> Dict[str, Any]:
     """Node trí tuệ của Subgraph: Dùng công cụ khảo sát hệ thống để khóa mục tiêu workspace."""
     discovery_tools = [get_current_working_directory, check_path_exists, find_project_root]
-    model_with_tools = model.bind_tools(discovery_tools + [WorkspaceDetection])
+    model_with_tools = fast_model.bind_tools(discovery_tools + [WorkspaceDetection])
     
     system_prompt = (
         "Bạn là một Agent chuyên nghiệp định vị thư mục làm việc (Workspace).\n"
@@ -379,7 +379,7 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
         user_msg = messages[0]
         
     user_query = user_msg.content
-    structured_llm = model.with_structured_output(TaskTriage, method="function_calling")
+    structured_llm = fast_model.with_structured_output(TaskTriage, method="function_calling")
     
     system_prompt = (
         "Bạn là một điều phối viên Agent thông minh. Hãy phân tích yêu cầu của người dùng "

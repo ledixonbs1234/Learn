@@ -1,3 +1,4 @@
+# oder/nodes.py
 import json
 import os
 import platform
@@ -221,10 +222,8 @@ def extract_path_from_text(text: str) -> Optional[str]:
     return None
 
 
-# THUẬT TOÁN TỰ ĐỘNG QUÉT DÒ TÌM THƯ MỤC CHROME EXTENSION
 def find_extension_dir_heuristic(workspace_path: Path) -> Optional[str]:
     try:
-        # Tìm tệp manifest.json đệ quy nhưng bỏ qua các thư mục rác hệ thống
         for path in workspace_path.rglob("manifest.json"):
             parts_lower = [p.lower() for p in path.parts]
             if not any(black in parts_lower for black in ["node_modules", ".venv", "venv", "env", "build", "dist", ".git"]):
@@ -234,6 +233,9 @@ def find_extension_dir_heuristic(workspace_path: Path) -> Optional[str]:
     return None
 
 
+# =====================================================================
+# TRIAGE NODE: THIẾT LẬP KẾ HOẠCH HẠT GIỐNG ĐỂ CHẠY KHẢO SÁT ĐỘNG TRƯỚC
+# =====================================================================
 def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
     messages = state["messages"]
     user_msg = None
@@ -332,7 +334,6 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         "step_findings": triage_res.get("step_findings", []),
         "is_simple": is_simple,
         "detailed_analysis": triage_res.get("detailed_analysis", ""), 
-        # Khởi tạo giá trị mặc định tránh lỗi merge state
         "extension_path": triage_res.get("extension_path", ""),
         "browser_console_logs": triage_res.get("browser_console_logs", ""),
         "messages": merged_messages
@@ -358,7 +359,7 @@ def get_eligible_tasks(plan: List[Any]) -> List[Any]:
     return eligible
 
 
-# NÂNG CẤP CONTEXT LOADER TỰ ĐỘNG PHÁT HIỆN CHROME EXTENSION
+# CONTEXT LOADER: TRẢ VỀ NGUYÊN BẢN SẠCH (ĐỂ AI TỰ DO DÙNG CÔNG CỤ KHẢO SÁT)
 def context_loader_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
     
@@ -387,13 +388,12 @@ def context_loader_node(state: AgentState) -> Dict[str, Any]:
             workspace_context = f"Lỗi khi đọc file THONGTIN.md: {str(e)}"
             context_msg = f"⚠️ Gặp sự cố khi đọc tệp `THONGTIN.md`: {str(e)}"
             
-    # TỰ ĐỘNG DÒ TÌM EXTENSION CHỨA MANIFEST.JSON TRONG DỰ ÁN
     ext_dir = find_extension_dir_heuristic(Path(ws))
     ext_msg = ""
     if ext_dir:
         ext_msg = f"\n📦 **[Tự động nhận diện Extension]**: Đã định vị thư mục Chrome Extension tại: `{ext_dir}`"
     else:
-        ext_msg = f"\n📦 **[Tự động nhận diện Extension]**: Không tìm thấy manifest.json trực tiếp trong thư mục workspace hiện hành."
+        ext_msg = f"\n📦 **[Tự động nhận diện Extension]**: Không tìm thấy manifest.json trực tiếp trong thư mục workspace."
         
     return {
         "workspace_context": workspace_context,
@@ -438,7 +438,7 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
         "   - Sửa lỗi hệ thống diện rộng (Complex Bug Fixing): Đòi hỏi phải phân tích kiến trúc, tìm kiếm ký hiệu xuyên suốt mã nguồn trước khi sửa đổi.\n"
         "   - Phân tích & Viết tài liệu tổng thể dự án: Khảo sát sâu toàn bộ workspace lớn.\n\n"
         "⚠️ QUY TẮC CHỌN TASK_TYPE (RẤT QUAN TRỌNG):\n"
-        "   - Chọn 'analysis' CHỈ KHI yêu cầu thuần túy là đọc hiểu, giải thích cấu trúc mã nguồn, dịch thuật, giải thích logic hoặc khảo sát tĩnh dự án (KHÔNG sửa đổi code, KHÔNG chạy terminal, và KHÔNG tương tác/chạy thử nghiệm trình duyệt web).\n"
+        "   - Chọn 'analysis' CHỈ KHI yêu cầu thuần túy là đọc hiểu, giải thích cấu trúc mã nguồn, dịch thuật hoặc khảo sát tĩnh dự án (KHÔNG sửa đổi code, KHÔNG chạy lệnh terminal, và KHÔNG tương tác/chạy thử nghiệm trình duyệt web).\n"
         "   - BẮT BUỘC CHỌN 'development' cho mọi trường hợp còn lại, bao gồm: Có viết/sửa code, chạy lệnh terminal, HOẶC cần khởi chạy trình duyệt web thật (Dynamic Web Testing) để nạp extension, tương tác web, kiểm tra hành vi runtime của ứng dụng."
     )
     
@@ -465,6 +465,17 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
                 status="pending"
             )
         ]
+    else:
+        # TẤC VỤ PHỨC TẠP: Khởi tạo "Kế hoạch hạt giống" (T_SURVEY) chạy ở chế độ Analysis trước!
+        plan = [
+            Task(
+                id="T_SURVEY",
+                description="Khảo sát cấu trúc thư mục, tệp cấu hình manifest.json và mã nguồn chính của dự án bằng các công cụ khảo sát để nắm vững kiến trúc trước khi lập kế hoạch.",
+                dependencies=[],
+                status="pending"
+            )
+        ]
+        task_type = "analysis" # Luôn bắt đầu bằng chế độ đọc hiểu, khảo sát tĩnh
         
     return {
         "plan": plan,
@@ -474,8 +485,8 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
         "messages": [
             AIMessage(
                 content=f"📊 **[Phân loại tác vụ]**: Hệ thống xác định yêu cầu thuộc diện "
-                        f"{'ĐƠN GIẢN (Fast-Track)' if is_simple else 'PHỨC TẠP (Multi-Step Planning)'} | "
-                        f"Pha hoạt động: `{task_type.upper()}`.\n\n"
+                        f"{'ĐƠN GIẢN (Fast-Track)' if is_simple else 'PHỨC TẠP (Multi-Step Discovery)'} | "
+                        f"Pha hoạt động khởi động: `{task_type.upper()}`.\n\n"
                         f"🎯 **[Phân tích mục tiêu]**:\n{detailed_analysis}"
             )
         ]
@@ -563,7 +574,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
     file_registry = state.get("file_registry", {})
     messages = list(state["messages"])
     task_type = state.get("task_type", "development")
-    extension_path = state.get("extension_path", "") # Lấy thông tin extension ra để truyền cho Model
+    extension_path = state.get("extension_path", "")
     
     eligible_tasks = get_eligible_tasks(plan)
     if not eligible_tasks:
@@ -642,10 +653,9 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         if workspace_context:
             system_prompt += f"\n--- TỔNG QUAN VỀ DỰ ÁN (THONGTIN.md) ---\n{workspace_context}\n"
         
-        # BÁO CHO AGENT BIẾT VỀ SỰ HIỆN DIỆN CỦA CHROME EXTENSION ĐÃ TỰ ĐỘNG NHẬN DIỆN
         if extension_path:
-            system_prompt += f"\nℹ️ **[Phát hiện Chrome Extension]**: Thư mục Extension đã được gán tại: `{extension_path}`. " \
-                             f"Khi kiểm thử trang web, hãy luôn truyền tham số `extension_path` này vào công cụ `web_interact_and_test` " \
+            system_prompt += f"\nℹ️ **[Phát hiện Chrome Extension]**: Thư mục Extension đã được định vị tại: `{extension_path}`. " \
+                             f"Khi kiểm thử động trang web, hãy luôn truyền tham số `extension_path` này vào công cụ `web_interact_and_test` " \
                              f"để trình duyệt tự động nạp Extension của bạn.\n"
 
         if registry_context_str:
@@ -704,6 +714,9 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         return {"messages": [response]}
 
 
+# =====================================================================
+# NÂNG CẤP REPLANNER: CHUYỂN HOẠT ĐỘNG TỪ PHA KHẢO SÁT SANG LẬP KẾ HOẠCH CHI TIẾT
+# =====================================================================
 def replanner_node(state: AgentState) -> Dict[str, Any]:
     replanning_count = state.get("replanning_count", 0)
     ws = state["workspace_path"]
@@ -713,7 +726,15 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
     workspace_context = state.get("workspace_context", "")
     error_logs = state.get("error_logs", "")
     
-    if replanning_count >= 5 or not error_logs:
+    # Phát hiện điểm chuyển tiếp: Nếu kế hoạch hiện thời chỉ có duy nhất 1 nhiệm vụ hạt giống khảo sát và đã chạy xong
+    is_survey_transition = (
+        len(plan) == 1 and 
+        (plan[0].id if isinstance(plan[0], Task) else plan[0].get("id")) == "T_SURVEY" and
+        (plan[0].status if isinstance(plan[0], Task) else plan[0].get("status")) == "completed"
+    )
+    
+    # 1. Nếu vượt quá giới hạn hoăc không có lỗi (và KHÔNG PHẢI trong pha chuyển tiếp khảo sát) -> Bypass
+    if replanning_count >= 5 or (not error_logs and not is_survey_transition):
         action_msg = "bypass_limit" if replanning_count >= 5 else "bypass_no_error"
         proposal_message = AIMessage(
             content=json.dumps({"action": action_msg}, ensure_ascii=False),
@@ -730,23 +751,39 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
         for t in plan
     ])
     
-    system_prompt = (
-        "Bạn là một Kiến trúc sư kiêm Điều phối viên dự án phần mềm cấp cao.\n"
-        f"Nhiệm vụ: Đánh giá tiến trình thực thi kế hoạch tại thư mục làm việc '{ws}'.\n\n"
-        "Hệ thống vừa phát hiện lỗi nghiêm trọng không thể tự gỡ lỗi ở cấp độ cục bộ.\n"
-        "Hãy đề xuất một kế hoạch điều chỉnh (được cập nhật trong updated_tasks) để giải quyết triệt để lỗi này.\n\n"
-        "⚠️ QUY TẮC CẬP NHẬT KẾ HOẠCH CHO PRODUCTION (BẮT BULC):\n"
-        "1. Đặt `should_modify_plan` là True và cập nhật danh sách nhiệm vụ trong `updated_tasks` để giải quyết vấn đề.\n"
-        "2. ĐỐI VỚI CÁC NHIỆM VỤ ĐÃ HOÀN THÀNH (status: 'completed'): Bắt buộc giữ nguyên ID, mô tả và trạng thái là 'completed'.\n"
-        "3. Kế hoạch cập nhật của bạn chỉ tập trung hoàn toàn vào các bước thực thi khảo sát vật lý (analysis) hoặc sửa đổi mã nguồn (development)."
-    )
+    # 2. Xây dựng System Prompt động dựa trên giai đoạn chuyển tiếp
+    if is_survey_transition:
+        system_prompt = (
+            "Bạn là một Kiến trúc sư kiêm Điều phối viên dự án phần mềm cấp cao.\n"
+            f"Nhiệm vụ: Dựa trên dữ liệu khảo sát và thám thính dự án vừa qua tại '{ws}' (ở các tin nhắn trước), "
+            "hãy thiết kế một lộ trình hành động (DAG updated_tasks) hoàn chỉnh để giải quyết trọn vẹn yêu cầu của người dùng.\n\n"
+            "⚠️ QUY TẮC THIẾT KẾ KẾ HOẠCH PHÁT TRIỂN & KIỂM THỬ (BẮT BUỘC):\n"
+            "1. Đặt `should_modify_plan` là True để áp dụng kế hoạch mới.\n"
+            "2. Giữ nguyên nhiệm vụ 'T_SURVEY' với trạng thái là 'completed'.\n"
+            "3. Bổ sung các nhiệm vụ mới (ví dụ: T1, T2...) mô tả chính xác các file cần xem, các file cần sửa dựa trên dữ liệu thật thu được từ pha khảo sát.\n"
+            "4. TUYỆT ĐỐI BẮT BUỘC phải lập kế hoạch cho nhiệm vụ 'Kiểm thử tích hợp động trên trình duyệt thật' sử dụng công cụ `web_interact_and_test` "
+            "để trực tiếp nạp Extension, truy cập trang web đích (ví dụ: abc.com) và xác thực hành vi của Extension làm bước cuối cùng trong kế hoạch!\n"
+            "5. Đặt `task_type` là 'development' (vì chúng ta sẽ sửa code và chạy trình duyệt kiểm thử)."
+        )
+    else:
+        system_prompt = (
+            "Bạn là một Kiến trúc sư kiêm Điều phối viên dự án phần mềm cấp cao.\n"
+            f"Nhiệm vụ: Đánh giá tiến trình thực thi kế hoạch tại thư mục làm việc '{ws}'.\n\n"
+            "Hệ thống vừa phát hiện lỗi nghiêm trọng không thể tự gỡ lỗi ở cấp độ cục bộ.\n"
+            "Hãy đề xuất một kế hoạch điều chỉnh (được cập nhật trong updated_tasks) để giải quyết triệt để lỗi này.\n\n"
+            "⚠️ QUY TẮC CẬP NHẬT KẾ HOẠCH CHO PRODUCTION (BẮT BUỘC):\n"
+            "1. Đặt `should_modify_plan` là True và cập nhật danh sách nhiệm vụ trong `updated_tasks` để giải quyết vấn đề.\n"
+            "2. ĐỐI VỚI CÁC NHIỆM VỤ ĐÃ HOÀN THÀNH (status: 'completed'): Bắt buộc giữ nguyên ID, mô tả và trạng thái là 'completed'.\n"
+            "3. Kế hoạch cập nhật của bạn chỉ tập trung hoàn toàn vào các bước thực thi khảo sát vật lý (analysis) hoặc sửa đổi mã nguồn (development)."
+        )
     
     if workspace_context:
         system_prompt += f"\n\n--- NGỮ CẢNH HỆ THỐNG (THONGTIN.md) ---\n{workspace_context}"
         
     user_prompt = f"Kế hoạch hiện tại:\n{plan_str}\n\n"
-    user_prompt += f"🚨 LỖI KIỂM BIÊN DỊCH CẦN SỬA ĐỔI KẾ HOẠCH:\n{error_logs}\n\n"
-    user_prompt += "Hãy đưa ra phân tích và cập nhật kế hoạch phù hợp thông qua cuộc gọi hàm."
+    if error_logs:
+        user_prompt += f"🚨 LỖI BIÊN DỊCH CẦN SỬA ĐỔI KẾ HOẠCH:\n{error_logs}\n\n"
+    user_prompt += "Hãy đưa ra phân tích và đề xuất cập nhật kế hoạch phù hợp thông qua cuộc gọi hàm."
     
     structured_llm = model.with_structured_output(PlanUpdate, method="function_calling")
     
@@ -797,7 +834,7 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
         )
         
         explanation_message = AIMessage(
-            content=f"🔄 **[Đề xuất điều chỉnh lộ trình của AI]**\n\n{explanation}\n\nHệ thống đang chờ bạn phê duyệt hoặc tinh chỉnh..."
+            content=f"🔄 **[Đề xuất lộ trình hành động dựa trên kết quả khảo sát]**\n\n{explanation}\n\nHệ thống đang chờ bạn phê duyệt hoặc tinh chỉnh..."
         )
         
         return {

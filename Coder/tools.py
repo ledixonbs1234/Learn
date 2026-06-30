@@ -1,6 +1,6 @@
 # tools.py
+import base64
 import json
-from logging import config
 import subprocess
 import re
 from pathlib import Path
@@ -10,6 +10,9 @@ from langchain_core.tools import BaseTool, tool
 from config import GitIgnoreMatcher, find_project_root_heuristic, sanitize_and_resolve_path
 from browser_subgraph import web_subgraph
 from langchain_core.callbacks import CallbackManagerForToolRun
+from langchain_core.messages import ToolMessage
+
+import config
 # ==========================================
 # CÁC HÀM TIỆN ÍCH HỖ TRỢ ĐỊNH DẠNG MARKDOWN
 # ==========================================
@@ -736,9 +739,17 @@ class WebInteractAndTestTool(BaseTool):
     args_schema: Type[BaseModel] = WebInteractSchema
     workspace_path: str
 
-    def _run(self, url: str, action_type: str, target_description: str, js_code_to_test: Optional[str] = None,run_manager: Optional[CallbackManagerForToolRun] = None) -> str:
-        # Thiết lập input cho Subgraph
+    def _run(
+        self, 
+        url: str, 
+        action_type: str, 
+        target_description: str, 
+        js_code_to_test: Optional[str] = None, 
+        run_manager: Optional[CallbackManagerForToolRun] = None
+    ) -> str:
+        # Thiết lập đầu vào cho Subgraph
         sub_input = {
+            "workspace_path": self.workspace_path,
             "url": url,
             "action_type": action_type,
             "target_description": target_description,
@@ -747,24 +758,51 @@ class WebInteractAndTestTool(BaseTool):
         }
         
         try:
-            # Gọi Subgraph chạy hoàn toàn đồng bộ
-            output = web_subgraph.invoke(sub_input)
+            # GIẢI PHÁP: Khởi tạo biến cấu hình là một dictionary cục bộ riêng biệt 
+            # để tránh hoàn toàn xung đột với module 'config' hệ thống
+            run_config = {}
             if run_manager:
-                config["callbacks"] = run_manager.get_child()
-            output = web_subgraph.invoke(sub_input, config=config)
+                run_config["callbacks"] = run_manager.get_child()
+            
+            # TỐI ƯU HÓA: Chỉ gọi invoke một lần duy nhất để khởi động trình duyệt đúng một lần
+            output = web_subgraph.invoke(sub_input, config=run_config)
+            
             if output.get("error"):
                 return f"❌ [Thất bại] Gặp sự cố trong quá trình xử lý: {output['error']}"
                 
+            current_tool_call_id = run_manager.get_child().parent_run_id if run_manager else "temporary_id"
+
             if action_type == "explore":
                 sel = output.get("detected_selectors", {})
-                return (
+                screenshot_path = output.get("screenshot_path")
+                
+                text_content = (
                     f"✅ [Thành công] Đã định vị xong phần tử mục tiêu:\n"
                     f"- **Tag Name:** `{sel.get('tagName')}`\n"
-                    f"- **Selector khuyến nghị:** `{sel.get('proposed_selector')}`\n"
+                    f"- **Selector khuyến nghị:** `{sel.get('selector')}`\n"
                     f"- **Văn bản hiển thị:** '{sel.get('text')}'\n"
                     f"- **Aria-Label:** '{sel.get('aria_label')}'\n"
-                    f"👉 Hãy sử dụng selector này để xây dựng kịch bản điều khiển cho Chrome Extension."
                 )
+                
+                # Nếu có ảnh chụp màn hình thực tế, đóng gói đa phương thức
+                if screenshot_path and Path(screenshot_path).exists():
+                    try:
+                        base64_image = encode_image_to_base64(screenshot_path)
+                        # Đóng gói ToolMessage trực tiếp để gửi trả ảnh về luồng State của Graph
+                        return ToolMessage(
+                            tool_call_id=current_tool_call_id, # Phải trùng khớp với ID của cuộc gọi hiện tại
+                            content=[
+                                {"type": "text", "text": text_content},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:image/png;base64,{base64_image}"}
+                                }
+                            ]
+                        )
+                    except Exception as img_err:
+                        text_content += f"\n⚠️ Không thể tải ảnh lên Agent: {str(img_err)}"
+                
+                return text_content
                 
             elif action_type == "test_js":
                 state_after = output.get("dom_state_after", {})
@@ -777,6 +815,11 @@ class WebInteractAndTestTool(BaseTool):
                 )
         except Exception as e:
             return f"❌ Lỗi hệ thống khi kích hoạt Web Subgraph: {str(e)}"
+        
+        
+def encode_image_to_base64(image_path: str) -> str:
+    with open(image_path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode('utf-8')
 # ==========================================
 # TÁI CẤU TRÚC LỚP QUẢN LÝ THAO TÁC WORKSPACE
 # ==========================================

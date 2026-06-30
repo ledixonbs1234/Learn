@@ -101,6 +101,7 @@ class AgentState(TypedDict):
     
 
 class WebInteractionState(TypedDict):
+    workspace_path: str 
     url: str
     action_type: Literal["explore", "test_js"]
     target_description: str

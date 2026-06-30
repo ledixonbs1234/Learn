@@ -1,5 +1,6 @@
 # browser_subgraph.py
 import os
+from pathlib import Path
 from typing import Dict, Any, Literal
 # Thay đổi quan trọng: Sử dụng launch của cloakbrowser thay cho sync_playwright
 from cloakbrowser import launch 
@@ -72,13 +73,14 @@ SOM_SCRIPT = """
 """
 
 def run_browser_session_sync(state: WebInteractionState) -> Dict[str, Any]:
+    workspace = state.get("workspace_path", ".") 
     url = state["url"]
     action_type = state["action_type"]
     target_desc = state["target_description"]
     js_code = state.get("js_code_to_test")
     
     screenshot_name = "web_marked_som.png"
-    screenshot_path = os.path.abspath(screenshot_name)
+    screenshot_path = str(Path(workspace).resolve() / screenshot_name)
     
     result = {
         "detected_selectors": None,
@@ -102,7 +104,7 @@ def run_browser_session_sync(state: WebInteractionState) -> Dict[str, Any]:
         page = browser.new_page()
         
         try:
-            page.goto(url, wait_until="networkidle", timeout=25000)
+            page.goto(url, wait_until="networkidle", timeout=5000)
             
             if action_type == "explore":
                 # Vẽ nhãn SoM lên trang web
@@ -127,11 +129,14 @@ def run_browser_session_sync(state: WebInteractionState) -> Dict[str, Any]:
                 ])
                 
                 selected_id = response.selected_id
-                if selected_id in registry:
-                    result["detected_selectors"] = registry[selected_id]
+                # Chuyển đổi ID sang kiểu chuỗi để khớp với khóa của registry nhận từ JS
+                selected_id_str = str(selected_id) 
+                
+                if selected_id_str in registry:
+                    result["detected_selectors"] = registry[selected_id_str]
                     result["screenshot_path"] = screenshot_path
                 else:
-                    result["error"] = f"LLM chọn ID {selected_id} không tồn tại trong Registry."
+                    result["error"] = f"LLM chọn ID {selected_id} (chuỗi: '{selected_id_str}') không tồn tại trong Registry. Các khóa hiện có: {list(registry.keys())}"
                     
             elif action_type == "test_js" and js_code:
                 # Chạy thử nghiệm mã Javascript điều khiển

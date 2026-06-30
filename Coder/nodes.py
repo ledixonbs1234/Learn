@@ -11,12 +11,11 @@ from concurrent.futures import ThreadPoolExecutor
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 from config import find_project_root_heuristic, model, sanitize_and_resolve_path, fast_model
-from state import AgentState, PlanUpdate, WorkspaceDetection, TaskPlan, TaskTriage, Task
+from state import AgentState, PlanUpdate, TaskPlan, TaskTriage, Task
 from tools import (
     GitManager, ReadFileLinesTool, UniversalSymbolSearchTool, WebInteractAndTestTool, WorkspaceTools, 
     ReadFilesTool, WriteFileTool, ApplyPatchTool, 
-    ListDirectoryTool, RunTerminalTool,
-    get_current_working_directory, check_path_exists, find_project_root, get_markdown_language
+    ListDirectoryTool, RunTerminalTool, get_markdown_language
 )
 def get_text_content_safely(content: Any) -> str:
     """
@@ -270,7 +269,7 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
             "modified_files": [],     
             "error_logs": "",         
             "step_findings": [],      
-            "is_simple": False
+            "is_simple": True
         }
         
     is_simple = triage_res.get("is_simple", False)
@@ -438,7 +437,29 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
     except Exception:
         is_simple = False
         task_type = "development"
-
+    plan = []
+    if is_simple:
+        plan = [
+            Task(
+                id="T1",
+                description=f"Thực hiện trực tiếp yêu cầu: {user_query_text}",
+                dependencies=[],
+                status="pending"
+            )
+        ]
+        
+    return {
+        "plan": plan,  # Gán kế hoạch đơn bước thay vì danh sách rỗng
+        "task_type": task_type,
+        "is_simple": is_simple,
+        "messages": [
+            AIMessage(
+                content=f"📊 **[Phân loại tác vụ]**: Hệ thống xác định yêu cầu thuộc diện "
+                        f"{'ĐƠN GIẢN (Fast-Track)' if is_simple else 'PHỨC TẠP (Multi-Step Planning)'} | "
+                        f"Pha hoạt động: `{task_type.upper()}`."
+            )
+        ]
+    }
 
 def planner_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
@@ -605,7 +626,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         system_prompt += (
             "\n⚠️ QUY TẮC PHẠM VI VÀ PHÒNG TRÁNH LỆCH DÒNG (BẮT BUỘC):\n"
             "1. Bạn đã được cung cấp nguồn mã nguồn mới nhất (đã đánh số dòng chi tiết) trong mục 'SINGLE SOURCE OF TRUTH' ở trên.\n"
-            "2. ĐÂY LÀ NỘI DUNG MỚI NHẤT VÀ CHÍNA XÁC NHẤT. Hãy luôn sử dụng mốc dòng và nội dung từ mục này để thiết lập khối SEARCH-AND-REPLACE cho công cụ `apply_search_replace_patch`.\n"
+            "2. ĐÂY LÀ NỘI DUNG MỚI NHẤT VÀ CHÍNH XÁC NHẤT. Hãy luôn sử dụng mốc dòng và nội dung từ mục này để thiết lập khối SEARCH-AND-REPLACE cho công cụ `apply_search_replace_patch`.\n"
             "3. Nếu bạn vừa sửa đổi một file ở bước trước, nội dung file đó trong mục 'SINGLE SOURCE OF TRUTH' đã được cập nhật tự động. Bạn không cần phải gọi lại công cụ đọc trừ khi muốn kiểm tra sâu hơn.\n"
             "\n⚠️ QUY TẮC SỬ DỤNG CÔNG CỤ:\n"
             "1. Đối với file trên 300 dòng: BẮT BUỘC dùng `apply_search_replace_patch` để áp dụng bản vá, cấm ghi đè bừa bãi.\n"

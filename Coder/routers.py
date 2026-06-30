@@ -8,7 +8,8 @@ from state import AgentState, Task
 # ==========================================
 
 def context_loader_router(state: AgentState) -> Literal["planner", "executor"]:
-    if state.get("plan"):
+    # Nếu là tác vụ đơn giản (Fast-Track) HOẶC đã có sẵn kế hoạch từ trước, chuyển thẳng sang Executor
+    if state.get("is_simple") or state.get("plan"):
         return "executor"
     return "planner"
 

@@ -1,7 +1,11 @@
 # browser_subgraph.py
 import os
+import atexit
+import tempfile
+import uuid
 from pathlib import Path
-from typing import Dict, Any, Literal
+from typing import Dict, Any, Literal, Optional
+from urllib.parse import urlparse
 # Thay đổi quan trọng: Sử dụng launch của cloakbrowser thay cho sync_playwright
 from cloakbrowser import launch 
 from langgraph.graph import StateGraph, START, END
@@ -72,6 +76,67 @@ SOM_SCRIPT = """
 }
 """
 
+
+class BrowserSessionManager:
+    """
+    Quản lý vòng đời của các phiên trình duyệt CloakBrowser.
+    Duy trì kết nối Browser và Page liên tục theo từng workspace nhằm bảo toàn Cookies, Session và trạng thái DOM.
+    """
+    _sessions: Dict[str, Dict[str, Any]] = {}
+
+    @classmethod
+    def get_or_create_page(cls, workspace_path: str) -> tuple:
+        """
+        Lấy ra browser và page đang hoạt động hoặc khởi chạy mới nếu chưa có.
+        Trả về tuple: (browser_instance, page_instance, was_reused)
+        """
+        ws_resolved = str(Path(workspace_path).resolve())
+        
+        if ws_resolved in cls._sessions:
+            session = cls._sessions[ws_resolved]
+            try:
+                # Kiểm tra kết nối đến page hoạt động ổn định
+                _ = session["page"].url
+                return session["browser"], session["page"], True
+            except Exception:
+                cls.close_session(ws_resolved)
+
+        # Khởi chạy một trình duyệt CloakBrowser mới
+        browser = launch(
+            headless=False,       # Đặt False để hiển thị trực quan trên localhost
+            humanize=True,        # Giả lập hành vi con người chống bot
+            geoip=True            # Đồng bộ hóa múi giờ và locale
+        )
+        page = browser.new_page()
+        
+        cls._sessions[ws_resolved] = {
+            "browser": browser,
+            "page": page
+        }
+        return browser, page, False
+
+    @classmethod
+    def close_session(cls, workspace_path: str):
+        """Đóng phiên trình duyệt tương ứng với workspace cụ thể."""
+        ws_resolved = str(Path(workspace_path).resolve())
+        if ws_resolved in cls._sessions:
+            session = cls._sessions[ws_resolved]
+            try:
+                session["browser"].close()
+            except Exception:
+                pass
+            del cls._sessions[ws_resolved]
+
+    @classmethod
+    def close_all(cls):
+        """Dọn dẹp toàn bộ trình duyệt đang chạy trong bộ nhớ."""
+        for ws in list(cls._sessions.keys()):
+            cls.close_session(ws)
+
+# Đăng ký đóng trình duyệt an toàn khi tiến trình python bị tắt đột ngột
+atexit.register(BrowserSessionManager.close_all)
+
+
 def run_browser_session_sync(state: WebInteractionState) -> Dict[str, Any]:
     workspace = state.get("workspace_path", ".") 
     url = state["url"]
@@ -79,8 +144,14 @@ def run_browser_session_sync(state: WebInteractionState) -> Dict[str, Any]:
     target_desc = state["target_description"]
     js_code = state.get("js_code_to_test")
     
-    screenshot_name = "web_marked_som.png"
-    screenshot_path = str(Path(workspace).resolve() / screenshot_name)
+    # GIẢI PHÁP: Lưu trữ tệp tin tạm trong thư mục tạm của Hệ điều hành thay vì Workspace
+    temp_dir = Path(tempfile.gettempdir()) / "ai_agent_browser_sessions"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Tạo tên ảnh duy nhất theo từng phiên chạy để tránh xung đột ghi đè
+    unique_id = str(uuid.uuid4())[:8]
+    screenshot_name = f"web_som_{unique_id}.png"
+    screenshot_path = str(temp_dir / screenshot_name)
     
     result = {
         "detected_selectors": None,
@@ -90,21 +161,25 @@ def run_browser_session_sync(state: WebInteractionState) -> Dict[str, Any]:
         "error": None
     }
     
-    # KHỞI CHẠY CLOAKBROWSER THAY THẾ CHO PLAYWRIGHT
-    # Bật chế độ 'humanize=True' để mô phỏng chính xác hành vi di chuột, cuộn trang của con người.
-    # Đặt headless=False (nếu muốn quan sát trực quan trên localhost) hoặc headless=True tùy nhu cầu của bạn.
     try:
-        browser = launch(
-            headless=False,       # Đặt False để trình duyệt hiện lên trực quan trên máy của bạn
-            humanize=True,        # Kích hoạt giả lập hành vi con người cấp độ C++
-            geoip=True            # Tự động đồng bộ hóa múi giờ và locale phù hợp
-        )
-        
-        # Tạo trang mới giống hệt như API chuẩn của Playwright
-        page = browser.new_page()
+        # Lấy phiên trình duyệt hiện tại từ Manager dựa trên workspace làm định danh
+        browser, page, reused = BrowserSessionManager.get_or_create_page(workspace)
         
         try:
-            page.goto(url, wait_until="networkidle", timeout=5000)
+            # QUY TẮC ĐIỀU HƯỚNG THÔNG MINH (SMART NAVIGATION)
+            should_navigate = not reused
+            if reused:
+                # Nếu tái sử dụng, chỉ tải lại trang khi domain của URL đích khác với trang hiện thời.
+                try:
+                    current_parsed = urlparse(page.url)
+                    target_parsed = urlparse(url)
+                    if current_parsed.netloc != target_parsed.netloc:
+                        should_navigate = True
+                except Exception:
+                    should_navigate = True
+            
+            if should_navigate:
+                page.goto(url, wait_until="networkidle", timeout=15000)
             
             if action_type == "explore":
                 # Vẽ nhãn SoM lên trang web
@@ -129,7 +204,6 @@ def run_browser_session_sync(state: WebInteractionState) -> Dict[str, Any]:
                 ])
                 
                 selected_id = response.selected_id
-                # Chuyển đổi ID sang kiểu chuỗi để khớp với khóa của registry nhận từ JS
                 selected_id_str = str(selected_id) 
                 
                 if selected_id_str in registry:
@@ -158,12 +232,9 @@ def run_browser_session_sync(state: WebInteractionState) -> Dict[str, Any]:
                     
         except Exception as run_err:
             result["error"] = f"Sự cố tương tác trang web: {str(run_err)}"
-        finally:
-            # Đóng trình duyệt CloakBrowser sau khi xử lý xong
-            browser.close()
             
     except Exception as launch_err:
-        result["error"] = f"Không thể khởi chạy CloakBrowser: {str(launch_err)}"
+        result["error"] = f"Không thể lấy hoặc khởi chạy CloakBrowser: {str(launch_err)}"
         
     return result
 

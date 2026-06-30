@@ -238,27 +238,21 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
             
     user_query_text = get_text_content_safely(user_msg.content) if user_msg else ""
     
-    # 1. PHÂN TÍCH TĨNH: Tìm kiếm đường dẫn vật lý trong yêu cầu (KHÔNG dùng AI)
     detected_path_str = extract_path_from_text(user_query_text)
     
     workspace_path = None
     is_fallback_workspace = False
     
     if detected_path_str:
-        # Nếu tìm thấy đường dẫn cụ thể -> Xác định gốc dự án một cách tự động
         start_path = Path(detected_path_str)
         resolved_root = find_project_root_heuristic(start_path)
         workspace_path = str(resolved_root)
     else:
-        # Nếu KHÔNG tìm thấy, hoãn việc thiết lập đường dẫn và đánh dấu chế độ Fallback
         is_fallback_workspace = True
-        # Gán tạm thời là thư mục hiện tại để phục vụ chạy phân loại trước
         workspace_path = state.get("workspace_path", ".")
         
-    # 2. CHẠY PHÂN LOẠI TRƯỚC (Triage) để hiểu bản chất của tác vụ
     triage_res = triage_node(state)
     
-    # Cơ chế phòng vệ (Defensive programming): Đảm bảo triage_res luôn hợp lệ
     if triage_res is None:
         triage_res = {
             "plan": [],
@@ -269,18 +263,16 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
             "modified_files": [],     
             "error_logs": "",         
             "step_findings": [],      
-            "is_simple": True
+            "is_simple": True,
+            "detailed_analysis": "" # Thiết lập mặc định nếu lỗi
         }
         
     is_simple = triage_res.get("is_simple", False)
     
-    # 3. ĐIỀU CHỈNH WORKSPACE DỰA TRÊN KẾT QUẢ PHÂN LOẠI
     if is_fallback_workspace:
         base_path = Path(workspace_path).resolve()
         
-        # Nếu là tác vụ đơn giản/hướng ngoại (như web automation hoặc terminal độc lập)
         if is_simple:
-            # Chỉ cần khởi tạo và gán thư mục Sandbox "temp/" cách ly, không cần quét toàn bộ mã nguồn làm gì
             temp_dir = base_path / "temp"
             if temp_dir.exists():
                 try:
@@ -290,7 +282,6 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
             temp_dir.mkdir(parents=True, exist_ok=True)
             workspace_path = str(temp_dir)
             
-            # Thêm temp/ vào .gitignore của thư mục chạy để tránh làm bẩn git dự án lớn
             try:
                 root_gitignore = base_path / ".gitignore"
                 if root_gitignore.exists():
@@ -303,12 +294,9 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
             except Exception:
                 pass
         else:
-            # Nếu là tác vụ lập trình phức tạp nhưng người dùng quên chỉ định đường dẫn
-            # Tự động gán gốc dự án mặc định tại Project Root của thư mục hiện tại
             resolved_root = find_project_root_heuristic(base_path)
             workspace_path = str(resolved_root)
             
-    # 4. CHUẨN BỊ TIN NHẮN HIỂN THỊ TRỰC QUAN
     detect_messages = []
     if is_fallback_workspace:
         if is_simple:
@@ -336,6 +324,7 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         "error_logs": triage_res.get("error_logs", ""),
         "step_findings": triage_res.get("step_findings", []),
         "is_simple": is_simple,
+        "detailed_analysis": triage_res.get("detailed_analysis", ""), # Đồng bộ hóa vào đồ thị chính
         "messages": merged_messages
     }
 
@@ -409,19 +398,25 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
     
     structured_llm = fast_model.with_structured_output(TaskTriage, method="function_calling")
     
+    # Cập nhật System Prompt yêu cầu AI tập trung phân tích sâu sắc mục đích của người dùng
     system_prompt = (
         "Bạn là một điều phối viên Agent thông minh cấp cao (Triage Supervisor).\n"
         "Nhiệm vụ của bạn là phân tích yêu cầu của người dùng để xác định xem yêu cầu đó nên được xử lý qua luồng Fast-Track (Đơn giản) hay luồng Lập kế hoạch (Phức tạp).\n\n"
-        "Hãy dựa trên các tiêu chí phân loại nghiêm ngặt sau:\n\n"
+        "Đồng thời, hãy viết một bản phân tích chi tiết vào thuộc tính 'detailed_analysis' để định hướng cho các Agent ở các bước sau. Bản phân tích này cần làm rõ:\n"
+        "1. Mục tiêu cốt lõi cuối cùng người dùng muốn đạt được.\n"
+        "2. Các tệp tin, thư mục hoặc phân hệ mã nguồn cụ thể có thể sẽ bị tác động hoặc cần đọc/sửa đổi.\n"
+        "3. Các ràng buộc về logic kỹ thuật, ngôn ngữ lập trình, hoặc các trường hợp biên cần lưu ý.\n"
+        "4. Gợi ý sơ bộ về phương pháp thực hiện tối ưu.\n\n"
+        "Hãy dựa trên các tiêu chí phân loại nghiêm ngặt sau để phân loại:\n\n"
         "1. KIỂM TRA TÁC VỤ ĐƠN GIẢN (is_simple = True):\n"
-        "   - Tương tác Web trực tiếp: Các yêu cầu truy cập website, nhấp nút, điền form, chụp ảnh màn hình hoặc chạy thử JS trên một trang cụ thể (ví dụ: 'vào trang web abc.com và nhấn...', 'chụp màn hình web...'). Các tác vụ này có thể thực thi trực tiếp bằng công cụ 'web_interact_and_test' mà không cần lập kế hoạch viết mã nguồn.\n"
+        "   - Tương tác Web trực tiếp: Các yêu cầu truy cập website, nhấp nút, điền form, chụp ảnh màn hình hoặc chạy thử JS trên một trang cụ thể (ví dụ: 'vào trang web abc.com và nhấn...').\n"
         "   - Khảo sát hệ thống đơn giản: Đọc nội dung 1-2 tệp tin cụ thể, liệt kê thư mục, hoặc tìm kiếm symbol.\n"
-        "   - Thực thi Terminal trực tiếp: Chạy một lệnh terminal đơn lẻ (ví dụ: kiểm tra phiên bản, chạy thử một tệp tin script có sẵn).\n"
+        "   - Thực thi Terminal trực tiếp: Chạy một lệnh terminal đơn lẻ.\n"
         "   - Chỉnh sửa nhỏ: Sửa đổi nhanh chỉ một vài dòng mã hoặc ghi đè một tệp tin ngắn dưới 100 dòng.\n\n"
         "2. KIỂM TRA TÁC VỤ PHỨC TẠP (is_simple = False):\n"
         "   - Phát triển tính năng mới (Feature Development): Yêu cầu viết mới hoặc can thiệp chỉnh sửa logic phức tạp trên nhiều tệp tin nguồn khác nhau.\n"
-        "   - Sửa lỗi hệ thống diện rộng (Complex Bug Fixing): Đòi hỏi phải phân tích kiến trúc, tìm kiếm ký hiệu xuyên suốt mã nguồn trước khi đưa ra phương án sửa đổi.\n"
-        "   - Phân tích & Viết tài liệu tổng thể dự án: Khảo sát sâu toàn bộ workspace lớn để viết báo cáo kỹ thuật (chọn task_type = 'analysis').\n\n"
+        "   - Sửa lỗi hệ thống diện rộng (Complex Bug Fixing): Đòi hỏi phải phân tích kiến trúc, tìm kiếm ký hiệu xuyên suốt mã nguồn trước khi sửa đổi.\n"
+        "   - Phân tích & Viết tài liệu tổng thể dự án: Khảo sát sâu toàn bộ workspace lớn.\n\n"
         "QUY TẮC CHỌN TASK_TYPE:\n"
         "   - Chọn 'analysis' nếu yêu cầu thuần túy chỉ là đọc hiểu, giải thích cấu trúc mã nguồn hoặc khảo sát dự án (không viết/sửa code trên ổ đĩa).\n"
         "   - Chọn 'development' cho các trường hợp còn lại (có viết code, sửa code, chạy terminal, hoặc tương tác trình duyệt web)."
@@ -434,9 +429,12 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
         ])
         is_simple = getattr(triage_output, "is_simple", False)
         task_type = getattr(triage_output, "task_type", "development")
+        detailed_analysis = getattr(triage_output, "detailed_analysis", "") # Lấy thông tin phân tích
     except Exception:
         is_simple = False
         task_type = "development"
+        detailed_analysis = "Không thể phân tích tự động mục tiêu yêu cầu của người dùng."
+
     plan = []
     if is_simple:
         plan = [
@@ -449,17 +447,22 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
         ]
         
     return {
-        "plan": plan,  # Gán kế hoạch đơn bước thay vì danh sách rỗng
+        "plan": plan,
         "task_type": task_type,
         "is_simple": is_simple,
+        "detailed_analysis": detailed_analysis, # Chuyển tiếp ra đồ thị
         "messages": [
             AIMessage(
                 content=f"📊 **[Phân loại tác vụ]**: Hệ thống xác định yêu cầu thuộc diện "
                         f"{'ĐƠN GIẢN (Fast-Track)' if is_simple else 'PHỨC TẠP (Multi-Step Planning)'} | "
-                        f"Pha hoạt động: `{task_type.upper()}`."
+                        f"Pha hoạt động: `{task_type.upper()}`.\n\n"
+                        f"🎯 **[Phân tích mục tiêu]**:\n{detailed_analysis}"
             )
         ]
     }
+
+
+
 
 def planner_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]

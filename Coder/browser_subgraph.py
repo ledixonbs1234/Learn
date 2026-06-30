@@ -6,8 +6,8 @@ import uuid
 from pathlib import Path
 from typing import Dict, Any, Literal, Optional
 from urllib.parse import urlparse
-# Thay đổi quan trọng: Sử dụng launch của cloakbrowser thay cho sync_playwright
-from cloakbrowser import launch 
+# Sử dụng launch_persistent_context để lưu trữ hồ sơ và trạng thái phiên duyệt web
+from cloakbrowser import launch_persistent_context 
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import SystemMessage, HumanMessage
 from pydantic import BaseModel, Field
@@ -80,15 +80,15 @@ SOM_SCRIPT = """
 class BrowserSessionManager:
     """
     Quản lý vòng đời của các phiên trình duyệt CloakBrowser.
-    Duy trì kết nối Browser và Page liên tục theo từng workspace nhằm bảo toàn Cookies, Session và trạng thái DOM.
+    Duy trì kết nối BrowserContext và Page liên tục theo từng workspace nhằm bảo toàn Cookies, Session và trạng thái DOM.
     """
     _sessions: Dict[str, Dict[str, Any]] = {}
 
     @classmethod
     def get_or_create_page(cls, workspace_path: str) -> tuple:
         """
-        Lấy ra browser và page đang hoạt động hoặc khởi chạy mới nếu chưa có.
-        Trả về tuple: (browser_instance, page_instance, was_reused)
+        Lấy ra context và page đang hoạt động hoặc khởi chạy mới nếu chưa có.
+        Trả về tuple: (context_instance, page_instance, was_reused)
         """
         ws_resolved = str(Path(workspace_path).resolve())
         
@@ -97,23 +97,34 @@ class BrowserSessionManager:
             try:
                 # Kiểm tra kết nối đến page hoạt động ổn định
                 _ = session["page"].url
-                return session["browser"], session["page"], True
+                return session["context"], session["page"], True
             except Exception:
                 cls.close_session(ws_resolved)
 
-        # Khởi chạy một trình duyệt CloakBrowser mới
-        browser = launch(
+        # Tạo mã băm ổn định cho từng workspace để tránh xung đột
+        profile_id = uuid.uuid5(uuid.NAMESPACE_URL, ws_resolved).hex
+        
+        # Đường dẫn lưu trữ được chỉ định vào thư mục cá nhân của User hiện hành (.cloak_profiles)
+        # Trên Windows, đường dẫn này sẽ có dạng C:\\Users\\Tên_User\\.cloak_profiles\\<profile_id>
+        profile_dir = Path.home() / ".cloak_profiles" / profile_id
+        profile_dir.mkdir(parents=True, exist_ok=True)
+
+        # Khởi chạy một trình duyệt CloakBrowser mới dưới dạng Persistent Context
+        context = launch_persistent_context(
+            user_data_dir=str(profile_dir),
             headless=False,       # Đặt False để hiển thị trực quan trên localhost
             humanize=True,        # Giả lập hành vi con người chống bot
             geoip=True            # Đồng bộ hóa múi giờ và locale
         )
-        page = browser.new_page()
+        
+        # Sử dụng trang đầu tiên của context nếu đã được khởi tạo tự động, tránh mở tab trống thứ hai
+        page = context.pages[0] if context.pages else context.new_page()
         
         cls._sessions[ws_resolved] = {
-            "browser": browser,
+            "context": context,
             "page": page
         }
-        return browser, page, False
+        return context, page, False
 
     @classmethod
     def close_session(cls, workspace_path: str):
@@ -122,7 +133,7 @@ class BrowserSessionManager:
         if ws_resolved in cls._sessions:
             session = cls._sessions[ws_resolved]
             try:
-                session["browser"].close()
+                session["context"].close()
             except Exception:
                 pass
             del cls._sessions[ws_resolved]
@@ -144,7 +155,7 @@ def run_browser_session_sync(state: WebInteractionState) -> Dict[str, Any]:
     target_desc = state["target_description"]
     js_code = state.get("js_code_to_test")
     
-    # GIẢI PHÁP: Lưu trữ tệp tin tạm trong thư mục tạm của Hệ điều hành thay vì Workspace
+    # Lưu trữ tệp tin tạm trong thư mục tạm của Hệ điều hành thay vì Workspace
     temp_dir = Path(tempfile.gettempdir()) / "ai_agent_browser_sessions"
     temp_dir.mkdir(parents=True, exist_ok=True)
     
@@ -163,7 +174,7 @@ def run_browser_session_sync(state: WebInteractionState) -> Dict[str, Any]:
     
     try:
         # Lấy phiên trình duyệt hiện tại từ Manager dựa trên workspace làm định danh
-        browser, page, reused = BrowserSessionManager.get_or_create_page(workspace)
+        context, page, reused = BrowserSessionManager.get_or_create_page(workspace)
         
         try:
             # QUY TẮC ĐIỀU HƯỚNG THÔNG MINH (SMART NAVIGATION)

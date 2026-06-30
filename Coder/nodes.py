@@ -233,9 +233,6 @@ def find_extension_dir_heuristic(workspace_path: Path) -> Optional[str]:
     return None
 
 
-# =====================================================================
-# TRIAGE NODE: THIẾT LẬP KẾ HOẠCH HẠT GIỐNG ĐỂ CHẠY KHẢO SÁT ĐỘNG TRƯỚC
-# =====================================================================
 def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
     messages = state["messages"]
     user_msg = None
@@ -359,7 +356,6 @@ def get_eligible_tasks(plan: List[Any]) -> List[Any]:
     return eligible
 
 
-# CONTEXT LOADER: TRẢ VỀ NGUYÊN BẢN SẠCH (ĐỂ AI TỰ DO DÙNG CÔNG CỤ KHẢO SÁT)
 def context_loader_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
     
@@ -425,7 +421,7 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
         "Đồng thời, hãy viết một bản phân tích chi tiết vào thuộc tính 'detailed_analysis' để định hướng cho các Agent ở các bước sau. Bản phân tích này cần làm rõ:\n"
         "1. Mục tiêu cốt lõi cuối cùng người dùng muốn đạt được.\n"
         "2. Các tệp tin, thư mục hoặc phân hệ mã nguồn cụ thể có thể sẽ bị tác động hoặc cần đọc/sửa đổi.\n"
-        "3. Các ràng buộc về logic kỹ thuật, ngôn ngữ lập trình, hoặc các trường hợp biên cần lưu ý.\n"
+        "3. Các ràng buộc về logic kỹ thuật, ngôn ngữ trình bày, hoặc các trường hợp biên cần lưu ý.\n"
         "4. Gợi ý sơ bộ về phương pháp thực hiện tối ưu.\n\n"
         "Hãy dựa trên các tiêu chí phân loại nghiêm ngặt sau để phân loại:\n\n"
         "1. KIỂM TRA TÁC VỤ ĐƠN GIẢN (is_simple = True):\n"
@@ -466,7 +462,6 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
             )
         ]
     else:
-        # TẤC VỤ PHỨC TẠP: Khởi tạo "Kế hoạch hạt giống" (T_SURVEY) chạy ở chế độ Analysis trước!
         plan = [
             Task(
                 id="T_SURVEY",
@@ -475,7 +470,7 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
                 status="pending"
             )
         ]
-        task_type = "analysis" # Luôn bắt đầu bằng chế độ đọc hiểu, khảo sát tĩnh
+        task_type = "analysis" 
         
     return {
         "plan": plan,
@@ -490,79 +485,6 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
                         f"🎯 **[Phân tích mục tiêu]**:\n{detailed_analysis}"
             )
         ]
-    }
-
-
-def planner_node(state: AgentState) -> Dict[str, Any]:
-    ws = state["workspace_path"]
-    conversation_history = state["messages"]
-    existing_plan = state.get("plan", [])
-    workspace_context = state.get("workspace_context", "")
-    
-    if existing_plan:
-        return {
-            "modified_files": [],
-            "attempts": 0,
-            "step_findings": ["__RESET__"],
-            "last_executed_task_ids": []
-        }
-    
-    structured_llm = model.with_structured_output(TaskPlan, method="function_calling")
-    
-    system_prompt = (
-        "Bạn là một Kiến trúc sư phần mềm cấp cao. Hãy lập hoặc cập nhật kế hoạch thực hiện "
-        f"cho dự án nằm trong thư mục '{ws}'.\n"
-    )
-    if workspace_context:
-        system_prompt += f"\n--- NGỮ CẢNH HỆ THỐNG HIỆN TẠI (THONGTIN.md) ---\n{workspace_context}\n"
-        
-    system_prompt += (
-        "Hãy phân tích kỹ lượng toàn bộ lịch sử trò chuyện để sinh ra kế hoạch dạng Đồ thị phụ thuộc (DAG).\n"
-        "QUY TẮC QUAN TRỌNG VỀ PHỤ THUỘC (DEPENDENCIES):\n"
-        "- Thiết lập `dependencies` của từng nhiệm vụ chính xác để cho phép chạy song song (nếu không liên quan) hoặc nối tiếp (nếu cần sự liên tục).\n"
-        "⚠️ LƯU Ý ĐẶC BIỆT QUAN TRỌNG ĐỂ TRÁNH TRÙNG LẶP (BẮT BUỘC):\n"
-        "- Tuyệt đối KHÔNG đưa bước 'Tổng hợp', 'Báo cáo', hay 'Viết tệp THONGTIN.md' làm nhiệm vụ trong kế hoạch! "
-        "Tác vụ tổng hợp đã được quản lý tự động bởi node 'synthesis' chuyên biệt ở phía sau.\n"
-        "- Tuyệt đối KHÔNG đưa bước 'Chạy test suite', 'Kiểm thử logic' (ví dụ: pytest, npm test, dart test) vào kế hoạch! "
-        "Tác vụ kiểm thử tĩnh và kiểm tra cú pháp đã được quản lý tự động bởi node 'tester' chuyên biệt ở phía sau.\n"
-        "- Kế hoạch của bạn chỉ tập quan tâm hoàn toàn vào các bước thực thi khảo sát vật lý (analysis) hoặc sửa đổi mã nguồn (development)."
-    )
-    
-    try:
-        plan_output = structured_llm.invoke([
-            {"role": "system", "content": system_prompt},
-            *conversation_history
-        ])
-        plan_tasks = getattr(plan_output, "tasks", [])
-        task_type = getattr(plan_output, "task_type", "development")
-    except Exception as e:
-        print(f"[Cảnh báo] Lỗi parse cấu trúc Planner: {str(e)}. Sử dụng kế hoạch dự phòng đơn bước.")
-        user_query = "Thực hiện yêu cầu hiện tại"
-        for msg in reversed(conversation_history):
-            if isinstance(msg, HumanMessage) or getattr(msg, "type", None) == "human":
-                user_query = msg.content
-                break
-        plan_tasks = [Task(
-            id="T1", 
-            description=f"Thực hiện trực tiếp nhiệm vụ từ yêu cầu: {user_query}", 
-            dependencies=[], 
-            status="pending"
-        )]
-        task_type = "development"
-    
-    plan_str = "\n".join([
-        f"- [{t.id}] {t.description} (Phụ thuộc: {t.dependencies if t.dependencies else 'Không'})" 
-        for t in plan_tasks
-    ])
-    
-    return {
-        "plan": plan_tasks,
-        "task_type": task_type,
-        "modified_files": [],
-        "attempts": 0,
-        "step_findings": ["__RESET__"],
-        "last_executed_task_ids": [],
-        "messages": [AIMessage(content=f"Đã lập kế hoạch hành động dạng đồ thị phụ thuộc (Loại: {task_type.upper()}):\n{plan_str}")]
     }
 
 
@@ -589,6 +511,22 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         for t in eligible_tasks
     ])
 
+    # =====================================================================
+    # GIẢI PHÁP: TRÍCH XUẤT FILE REGISTRY LÀM SINGLE SOURCE OF TRUTH CHUNG
+    # =====================================================================
+    registry_context_str = ""
+    if file_registry:
+        registry_context_str = "\n=== 📦 NỘI DUNG MÃ NGUỒN CẬP NHẬT MỚI NHẤT (SINGLE SOURCE OF TRUTH) ===\n"
+        for file_path, content in file_registry.items():
+            lang = get_markdown_language(file_path)
+            lines = content.splitlines()
+            formatted_lines = [f"{idx+1:04d} | {line}" for idx, line in enumerate(lines)]
+            
+            registry_context_str += (
+                f"\n--- TỆP TIN: `{file_path}` ---\n"
+                f"```{lang}\n" + "\n".join(formatted_lines) + "\n```\n"
+            )
+
     if task_type == "analysis":
         read_files = ReadFilesTool(workspace_path=ws)
         list_directory = ListDirectoryTool(workspace_path=ws)
@@ -609,6 +547,10 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         if workspace_context:
             system_prompt += f"\n--- TỔNG QUAN VỀ DỰ ÁN (THONGTIN.md) ---\n{workspace_context}\n"
             
+        # 🔔 CẬP NHẬT: Nạp registry mã nguồn vào System Prompt của chế độ Khảo sát (Analysis Mode)
+        if registry_context_str:
+            system_prompt += registry_context_str
+            
         system_prompt += (
             "\nHãy sử dụng các công cụ khảo sát cấu trúc hệ thống.\n"
             "\n⚠️ RÀNG BUỘC PHẠM VI NGHIÊM NGẶT (BẮT BUỘC):\n"
@@ -621,19 +563,6 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             system_prompt += previous_findings_str
 
     else:  # development
-        registry_context_str = ""
-        if file_registry:
-            registry_context_str = "\n=== 📦 NỘI DUNG MÃ NGUỒN CẬP NHẬT MỚI NHẤT (SINGLE SOURCE OF TRUTH) ===\n"
-            for file_path, content in file_registry.items():
-                lang = get_markdown_language(file_path)
-                lines = content.splitlines()
-                formatted_lines = [f"{idx+1:04d} | {line}" for idx, line in enumerate(lines)]
-                
-                registry_context_str += (
-                    f"\n--- TỆP TIN: `{file_path}` ---\n"
-                    f"```{lang}\n" + "\n".join(formatted_lines) + "\n```\n"
-                )
-                
         web_interact_tool = WebInteractAndTestTool(workspace_path=ws)
         read_files = ReadFilesTool(workspace_path=ws)
         write_file = WriteFileTool(workspace_path=ws)
@@ -658,6 +587,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
                              f"Khi kiểm thử động trang web, hãy luôn truyền tham số `extension_path` này vào công cụ `web_interact_and_test` " \
                              f"để trình duyệt tự động nạp Extension của bạn.\n"
 
+        # Nạp registry mã nguồn vào System Prompt của chế độ Phát triển (Development Mode)
         if registry_context_str:
             system_prompt += registry_context_str
             
@@ -714,9 +644,6 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         return {"messages": [response]}
 
 
-# =====================================================================
-# NÂNG CẤP REPLANNER: CHUYỂN HOẠT ĐỘNG TỪ PHA KHẢO SÁT SANG LẬP KẾ HOẠCH CHI TIẾT
-# =====================================================================
 def replanner_node(state: AgentState) -> Dict[str, Any]:
     replanning_count = state.get("replanning_count", 0)
     ws = state["workspace_path"]
@@ -726,14 +653,12 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
     workspace_context = state.get("workspace_context", "")
     error_logs = state.get("error_logs", "")
     
-    # Phát hiện điểm chuyển tiếp: Nếu kế hoạch hiện thời chỉ có duy nhất 1 nhiệm vụ hạt giống khảo sát và đã chạy xong
     is_survey_transition = (
         len(plan) == 1 and 
         (plan[0].id if isinstance(plan[0], Task) else plan[0].get("id")) == "T_SURVEY" and
         (plan[0].status if isinstance(plan[0], Task) else plan[0].get("status")) == "completed"
     )
     
-    # 1. Nếu vượt quá giới hạn hoăc không có lỗi (và KHÔNG PHẢI trong pha chuyển tiếp khảo sát) -> Bypass
     if replanning_count >= 5 or (not error_logs and not is_survey_transition):
         action_msg = "bypass_limit" if replanning_count >= 5 else "bypass_no_error"
         proposal_message = AIMessage(
@@ -751,7 +676,6 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
         for t in plan
     ])
     
-    # 2. Xây dựng System Prompt động dựa trên giai đoạn chuyển tiếp
     if is_survey_transition:
         system_prompt = (
             "Bạn là một Kiến trúc sư kiêm Điều phối viên dự án phần mềm cấp cao.\n"

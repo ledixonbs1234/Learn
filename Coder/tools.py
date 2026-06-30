@@ -13,11 +13,8 @@ from langchain_core.callbacks import CallbackManagerForToolRun
 from langchain_core.messages import ToolMessage
 
 import config
-# ==========================================
-# CÁC HÀM TIỆN ÍCH HỖ TRỢ ĐỊNH DẠNG MARKDOWN
-# ==========================================
+
 def get_markdown_language(file_path: str) -> str:
-    """Ánh xạ phần mở rộng của file sang ngôn ngữ định dạng Markdown tương ứng."""
     ext = Path(file_path).suffix.lower()
     mapping = {
         ".py": "python",
@@ -48,9 +45,7 @@ def get_markdown_language(file_path: str) -> str:
     }
     return mapping.get(ext, "text")
 
-# ==========================================
-# CÁC CÔNG CỤ DÒ TÌM HỆ THỐNG THỰC TẾ (SENSING TOOLS)
-# ==========================================
+
 @tool
 def get_current_working_directory() -> str:
     """Trả về đường dẫn thư mục làm việc hiện tại (Current Working Directory - CWD) của tiến trình đang chạy Agent."""
@@ -75,10 +70,7 @@ def check_path_exists(path_str: str) -> str:
 
 @tool
 def find_project_root(start_path: str) -> str:
-    """
-    Tìm kiếm ngược lên trên (upwards) từ một đường dẫn bắt đầu để tìm kiếm các tệp tin đánh dấu gốc dự án.
-    Đã được nâng cấp để định vị chính xác phân hệ trong Monorepo và chống sập luồng hệ thống.
-    """
+    """ Tìm kiếm ngược lên trên (upwards) từ một đường dẫn bắt đầu để tìm kiếm các tệp tin đánh dấu gốc dự án. """
     try:
         start_p = Path(start_path)
         resolved_root = find_project_root_heuristic(start_p)
@@ -93,9 +85,7 @@ def find_project_root(start_path: str) -> str:
             "message": f"Gặp lỗi vật lý khi truy cập đĩa cứng: {str(e)}"
         }, ensure_ascii=False)
 
-# ==========================================
-# SCHEMAS PHỤC VỤ TOOL CALLING
-# ==========================================
+
 class ReadFilesSchema(BaseModel):
     file_paths: Union[str, List[str]] = Field(description="Đường dẫn tương đối hoặc danh sách đường dẫn tương đối của các tệp tin.")
 
@@ -126,9 +116,6 @@ class ReadFileLinesSchema(BaseModel):
     end_line: int = Field(description="Dòng kết thúc đọc (bao gồm cả dòng này).")
 
 
-# ==========================================
-# CẤU TRÚC LẠI TOOL ĐỌC DÒNG FILE (READ FILE LINES TOOL)
-# ==========================================
 class ReadFileLinesTool(BaseTool):
     name: str = "read_file_lines"
     description: str = (
@@ -166,7 +153,6 @@ class ReadFileLinesTool(BaseTool):
             header = f"=== NỘI DUNG TỆP KHOANH VÙNG: {file_path} (Dòng {start} đến {end} trên tổng số {total_lines} dòng) ===\n"
             lang = get_markdown_language(file_path)
             
-            # Thay đổi quan trọng: Đưa nội dung dòng vào khối mã Markdown thích hợp
             markdown_body = f"```{lang}\n" + "\n".join(formatted_lines) + "\n```"
             return header + markdown_body
             
@@ -179,7 +165,6 @@ class UniversalSearchSchema(BaseModel):
 
 
 class SymbolNode:
-    """Cấu trúc dữ liệu Node phục vụ biểu diễn cây phân cấp ký hiệu."""
     def __init__(self, start: int, end: int, signature: str, description: str):
         self.start = start
         self.end = end
@@ -193,20 +178,17 @@ class UniversalSymbolSearchTool(BaseTool):
     description: str = (
         "Quét tệp tin nguồn để trích xuất danh sách và cây phân cấp cấu trúc của các định nghĩa Class, Hàm, Phương thức, Struct... "
         "Hiển thị trực quan quan hệ lồng nhau giữa các hàm kèm đầy đủ tham số khai báo gốc."
-        "Hỗ trợ tất cả các ngôn ngữ phổ biến (Python, Dart, TS, JS, JSX, Go, Rust, C++, Java, C#, Swift, Kotlin)."
     )
     args_schema: Type[BaseModel] = UniversalSearchSchema
     workspace_path: str
 
     def _clean_block_comments(self, content: str) -> str:
-        """Xóa sạch comment khối /* ... */ đa dòng nhưng bảo toàn tuyệt đối số dòng."""
         def replacer(match):
             newlines_count = match.group(0).count("\n")
             return "\n" * newlines_count
         return re.sub(r"/\*.*?\*/", replacer, content, flags=re.DOTALL)
 
     def _strip_strings_and_line_comments(self, line: str, ext: str) -> str:
-        """Xóa sạch comments và chuỗi ký tự để tránh nhiễu ngoặc nhọn."""
         if ext in [".py", ".yaml", ".yml"]:
             clean_line = re.sub(r"#.*$", "", line)
         else:
@@ -218,7 +200,6 @@ class UniversalSymbolSearchTool(BaseTool):
         return clean_line
 
     def _find_brace_block_end(self, lines: list, start_idx: int, ext: str) -> int:
-        """Thuật toán Brace-Matching nâng cao: Khử chuỗi và comment trước khi đếm ngoặc nhọn."""
         brace_count = 0
         found_first_brace = False
         end_idx = start_idx
@@ -252,7 +233,6 @@ class UniversalSymbolSearchTool(BaseTool):
         return end_idx + 1
 
     def _find_python_block_end(self, lines: list, start_idx: int) -> int:
-        """Thuật toán Indentation nâng cao: Nhận diện ranh giới thụt lề của Python."""
         sig_end_idx = start_idx
         for idx in range(start_idx, len(lines)):
             clean_line = lines[idx].strip().split("#", 1)[0].strip()
@@ -280,7 +260,6 @@ class UniversalSymbolSearchTool(BaseTool):
         return end_idx + 1
 
     def _extract_full_signature(self, lines: list, start_idx: int, ext: str) -> str:
-        """Trích xuất và định dạng chuẩn hóa toàn bộ signature khai báo."""
         sig_end_idx = start_idx
         if ext == ".py":
             for idx in range(start_idx, len(lines)):
@@ -320,7 +299,6 @@ class UniversalSymbolSearchTool(BaseTool):
         return full_sig
 
     def _extract_description(self, lines: list, start_line_1based: int, ext: str) -> str:
-        """Trích xuất giải thích/mô tả chức năng từ Docstrings hoặc Comments."""
         description_lines = []
         def_idx = start_line_1based - 1
 
@@ -415,7 +393,6 @@ class UniversalSymbolSearchTool(BaseTool):
         return "Không có mô tả"
 
     def _get_compact_name(self, signature: str, ext: str) -> str:
-        """Lọc bỏ từ khóa thừa nhưng GIỮ NGUYÊN toàn bộ danh sách tham số khai báo."""
         match_class = re.search(r'\b(class|interface|struct|enum|type|union|trait|mixin|extension)\s+([a-zA-Z0-9_<>]+)', signature)
         if match_class:
             return f"🔹 {match_class.group(1)} {match_class.group(2)}"
@@ -450,10 +427,6 @@ class UniversalSymbolSearchTool(BaseTool):
         return f"⚙️ {sig_clean}"
 
     def _render_markdown_tree(self, node: SymbolNode, ext: str, indent: str = "", is_last: bool = True, is_root: bool = False) -> List[str]:
-        """
-        Hàm đệ quy vẽ cấu trúc cây lồng nhau chuẩn hóa.
-        Cố định thông tin dòng lên đầu dòng và đặt mô tả sát bên phải tên hàm.
-        """
         lines = []
         if is_root:
             lines.append(f"{node.signature} | {node.description}")
@@ -587,7 +560,7 @@ class UniversalSymbolSearchTool(BaseTool):
                         break
             
             if not raw_symbols:
-                return f"Thông báo: Đã quét tệp '{file_path}' nhưng không phát hiện cấu trúc đặc trưng nào."
+                return f"Thông báo: Đã quét tệp '{file_path}' but không phát hiện cấu trúc đặc trưng nào."
             
             raw_symbols.sort(key=lambda x: (x[0], -x[1]))
             
@@ -618,9 +591,7 @@ class UniversalSymbolSearchTool(BaseTool):
         except Exception as e:
             return f"Lỗi phân tích phạm vi khối mã: {str(e)}"
 
-# ==========================================
-# CÁC LỚP CÔNG CỤ CHUẨN HOÁ (BASE TOOL)
-# ==========================================
+
 class ReadFilesTool(BaseTool):
     name: str = "read_files"
     description: str = "Đọc nội dung của một hoặc nhiều tệp tin trong workspace cùng lúc."
@@ -675,9 +646,7 @@ class RunTerminalTool(BaseTool):
         tools_mgr = WorkspaceTools(self.workspace_path)
         return tools_mgr.run_terminal(command)
 
-# ==========================================
-# CÁC LỚP TIỆN ÍCH NGHIỆP VỤ
-# ==========================================
+
 class GitManager:
     def __init__(self, workspace_path: str):
         self.workspace = Path(workspace_path).expanduser().resolve()
@@ -716,6 +685,10 @@ class GitManager:
         if status and not status.startswith("ERROR"):
             self._run_cmd(["git", "commit", "-m", message])
 
+
+# ==========================================
+# CẤU TRÚC LẠI BỘ SCHEMA ĐỂ NHẬN EXTENSION PATH QUA FUNCTION CALLING
+# ==========================================
 class WebInteractSchema(BaseModel):
     url: str = Field(description="Đường dẫn URL của trang web cần xử lý.")
     action_type: Literal["explore", "test_js"] = Field(
@@ -728,13 +701,18 @@ class WebInteractSchema(BaseModel):
         default=None,
         description="Đoạn mã Javascript cần chạy thử nghiệm trên trang (bắt buộc truyền nếu action_type là 'test_js')."
     )
+    extension_path: Optional[str] = Field(
+        default=None,
+        description="Đường dẫn tương đối tới thư mục chứa manifest.json của Chrome Extension trong workspace (nếu muốn nạp extension vào phiên chạy thử)."
+    )
+
 
 class WebInteractAndTestTool(BaseTool):
     name: str = "web_interact_and_test"
     description: str = (
         "Công cụ chuyên dụng để mở trình duyệt, thăm dò tìm kiếm các CSS Selector bền vững, "
         "hoặc chạy thử nghiệm và xác thực các đoạn mã Javascript điều khiển trên trang web thật. "
-        "Giúp Agent kiểm tra tính chính xác của mã nguồn trước khi viết file extension hoàn chỉnh."
+        "Hỗ trợ nạp và kiểm thử tương tác tự động với Chrome Extension từ đĩa."
     )
     args_schema: Type[BaseModel] = WebInteractSchema
     workspace_path: str
@@ -745,26 +723,33 @@ class WebInteractAndTestTool(BaseTool):
         action_type: str, 
         target_description: str, 
         js_code_to_test: Optional[str] = None, 
+        extension_path: Optional[str] = None, # Nhận tham số động từ LLM
         run_manager: Optional[CallbackManagerForToolRun] = None
     ) -> str:
-        # Thiết lập đầu vào cho Subgraph
+        
+        # Resolve đường dẫn vật lý của Chrome Extension
+        resolved_ext_path = None
+        if extension_path:
+            try:
+                resolved_ext_path = str(sanitize_and_resolve_path(self.workspace_path, extension_path, create_parent=False))
+            except Exception:
+                resolved_ext_path = extension_path
+
         sub_input = {
             "workspace_path": self.workspace_path,
             "url": url,
             "action_type": action_type,
             "target_description": target_description,
             "js_code_to_test": js_code_to_test,
+            "extension_path": resolved_ext_path, # Truyền xuống Subgraph
             "attempts": 0
         }
         
         try:
-            # GIẢI PHÁP: Khởi tạo biến cấu hình là một dictionary cục bộ riêng biệt 
-            # để tránh hoàn toàn xung đột với module 'config' hệ thống
             run_config = {}
             if run_manager:
                 run_config["callbacks"] = run_manager.get_child()
             
-            # TỐI ƯU HÓA: Chỉ gọi invoke một lần duy nhất để khởi động trình duyệt đúng một lần
             output = web_subgraph.invoke(sub_input, config=run_config)
             
             if output.get("error"):
@@ -772,25 +757,35 @@ class WebInteractAndTestTool(BaseTool):
                 
             current_tool_call_id = run_manager.get_child().parent_run_id if run_manager else "temporary_id"
 
+            # Trích xuất browser logs để phục vụ phản hồi debug
+            console_logs_str = ""
+            if output.get("browser_console_logs"):
+                console_logs_str = f"\n\n📋 **Nhật ký bảng điều khiển trình duyệt (Browser Console Logs):**\n```text\n{output['browser_console_logs']}\n```"
+
             if action_type == "explore":
                 sel = output.get("detected_selectors", {})
                 screenshot_path = output.get("screenshot_path")
                 
+                # Nâng cấp nội dung phản hồi, hiển thị chi tiết các thuộc tính trạng thái
                 text_content = (
                     f"✅ [Thành công] Đã định vị xong phần tử mục tiêu:\n"
                     f"- **Tag Name:** `{sel.get('tagName')}`\n"
                     f"- **Selector khuyến nghị:** `{sel.get('selector')}`\n"
                     f"- **Văn bản hiển thị:** '{sel.get('text')}'\n"
                     f"- **Aria-Label:** '{sel.get('aria_label')}'\n"
+                    f"- **CSS Classes:** `{sel.get('classes')}`\n"
+                    f"- **Trạng thái Active (Lớp active/selected):** `{sel.get('isActive')}`\n"
+                    f"- **Checked (nút chọn):** `{sel.get('checked')}`\n"
+                    f"- **Aria-Selected:** `{sel.get('aria_selected')}`\n"
                 )
                 
-                # Nếu có ảnh chụp màn hình thực tế, đóng gói đa phương thức
+                text_content += console_logs_str
+                
                 if screenshot_path and Path(screenshot_path).exists():
                     try:
                         base64_image = encode_image_to_base64(screenshot_path)
-                        # Đóng gói ToolMessage trực tiếp để gửi trả ảnh về luồng State của Graph
                         return ToolMessage(
-                            tool_call_id=current_tool_call_id, # Phải trùng khớp với ID của cuộc gọi hiện tại
+                            tool_call_id=current_tool_call_id,
                             content=[
                                 {"type": "text", "text": text_content},
                                 {
@@ -806,13 +801,15 @@ class WebInteractAndTestTool(BaseTool):
                 
             elif action_type == "test_js":
                 state_after = output.get("dom_state_after", {})
-                return (
+                ret_msg = (
                     f"✅ [Thành công] Đã thực thi và chạy thử nghiệm mã Javascript điều khiển trên trang web thật.\n"
                     f"- **Kết quả thực thi:** Thành công (Không phát sinh lỗi JS runtime)\n"
                     f"- **Ảnh chụp màn hình kết quả:** Đã lưu tại `{output.get('screenshot_path')}`\n"
                     f"- **Trạng thái URL sau thực thi:** `{state_after.get('url_after')}`\n"
-                    f"👉 Mã JS này đã được xác thực hoạt động ổn định trên môi trường thực tế."
                 )
+                ret_msg += console_logs_str
+                return ret_msg
+                
         except Exception as e:
             return f"❌ Lỗi hệ thống khi kích hoạt Web Subgraph: {str(e)}"
         
@@ -820,9 +817,8 @@ class WebInteractAndTestTool(BaseTool):
 def encode_image_to_base64(image_path: str) -> str:
     with open(image_path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode('utf-8')
-# ==========================================
-# TÁI CẤU TRÚC LỚP QUẢN LÝ THAO TÁC WORKSPACE
-# ==========================================
+
+
 class WorkspaceTools:
     def __init__(self, workspace_path: str):
         self.workspace = Path(workspace_path).expanduser().resolve()
@@ -865,9 +861,6 @@ class WorkspaceTools:
                 return [cleaned_path]
         return []
 
-    # ==========================================
-    # CẬP NHẬT: QUẤN MARKDOWN CODE BLOCK CHO READ FILES
-    # ==========================================
     def read_files(self, file_paths: Union[str, List[str]]) -> str:
         paths = self._normalize_file_paths(file_paths)
         if not paths:
@@ -887,7 +880,6 @@ class WorkspaceTools:
                 content = safe_path.read_text(encoding="utf-8")
                 lang = get_markdown_language(path)
                 
-                # Tái thiết cấu trúc đầu ra với các Code Block chuẩn hóa thay cho header thô
                 block_output = (
                     f"=== TỆP TIN: `{path}` ===\n"
                     f"```{lang}\n"
@@ -914,7 +906,6 @@ class WorkspaceTools:
             if not safe_path.exists():
                 return f"Lỗi: Không tìm thấy tệp tin '{file_path}' cần áp dụng bản vá."
                 
-            # FUZZY REGEX: Cho phép số lượng ký tự < hoặc > dao động từ 5 trở lên, không phân biệt chữ hoa chữ thường
             pattern = r"<+{5,}\s*[sS][eE][aA][rR][cC][hH]\s*[\r\n]+(.*?)(?:[\r\n]+)=+{5,}\s*[\r\n]+(.*?)(?:[\r\n]+)>+{5,}\s*[rR][eE][pP][lL][aA][cC][eE]"
             match = re.search(pattern, patch_block, re.DOTALL)
             
@@ -937,7 +928,6 @@ class WorkspaceTools:
             normalized_original = original_content.replace("\r\n", "\n")
             
             if normalized_search not in normalized_original:
-                # Thêm cơ chế Fuzzy loại bỏ khoảng trắng thừa đầu dòng để tăng tỉ lệ khớp
                 stripped_search = "\n".join([line.strip() for line in normalized_search.splitlines() if line.strip()])
                 stripped_original = "\n".join([line.strip() for line in normalized_original.splitlines() if line.strip()])
                 
@@ -998,9 +988,6 @@ class WorkspaceTools:
         except Exception as e:
             return f"Lỗi liệt kê thư mục: {str(e)}"
 
-    # ==========================================
-    # CẬP NHẬT: QUẤN MARKDOWN CODE BLOCK CHO RUN TERMINAL
-    # ==========================================
     def run_terminal(self, command: str, timeout: int = 60) -> str:
         try:
             res = subprocess.run(
@@ -1013,7 +1000,6 @@ class WorkspaceTools:
             )
             
             output = []
-            # Cập nhật: Sử dụng thẻ khối mã 'bash' để biểu diễn rõ ràng log dòng lệnh đầu ra
             if res.stdout:
                 output.append(f"[STDOUT]\n```bash\n{res.stdout.strip()}\n```")
             if res.stderr:

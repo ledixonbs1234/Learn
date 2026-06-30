@@ -63,7 +63,6 @@ class TaskTriage(BaseModel):
         default="development",
         description="Phân loại hướng xử lý của yêu cầu."
     )
-    # THÊM TRƯỜNG PHÂN TÍCH CHI TIẾT
     detailed_analysis: str = Field(
         default="",
         description="Bản phân tích chi tiết yêu cầu người dùng. Cần làm rõ: Mục đích cốt lõi, các tệp tin/thư mục dự kiến bị tác động, các ràng buộc kỹ thuật, và lộ trình gợi ý sơ bộ."
@@ -104,6 +103,9 @@ class AgentState(TypedDict):
     replanning_count: int
     is_simple: bool
     detailed_analysis: str
+    # BỔ SUNG CÁC TRƯỜNG DỮ LIỆU ĐỂ KIỂM THỬ VÀ GỠ LỖI EXTENSION
+    extension_path: str
+    browser_console_logs: str
     
 
 class WebInteractionState(TypedDict):
@@ -111,7 +113,10 @@ class WebInteractionState(TypedDict):
     url: str
     action_type: Literal["explore", "test_js"]
     target_description: str
-    js_code_to_test: Optional[str]           # Code JS mà Agent chính muốn chạy thử
+    js_code_to_test: Optional[str]
+    # BỔ SUNG TRƯỜNG TRUYỀN DẪN CHO SUBGRAPH
+    extension_path: Optional[str]
+    browser_console_logs: Optional[str]
     
     # Kết quả trả về
     detected_selectors: Optional[Dict[str, Any]]

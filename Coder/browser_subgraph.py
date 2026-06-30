@@ -6,7 +6,6 @@ import uuid
 from pathlib import Path
 from typing import Dict, Any, Literal, Optional
 from urllib.parse import urlparse
-# Sử dụng launch_persistent_context để lưu trữ hồ sơ và trạng thái phiên duyệt web
 from cloakbrowser import launch_persistent_context 
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -19,7 +18,7 @@ class ElementSelection(BaseModel):
     selected_id: int = Field(description="ID của phần tử phù hợp nhất.")
     reason: str = Field(description="Lý do lựa chọn.")
 
-# (Giữ nguyên đoạn mã SOM_SCRIPT)
+# NÂNG CẤP SOM_SCRIPT ĐỂ TRÍCH XUẤT TRẠNG THÁI HOẠT ĐỘNG CỦA CÁC PHẦN TỬ
 SOM_SCRIPT = """
 () => {
     const oldMarks = document.querySelectorAll('.ai-som-mark');
@@ -68,7 +67,12 @@ SOM_SCRIPT = """
                 "text": el.innerText ? el.innerText.trim() : "",
                 "aria_label": el.getAttribute('aria-label') || "",
                 "selector": selector,
-                "value": el.value || ""
+                "value": el.value || "",
+                // BỔ SUNG CÁC TRƯỜNG TRẠNG THÁI PHỤC VỤ CƠ CHẾ ASSERTION
+                "classes": el.className || "",
+                "checked": el.checked || false,
+                "aria_selected": el.getAttribute('aria-selected') || "false",
+                "style": el.getAttribute('style') || ""
             };
         }
     });
@@ -80,55 +84,58 @@ SOM_SCRIPT = """
 class BrowserSessionManager:
     """
     Quản lý vòng đời của các phiên trình duyệt CloakBrowser.
-    Duy trì kết nối BrowserContext và Page liên tục theo từng workspace nhằm bảo toàn Cookies, Session và trạng thái DOM.
+    Hỗ trợ nạp Chrome Extension và kiểm tra thay đổi cấu hình nạp giữa các lượt chạy.
     """
     _sessions: Dict[str, Dict[str, Any]] = {}
 
     @classmethod
-    def get_or_create_page(cls, workspace_path: str) -> tuple:
+    def get_or_create_page(cls, workspace_path: str, extension_path: Optional[str] = None) -> tuple:
         """
-        Lấy ra context và page đang hoạt động hoặc khởi chạy mới nếu chưa có.
-        Trả về tuple: (context_instance, page_instance, was_reused)
+        Lấy ra context và page đang hoạt động.
+        Nếu thư mục extension_path thay đổi so với phiên trước, tự động đóng phiên cũ và khởi chạy lại.
         """
         ws_resolved = str(Path(workspace_path).resolve())
+        ext_resolved = str(Path(extension_path).resolve()) if extension_path else None
         
         if ws_resolved in cls._sessions:
             session = cls._sessions[ws_resolved]
-            try:
-                # Kiểm tra kết nối đến page hoạt động ổn định
-                _ = session["page"].url
-                return session["context"], session["page"], True
-            except Exception:
+            # Nếu đường dẫn extension thay đổi so với phiên đang chạy, đóng phiên cũ để khởi chạy lại
+            if session.get("loaded_extension_path") != ext_resolved:
                 cls.close_session(ws_resolved)
+            else:
+                try:
+                    _ = session["page"].url
+                    return session["context"], session["page"], True
+                except Exception:
+                    cls.close_session(ws_resolved)
 
-        # Tạo mã băm ổn định cho từng workspace để tránh xung đột
         profile_id = uuid.uuid5(uuid.NAMESPACE_URL, ws_resolved).hex
-        
-        # Đường dẫn lưu trữ được chỉ định vào thư mục cá nhân của User hiện hành (.cloak_profiles)
-        # Trên Windows, đường dẫn này sẽ có dạng C:\\Users\\Tên_User\\.cloak_profiles\\<profile_id>
         profile_dir = Path.home() / ".cloak_profiles" / profile_id
         profile_dir.mkdir(parents=True, exist_ok=True)
 
-        # Khởi chạy một trình duyệt CloakBrowser mới dưới dạng Persistent Context
+        # Chuẩn bị tham số nạp extension cho cloakbrowser
+        extension_paths_list = [ext_resolved] if ext_resolved else None
+
+        # Khởi chạy trình duyệt CloakBrowser dưới dạng Persistent Context
         context = launch_persistent_context(
             user_data_dir=str(profile_dir),
-            headless=False,       # Đặt False để hiển thị trực quan trên localhost
+            headless=False,       # Đặt False để hiển thị trực quan và kích hoạt Extension
             humanize=True,        # Giả lập hành vi con người chống bot
-            geoip=True            # Đồng bộ hóa múi giờ và locale
+            geoip=True,           # Đồng bộ hóa múi giờ và locale
+            extension_paths=extension_paths_list # Nạp trực tiếp qua thư viện cloakbrowser
         )
         
-        # Sử dụng trang đầu tiên của context nếu đã được khởi tạo tự động, tránh mở tab trống thứ hai
         page = context.pages[0] if context.pages else context.new_page()
         
         cls._sessions[ws_resolved] = {
             "context": context,
-            "page": page
+            "page": page,
+            "loaded_extension_path": ext_resolved
         }
         return context, page, False
 
     @classmethod
     def close_session(cls, workspace_path: str):
-        """Đóng phiên trình duyệt tương ứng với workspace cụ thể."""
         ws_resolved = str(Path(workspace_path).resolve())
         if ws_resolved in cls._sessions:
             session = cls._sessions[ws_resolved]
@@ -140,11 +147,9 @@ class BrowserSessionManager:
 
     @classmethod
     def close_all(cls):
-        """Dọn dẹp toàn bộ trình duyệt đang chạy trong bộ nhớ."""
         for ws in list(cls._sessions.keys()):
             cls.close_session(ws)
 
-# Đăng ký đóng trình duyệt an toàn khi tiến trình python bị tắt đột ngột
 atexit.register(BrowserSessionManager.close_all)
 
 
@@ -154,12 +159,11 @@ def run_browser_session_sync(state: WebInteractionState) -> Dict[str, Any]:
     action_type = state["action_type"]
     target_desc = state["target_description"]
     js_code = state.get("js_code_to_test")
+    extension_path = state.get("extension_path") # Lấy ra từ State
     
-    # Lưu trữ tệp tin tạm trong thư mục tạm của Hệ điều hành thay vì Workspace
     temp_dir = Path(tempfile.gettempdir()) / "ai_agent_browser_sessions"
     temp_dir.mkdir(parents=True, exist_ok=True)
     
-    # Tạo tên ảnh duy nhất theo từng phiên chạy để tránh xung đột ghi đè
     unique_id = str(uuid.uuid4())[:8]
     screenshot_name = f"web_som_{unique_id}.png"
     screenshot_path = str(temp_dir / screenshot_name)
@@ -169,18 +173,29 @@ def run_browser_session_sync(state: WebInteractionState) -> Dict[str, Any]:
         "execution_success": False,
         "dom_state_after": None,
         "screenshot_path": None,
+        "browser_console_logs": None,
         "error": None
     }
     
     try:
-        # Lấy phiên trình duyệt hiện tại từ Manager dựa trên workspace làm định danh
-        context, page, reused = BrowserSessionManager.get_or_create_page(workspace)
+        # Lấy phiên trình duyệt hiện tại và nạp extension nếu có
+        context, page, reused = BrowserSessionManager.get_or_create_page(workspace, extension_path)
+        
+        # Thiết lập cơ chế ghi nhận console logs để tránh rò rỉ bộ nhớ
+        browser_logs = []
+        
+        def log_handler(msg):
+            browser_logs.append(f"[{msg.type.upper()}] {msg.text}")
+            
+        def err_handler(err):
+            browser_logs.append(f"[RUNTIME_ERROR] {err.message}")
+            
+        page.on("console", log_handler)
+        page.on("pageerror", err_handler)
         
         try:
-            # QUY TẮC ĐIỀU HƯỚNG THÔNG MINH (SMART NAVIGATION)
             should_navigate = not reused
             if reused:
-                # Nếu tái sử dụng, chỉ tải lại trang khi domain của URL đích khác với trang hiện thời.
                 try:
                     current_parsed = urlparse(page.url)
                     target_parsed = urlparse(url)
@@ -192,6 +207,10 @@ def run_browser_session_sync(state: WebInteractionState) -> Dict[str, Any]:
             if should_navigate:
                 page.goto(url, wait_until="networkidle", timeout=15000)
             
+            # TRỄ ĐỘNG (DYNAMIC WAIT): Đợi Content Script của Extension thực thi hành vi can thiệp DOM
+            if extension_path:
+                page.wait_for_timeout(4000)
+            
             if action_type == "explore":
                 # Vẽ nhãn SoM lên trang web
                 registry = page.evaluate(SOM_SCRIPT)
@@ -200,12 +219,15 @@ def run_browser_session_sync(state: WebInteractionState) -> Dict[str, Any]:
                 # Gọi LLM dạng cấu trúc để chọn phần tử phù hợp nhất
                 compact_dom = ""
                 for el_id, info in registry.items():
-                    compact_dom += f"ID [{el_id}]: {info['tagName']} | Text: '{info['text']}' | Label: '{info['aria_label']}'\n"
+                    compact_dom += (
+                        f"ID [{el_id}]: {info['tagName']} | Text: '{info['text']}' | Label: '{info['aria_label']}' "
+                        f"| Classes: '{info['classes']}' | Active: {info['isActive']} | Checked: {info['checked']}\n"
+                    )
                 
                 structured_llm = model.with_structured_output(ElementSelection, method="function_calling")
                 prompt = (
                     f"Người dùng muốn tìm phần tử: '{target_desc}'.\n"
-                    f"Dưới đây là cấu trúc DOM rút gọn:\n{compact_dom}\n"
+                    f"Dưới đây là cấu trúc DOM rút gọn kèm thuộc tính trạng thái:\n{compact_dom}\n"
                     "Hãy chọn ra ID chính xác nhất."
                 )
                 
@@ -220,20 +242,19 @@ def run_browser_session_sync(state: WebInteractionState) -> Dict[str, Any]:
                 if selected_id_str in registry:
                     result["detected_selectors"] = registry[selected_id_str]
                     result["screenshot_path"] = screenshot_path
+                    result["execution_success"] = True
                 else:
                     result["error"] = f"LLM chọn ID {selected_id} (chuỗi: '{selected_id_str}') không tồn tại trong Registry. Các khóa hiện có: {list(registry.keys())}"
                     
             elif action_type == "test_js" and js_code:
-                # Chạy thử nghiệm mã Javascript điều khiển
                 try:
                     page.evaluate(f"() => {{ {js_code} }}")
-                    page.wait_for_timeout(1500) # Chờ giao diện cập nhật trạng thái
+                    page.wait_for_timeout(1500)
                     
                     page.screenshot(path=screenshot_path)
                     result["execution_success"] = True
                     result["screenshot_path"] = screenshot_path
                     
-                    # Lấy lại trạng thái sau khi thao tác
                     result["dom_state_after"] = {
                         "url_after": page.url
                     }
@@ -241,9 +262,18 @@ def run_browser_session_sync(state: WebInteractionState) -> Dict[str, Any]:
                     result["error"] = f"Lỗi chạy thử JS: {str(js_err)}"
                     result["execution_success"] = False
                     
-        except Exception as run_err:
-            result["error"] = f"Sự cố tương tác trang web: {str(run_err)}"
-            
+            # Trích xuất toàn bộ log của phiên chạy này
+            if browser_logs:
+                result["browser_console_logs"] = "\n".join(browser_logs[-20:]) # Chỉ lấy 20 dòng cuối cùng
+                
+        finally:
+            # Ngăn ngừa Memory Leak: Gỡ bỏ Listener sau khi kết thúc vòng đời của request kiểm thử
+            try:
+                page.remove_listener("console", log_handler)
+                page.remove_listener("pageerror", err_handler)
+            except Exception:
+                pass
+                
     except Exception as launch_err:
         result["error"] = f"Không thể lấy hoặc khởi chạy CloakBrowser: {str(launch_err)}"
         

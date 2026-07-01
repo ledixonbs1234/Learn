@@ -3,6 +3,7 @@ import os
 import atexit
 import tempfile
 import uuid
+import re # ĐÃ BỔ SUNG ĐỂ SỬ DỤNG REGEX PARSER DỰ PHÒNG
 from pathlib import Path
 from typing import Dict, Any, Literal, Optional
 from urllib.parse import urlparse
@@ -18,7 +19,7 @@ class ElementSelection(BaseModel):
     selected_id: int = Field(description="ID của phần tử phù hợp nhất.")
     reason: str = Field(description="Lý do lựa chọn.")
 
-# NÂNG CẤP SOM_SCRIPT ĐỂ TRÍCH XUẤT TRẠNG THÁI HOẠT ĐỘNG CỦA CÁC PHẦN TỬ
+# SOM_SCRIPT trích xuất đầy đủ thông tin trạng thái
 SOM_SCRIPT = """
 () => {
     const oldMarks = document.querySelectorAll('.ai-som-mark');
@@ -61,6 +62,11 @@ SOM_SCRIPT = """
                 if (cleanClasses) selector += `.${cleanClasses}`;
             }
 
+            const isActiveElement = (document.activeElement === el) || 
+                                    el.classList.contains('active') || 
+                                    el.classList.contains('selected') ||
+                                    el.getAttribute('aria-selected') === 'true';
+
             registry[id] = {
                 "id": id,
                 "tagName": el.tagName,
@@ -68,11 +74,11 @@ SOM_SCRIPT = """
                 "aria_label": el.getAttribute('aria-label') || "",
                 "selector": selector,
                 "value": el.value || "",
-                // BỔ SUNG CÁC TRƯỜNG TRẠNG THÁI PHỤC VỤ CƠ CHẾ ASSERTION
                 "classes": el.className || "",
                 "checked": el.checked || false,
                 "aria_selected": el.getAttribute('aria-selected') || "false",
-                "style": el.getAttribute('style') || ""
+                "style": el.getAttribute('style') || "",
+                "isActive": isActiveElement
             };
         }
     });
@@ -83,74 +89,34 @@ SOM_SCRIPT = """
 
 class BrowserSessionManager:
     """
-    Quản lý vòng đời của các phiên trình duyệt CloakBrowser.
-    Hỗ trợ nạp Chrome Extension và kiểm tra thay đổi cấu hình nạp giữa các lượt chạy.
+    Quản lý khởi tạo trình duyệt CloakBrowser độc lập cho từng luồng.
+    Không lưu đệm tĩnh để tránh xung đột Event Loop giữa các luồng làm việc của LangGraph.
     """
-    _sessions: Dict[str, Dict[str, Any]] = {}
-
     @classmethod
-    def get_or_create_page(cls, workspace_path: str, extension_path: Optional[str] = None) -> tuple:
+    def create_page(cls, workspace_path: str, extension_path: Optional[str] = None) -> tuple:
         """
-        Lấy ra context và page đang hoạt động.
-        Nếu thư mục extension_path thay đổi so với phiên trước, tự động đóng phiên cũ và khởi chạy lại.
+        Khởi tạo một context và page mới sạch sẽ trong luồng hiện tại.
+        Mọi cookies và cookies/localstorage của extension đều được bảo toàn thông qua profile_dir vật lý.
         """
         ws_resolved = str(Path(workspace_path).resolve())
         ext_resolved = str(Path(extension_path).resolve()) if extension_path else None
         
-        if ws_resolved in cls._sessions:
-            session = cls._sessions[ws_resolved]
-            # Nếu đường dẫn extension thay đổi so với phiên đang chạy, đóng phiên cũ để khởi chạy lại
-            if session.get("loaded_extension_path") != ext_resolved:
-                cls.close_session(ws_resolved)
-            else:
-                try:
-                    _ = session["page"].url
-                    return session["context"], session["page"], True
-                except Exception:
-                    cls.close_session(ws_resolved)
-
         profile_id = uuid.uuid5(uuid.NAMESPACE_URL, ws_resolved).hex
         profile_dir = Path.home() / ".cloak_profiles" / profile_id
         profile_dir.mkdir(parents=True, exist_ok=True)
 
-        # Chuẩn bị tham số nạp extension cho cloakbrowser
         extension_paths_list = [ext_resolved] if ext_resolved else None
 
-        # Khởi chạy trình duyệt CloakBrowser dưới dạng Persistent Context
         context = launch_persistent_context(
             user_data_dir=str(profile_dir),
-            headless=False,       # Đặt False để hiển thị trực quan và kích hoạt Extension
-            humanize=True,        # Giả lập hành vi con người chống bot
-            geoip=True,           # Đồng bộ hóa múi giờ và locale
-            extension_paths=extension_paths_list # Nạp trực tiếp qua thư viện cloakbrowser
+            headless=False,       
+            humanize=True,        
+            geoip=True,           
+            extension_paths=extension_paths_list 
         )
         
         page = context.pages[0] if context.pages else context.new_page()
-        
-        cls._sessions[ws_resolved] = {
-            "context": context,
-            "page": page,
-            "loaded_extension_path": ext_resolved
-        }
-        return context, page, False
-
-    @classmethod
-    def close_session(cls, workspace_path: str):
-        ws_resolved = str(Path(workspace_path).resolve())
-        if ws_resolved in cls._sessions:
-            session = cls._sessions[ws_resolved]
-            try:
-                session["context"].close()
-            except Exception:
-                pass
-            del cls._sessions[ws_resolved]
-
-    @classmethod
-    def close_all(cls):
-        for ws in list(cls._sessions.keys()):
-            cls.close_session(ws)
-
-atexit.register(BrowserSessionManager.close_all)
+        return context, page
 
 
 def run_browser_session_sync(state: WebInteractionState) -> Dict[str, Any]:
@@ -159,7 +125,7 @@ def run_browser_session_sync(state: WebInteractionState) -> Dict[str, Any]:
     action_type = state["action_type"]
     target_desc = state["target_description"]
     js_code = state.get("js_code_to_test")
-    extension_path = state.get("extension_path") # Lấy ra từ State
+    extension_path = state.get("extension_path") 
     
     temp_dir = Path(tempfile.gettempdir()) / "ai_agent_browser_sessions"
     temp_dir.mkdir(parents=True, exist_ok=True)
@@ -177,11 +143,11 @@ def run_browser_session_sync(state: WebInteractionState) -> Dict[str, Any]:
         "error": None
     }
     
+    context = None
     try:
-        # Lấy phiên trình duyệt hiện tại và nạp extension nếu có
-        context, page, reused = BrowserSessionManager.get_or_create_page(workspace, extension_path)
+        # Khởi tạo một phiên sạch sẽ thuộc luồng hiện hành
+        context, page = BrowserSessionManager.create_page(workspace, extension_path)
         
-        # Thiết lập cơ chế ghi nhận console logs để tránh rò rỉ bộ nhớ
         browser_logs = []
         
         def log_handler(msg):
@@ -194,57 +160,98 @@ def run_browser_session_sync(state: WebInteractionState) -> Dict[str, Any]:
         page.on("pageerror", err_handler)
         
         try:
-            should_navigate = not reused
-            if reused:
-                try:
-                    current_parsed = urlparse(page.url)
-                    target_parsed = urlparse(url)
-                    if current_parsed.netloc != target_parsed.netloc:
-                        should_navigate = True
-                except Exception:
-                    should_navigate = True
+            # Điều hướng trang web
+            page.goto(url, wait_until="networkidle", timeout=15000)
             
-            if should_navigate:
-                page.goto(url, wait_until="networkidle", timeout=15000)
-            
-            # TRỄ ĐỘNG (DYNAMIC WAIT): Đợi Content Script của Extension thực thi hành vi can thiệp DOM
             if extension_path:
                 page.wait_for_timeout(4000)
             
             if action_type == "explore":
-                # Vẽ nhãn SoM lên trang web
                 registry = page.evaluate(SOM_SCRIPT)
                 page.screenshot(path=screenshot_path)
                 
-                # Gọi LLM dạng cấu trúc để chọn phần tử phù hợp nhất
                 compact_dom = ""
                 for el_id, info in registry.items():
                     compact_dom += (
-                        f"ID [{el_id}]: {info['tagName']} | Text: '{info['text']}' | Label: '{info['aria_label']}' "
-                        f"| Classes: '{info['classes']}' | Active: {info['isActive']} | Checked: {info['checked']}\n"
+                        f"ID [{el_id}]: {info.get('tagName', 'UNKNOWN')} | Text: '{info.get('text', '')}' | Label: '{info.get('aria_label', '')}' "
+                        f"| Classes: '{info.get('classes', '')}' | Active: {info.get('isActive', False)} | Checked: {info.get('checked', False)}\n"
                     )
                 
-                structured_llm = model.with_structured_output(ElementSelection, method="function_calling")
+                # NÂNG CẤP LẬP TRÌNH PHÒNG THỦ: Sử dụng include_raw=True để tránh sập đồ thị khi gọi Local LLM Proxy
+                structured_llm = model.with_structured_output(
+                    ElementSelection, 
+                    method="function_calling", 
+                    include_raw=True
+                )
+                
                 prompt = (
                     f"Người dùng muốn tìm phần tử: '{target_desc}'.\n"
                     f"Dưới đây là cấu trúc DOM rút gọn kèm thuộc tính trạng thái:\n{compact_dom}\n"
-                    "Hãy chọn ra ID chính xác nhất."
+                    "Hãy chọn ra ID chính xác nhất bằng cách gọi hàm ElementSelection."
                 )
                 
-                response = structured_llm.invoke([
-                    SystemMessage(content="Bạn là chuyên gia định vị phần tử giao diện."),
+                llm_output = structured_llm.invoke([
+                    SystemMessage(content="Bạn là chuyên gia định vị phần tử giao diện. Hãy trả về một cấu trúc ElementSelection hợp lệ."),
                     HumanMessage(content=prompt)
                 ])
                 
-                selected_id = response.selected_id
-                selected_id_str = str(selected_id) 
+                parsed = llm_output.get("parsed")
+                raw_msg = llm_output.get("raw")
+                parsing_error = llm_output.get("parsing_error")
+                
+                selected_id = None
+                reason = "Không rõ lý do"
+                
+                # 🛡️ HỆ THỐNG PHÂN TÍCH CÚ PHÁP DỰ PHÒNG ĐA TẦNG (MULTI-TIER FALLBACK PARSER)
+                if parsed is not None:
+                    selected_id = parsed.selected_id
+                    reason = parsed.reason
+                else:
+                    # Tầng 1: Kiểm tra nếu có tool_calls trong raw_msg nhưng LangChain parse lỗi
+                    tool_calls = getattr(raw_msg, "tool_calls", []) if raw_msg else []
+                    if tool_calls:
+                        try:
+                            args = tool_calls[0].get("args", {})
+                            if "selected_id" in args:
+                                selected_id = int(args["selected_id"])
+                                reason = args.get("reason", "Trích xuất thành công từ tool_calls thô")
+                        except Exception:
+                            pass
+                    
+                    # Tầng 2: Nếu vẫn None, quét Regex trên raw_msg.content
+                    if selected_id is None and raw_msg and hasattr(raw_msg, "content"):
+                        raw_content = str(raw_msg.content)
+                        match = re.search(r'"selected_id"\s*:\s*(\d+)', raw_content) or \
+                                re.search(r'selected_id\s*[:=]\s*(\d+)', raw_content, re.IGNORECASE) or \
+                                re.search(r'ID\s*\[?(\d+)\]?', raw_content, re.IGNORECASE)
+                        
+                        if match:
+                            selected_id = int(match.group(1))
+                            reason = f"Trích xuất dự phòng qua Regex (Lỗi gốc: {parsing_error})"
+                        else:
+                            # Tầng 3: Quét ID hợp lệ đầu tiên xuất hiện trong văn bản thô
+                            all_nums = [int(n) for n in re.findall(r'\b\d+\b', raw_content)]
+                            valid_nums = [n for n in all_nums if str(n) in registry]
+                            if valid_nums:
+                                selected_id = valid_nums[0]
+                                reason = f"Trích xuất số ID khả dụng đầu tiên (Lỗi gốc: {parsing_error})"
+                
+                selected_id_str = str(selected_id) if selected_id is not None else ""
                 
                 if selected_id_str in registry:
-                    result["detected_selectors"] = registry[selected_id_str]
+                    result_selectors = registry[selected_id_str]
+                    result_selectors["selection_reason"] = reason
+                    result["detected_selectors"] = result_selectors
                     result["screenshot_path"] = screenshot_path
                     result["execution_success"] = True
                 else:
-                    result["error"] = f"LLM chọn ID {selected_id} (chuỗi: '{selected_id_str}') không tồn tại trong Registry. Các khóa hiện có: {list(registry.keys())}"
+                    # Tầng 4: Trả về lỗi chi tiết kèm nội dung thô để gỡ lỗi thay vì làm sập đồ thị
+                    raw_dump = raw_msg.content if (raw_msg and hasattr(raw_msg, "content")) else str(raw_msg)
+                    result["error"] = (
+                        f"Không thể phân tích hoặc trích xuất ID hợp lệ từ phản hồi của LLM.\n"
+                        f"Lỗi cú pháp (Parsing Error): {parsing_error}\n"
+                        f"Nội dung thô từ mô hình: {raw_dump}"
+                    )
                     
             elif action_type == "test_js" and js_code:
                 try:
@@ -262,12 +269,10 @@ def run_browser_session_sync(state: WebInteractionState) -> Dict[str, Any]:
                     result["error"] = f"Lỗi chạy thử JS: {str(js_err)}"
                     result["execution_success"] = False
                     
-            # Trích xuất toàn bộ log của phiên chạy này
             if browser_logs:
-                result["browser_console_logs"] = "\n".join(browser_logs[-20:]) # Chỉ lấy 20 dòng cuối cùng
+                result["browser_console_logs"] = "\n".join(browser_logs[-20:]) 
                 
         finally:
-            # Ngăn ngừa Memory Leak: Gỡ bỏ Listener sau khi kết thúc vòng đời của request kiểm thử
             try:
                 page.remove_listener("console", log_handler)
                 page.remove_listener("pageerror", err_handler)
@@ -276,6 +281,13 @@ def run_browser_session_sync(state: WebInteractionState) -> Dict[str, Any]:
                 
     except Exception as launch_err:
         result["error"] = f"Không thể lấy hoặc khởi chạy CloakBrowser: {str(launch_err)}"
+    finally:
+        # Đảm bảo đóng trình duyệt và giải phóng Event Loop sau khi tác vụ kết thúc
+        if context:
+            try:
+                context.close()
+            except Exception:
+                pass
         
     return result
 

@@ -1,4 +1,5 @@
 # tools.py
+import asyncio
 import base64
 import json
 import subprocess
@@ -1015,3 +1016,108 @@ class WorkspaceTools:
             return f"Lỗi: Lệnh bị buộc dừng do vượt quá thời gian chờ (timeout) {timeout} giây."
         except Exception as e:
             return f"Lỗi thực thi lệnh terminal: {str(e)}"
+        
+        
+class ChromeDevToolsMcpSchema(BaseModel):
+    action: Literal["get_console_logs", "get_network_requests", "evaluate_js", "take_screenshot", "audit_performance"] = Field(
+        description="Hành động gỡ lỗi chuyên sâu cần thực hiện trên trình duyệt Chrome thông qua CDP."
+    )
+    url: Optional[str] = Field(
+        default=None, 
+        description="Đường dẫn URL của trang web cần điều hướng đến trước khi gỡ lỗi (nếu có)."
+    )
+    js_code: Optional[str] = Field(
+        default=None, 
+        description="Đoạn mã JavaScript cần thực thi trên trang (Bắt buộc phải truyền nếu chọn action là 'evaluate_js')."
+    )
+
+class ChromeDevToolsMcpTool(BaseTool):
+    name: str = "chrome_devtools_mcp_tool"
+    description: str = (
+        "Công cụ can thiệp trực tiếp vào Chrome DevTools Protocol (CDP) thông qua MCP Server. "
+        "Dùng để thu thập nhật ký console (lỗi Extension runtime), danh sách network requests (lỗi API/CORS), "
+        "chạy mã JS ngầm hoặc chụp ảnh màn hình để gỡ lỗi Chrome Extension trên trình duyệt thực."
+    )
+    args_schema: Type[BaseModel] = ChromeDevToolsMcpSchema
+    workspace_path: str
+
+    def _run(self, action: str, url: Optional[str] = None, js_code: Optional[str] = None) -> str:
+        # Cầu nối đồng bộ hóa luồng bất đồng bộ của MCP Client
+        import asyncio
+        try:
+            return asyncio.run(self._run_async(action, url, js_code))
+        except Exception as e:
+            return f"❌ [Lỗi Hệ Thống] Không thể chạy tác vụ MCP: {str(e)}"
+
+    async def _run_async(self, action: str, url: Optional[str], js_code: Optional[str]) -> str:
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+        import tempfile
+        from pathlib import Path
+        import json
+
+        # Khởi chạy MCP Server thông qua npx trong tiến trình con Stdio
+        server_params = StdioServerParameters(
+            command="npx",
+            args=["-y", "chrome-devtools-mcp@latest", "--autoConnect", "--no-usage-statistics"]
+        )
+
+        try:
+            async with stdio_client(server_params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    # Thiết lập bắt tay khởi tạo kết nối MCP
+                    await session.initialize()
+
+                    # 1. Điều hướng trang nếu LLM yêu cầu URL mới
+                    if url:
+                        await session.call_tool("navigate_page", arguments={"url": url})
+                        await asyncio.sleep(2.5)  # Chờ trang ổn định
+
+                    # 2. Định tuyến các hành động chuyên sâu đến các tool tương ứng của MCP Server
+                    if action == "get_console_logs":
+                        # Gọi công cụ list_console_messages của Google DevTools MCP
+                        res = await session.call_tool("list_console_messages", arguments={})
+                        logs = res.content[0].text if res.content else "Không thu thập được log."
+                        return f"📋 [Console Logs] Kết quả từ trình duyệt:\n{logs}"
+
+                    elif action == "get_network_requests":
+                        # Gọi công cụ list_network_requests
+                        res = await session.call_tool("list_network_requests", arguments={})
+                        requests = res.content[0].text if res.content else "Không thu thập được dữ liệu mạng."
+                        return f"🌐 [Network Requests] Kết quả phân tích mạng:\n{requests}"
+
+                    elif action == "evaluate_js":
+                        if not js_code:
+                            return "Lỗi: Bạn cần cung cấp mã JavaScript trong thuộc tính 'js_code' để thực thi hành động này."
+                        res = await session.call_tool("evaluate_script", arguments={"expression": js_code})
+                        val = res.content[0].text if res.content else "Không có kết quả trả về."
+                        return f"⚡ [JS Execution Result]:\n{val}"
+
+                    elif action == "take_screenshot":
+                        temp_dir = Path(tempfile.gettempdir()) / "mcp_screenshots"
+                        temp_dir.mkdir(parents=True, exist_ok=True)
+                        file_name = f"devtools_screenshot_{int(asyncio.get_event_loop().time())}.png"
+                        full_path = temp_dir / file_name
+                        
+                        await session.call_tool("take_screenshot", arguments={"filePath": str(full_path)})
+                        return f"📸 [Screenshot] Đã chụp màn hình và lưu cục bộ tại: `{full_path}`"
+
+                    elif action == "audit_performance":
+                        # Trích xuất dữ liệu vết hiệu năng thời gian thực
+                        await session.call_tool("performance_start_trace", arguments={})
+                        await asyncio.sleep(3.0)  # Ghi nhận hoạt động trong 3 giây
+                        res = await session.call_tool("performance_stop_trace", arguments={})
+                        trace_data = res.content[0].text if res.content else "Không có dữ liệu hiệu năng."
+                        return f"⏱️ [Performance Audit] Phân tích vết hiệu năng:\n{trace_data}"
+
+                    else:
+                        return f"Lỗi: Hành động '{action}' không được hỗ trợ trong hệ thống MCP."
+
+        except Exception as conn_error:
+            return (
+                f"❌ Không thể đính kèm vào trình duyệt Chrome qua CDP.\n"
+                f"Chi tiết lỗi: {str(conn_error)}\n"
+                f"Yêu cầu xử lý:\n"
+                f"1. Đảm bảo đã bật 'remote debugging' tại địa chỉ 'chrome://inspect/#remote-debugging' trên Chrome.\n"
+                f"2. Đảm bảo Chrome của bạn đang mở ở chế độ hoạt động bình thường trên máy tính."
+            )

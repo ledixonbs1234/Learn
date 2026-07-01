@@ -1,4 +1,5 @@
 # oder/nodes.py
+import asyncio
 import json
 import os
 import platform
@@ -12,9 +13,10 @@ from concurrent.futures import ThreadPoolExecutor
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.types import interrupt
 from config import find_project_root_heuristic, model, sanitize_and_resolve_path, fast_model
+from mcp_helper import run_agent_with_devtools_mcp
 from state import AgentState, PlanUpdate, TaskPlan, TaskTriage, Task
 from tools import (
-    GitManager, ReadFileLinesTool, UniversalSymbolSearchTool, WebInteractAndTestTool, WorkspaceTools, 
+    ChromeDevToolsMcpTool, GitManager, ReadFileLinesTool, UniversalSymbolSearchTool, WebInteractAndTestTool, WorkspaceTools, 
     ReadFilesTool, WriteFileTool, ApplyPatchTool, 
     ListDirectoryTool, RunTerminalTool, get_markdown_language
 )
@@ -486,7 +488,30 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
             )
         ]
     }
-
+def chrome_extension_debugger_node(state: AgentState) -> Dict[str, Any]:
+    """
+    Nút xử lý gỡ lỗi chuyên sâu sử dụng Chrome DevTools MCP.
+    """
+    user_query = "Hãy kiểm tra xem trang web hiện tại có phát sinh lỗi console hoặc lỗi mạng nào liên quan đến Extension của tôi không."
+    
+    # Chạy tác vụ bất đồng bộ từ luồng đồng bộ của LangGraph
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        # Tránh xung đột nếu Event Loop đang chạy
+        import nest_asyncio
+        nest_asyncio.apply()
+        
+    debug_result = asyncio.run(
+        run_agent_with_devtools_mcp(
+            model=model,
+            prompt_message=user_query,
+            chat_history=state.get("messages", [])
+        )
+    )
+    
+    return {
+        "messages": [AIMessage(content=f"📋 **[Kết quả kiểm tra DevTools]**:\n\n{debug_result}")]
+    }
 
 def executor_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
@@ -564,6 +589,9 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
 
     else:  # development
         web_interact_tool = WebInteractAndTestTool(workspace_path=ws)
+        # Khởi tạo công cụ Chrome DevTools MCP mới
+        chrome_devtools_tool = ChromeDevToolsMcpTool(workspace_path=ws) # <--- THÊM DÒNG NÀY
+        
         read_files = ReadFilesTool(workspace_path=ws)
         write_file = WriteFileTool(workspace_path=ws)
         apply_patch = ApplyPatchTool(workspace_path=ws)
@@ -572,8 +600,13 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         run_terminal_command = RunTerminalTool(workspace_path=ws)
         read_file_lines = ReadFileLinesTool(workspace_path=ws)
         
-        tools = [read_files, write_file, apply_patch, list_directory, run_terminal_command, search_symbols, read_file_lines, web_interact_tool]
-        
+        # Bổ sung chrome_devtools_tool vào danh sách tools dưới đây:
+        tools = [
+            read_files, write_file, apply_patch, list_directory, 
+            run_terminal_command, search_symbols, read_file_lines, 
+            web_interact_tool, 
+            chrome_devtools_tool  # <--- THÊM DÒNG NÀY
+        ]
         system_prompt = (
             "Bạn là một kỹ sư phần mềm thực thi chuyên nghiệp chuyên sửa lỗi và viết mới mã nguồn (Write-Access Mode).\n"
             f"Nhiệm vụ: Bạn đang thực hiện đồng thời các nhiệm vụ sau:\n{tasks_str}\n"
@@ -914,6 +947,7 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
     search_symbols = UniversalSymbolSearchTool(workspace_path=ws)
     read_file_lines = ReadFileLinesTool(workspace_path=ws)
     web_interact_tool = WebInteractAndTestTool(workspace_path=ws)
+    chrome_devtools_tool = ChromeDevToolsMcpTool(workspace_path=ws)
     tools_map = {
         "read_files": read_files,
         "write_file": write_file,
@@ -922,7 +956,8 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         "run_terminal_command": run_terminal_command,
         "search_symbols_universal": search_symbols,
         "read_file_lines": read_file_lines,
-        "web_interact_and_test": web_interact_tool
+        "web_interact_and_test": web_interact_tool,
+         "chrome_devtools_mcp_tool": chrome_devtools_tool 
     }
     
     last_message = state["messages"][-1]

@@ -27,20 +27,39 @@ def executor_router(state: AgentState) -> Literal["tool_node", "tester", "replan
     return "replanner"
 
 
-def tester_router(state: AgentState) -> Literal["executor", "replanner", "commit"]:
+def tester_router(state: AgentState) -> Literal["executor", "chrome_extension_debugger", "replanner", "commit"]:
     error = state.get("error_logs", "")
     attempts = state.get("attempts", 0)
     is_simple = state.get("is_simple", False)
+    extension_path = state.get("extension_path", "")
     
+    # 1. Nếu có lỗi kiểm tra tĩnh (cú pháp/biên dịch) và chưa quá 3 lần thử -> Quay lại sửa code [2]
     if error and attempts < 3:
         return "executor"
         
+    # 2. Nếu kiểm tra tĩnh ĐÃ THÀNH CÔNG và đây là dự án Chrome Extension: Chuyển sang kiểm thử động
+    if not error and extension_path:
+        return "chrome_extension_debugger"
+        
+    # 3. Các trường hợp thông thường khác
     if is_simple:
         return "commit"
         
     return "replanner"
 
-
+def debugger_router(state: AgentState) -> Literal["executor", "replanner", "synthesis"]:
+    runtime_error = state.get("error_logs", "")
+    is_simple = state.get("is_simple", False)
+    
+    # Nếu phát hiện lỗi crash runtime của Extension -> Đưa thông tin lỗi quay lại để sửa đổi
+    if runtime_error:
+        return "executor" if is_simple else "replanner"
+        
+    # Nếu chạy mượt mà không có lỗi: Tiếp tục kế hoạch
+    if is_simple:
+        return "synthesis"
+        
+    return "replanner"
 def replanner_router(state: AgentState) -> Literal["executor", "synthesis"]:
     plan = state["plan"]
     

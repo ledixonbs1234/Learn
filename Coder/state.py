@@ -125,3 +125,7 @@ class WebInteractionState(TypedDict):
     screenshot_path: Optional[str]
     error: Optional[str]
     attempts: int
+    
+class RuntimeVerificationResult(BaseModel):
+    has_critical_error: bool = Field(description="True nếu phát hiện lỗi crash, exception, lỗi CORS, hoặc lỗi console đỏ nghiêm trọng.")
+    error_summary: str = Field(description="Tóm tắt ngắn gọn lỗi runtime phát hiện được (nếu có).")

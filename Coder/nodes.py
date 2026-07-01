@@ -14,9 +14,9 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langgraph.types import interrupt
 from config import find_project_root_heuristic, model, sanitize_and_resolve_path, fast_model
 from mcp_helper import run_agent_with_devtools_mcp
-from state import AgentState, PlanUpdate, TaskPlan, TaskTriage, Task
+from state import AgentState, PlanUpdate, RuntimeVerificationResult, TaskPlan, TaskTriage, Task
 from tools import (
-    ChromeDevToolsMcpTool, GitManager, ReadFileLinesTool, UniversalSymbolSearchTool, WebInteractAndTestTool, WorkspaceTools, 
+    GitManager, ReadFileLinesTool, UniversalSymbolSearchTool, WebInteractAndTestTool, WorkspaceTools, 
     ReadFilesTool, WriteFileTool, ApplyPatchTool, 
     ListDirectoryTool, RunTerminalTool, get_markdown_language
 )
@@ -415,7 +415,7 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
         
     user_query_text = get_text_content_safely(user_msg.content)
     
-    structured_llm = fast_model.with_structured_output(TaskTriage, method="function_calling")
+    structured_llm = model.with_structured_output(TaskTriage, method="function_calling")
     
     system_prompt = (
         "Bạn là một điều phối viên Agent thông minh cấp cao (Triage Supervisor).\n"
@@ -491,27 +491,69 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
 def chrome_extension_debugger_node(state: AgentState) -> Dict[str, Any]:
     """
     Nút xử lý gỡ lỗi chuyên sâu sử dụng Chrome DevTools MCP.
+    Đánh giá xem Extension có chạy mượt mà ở runtime hay không.
     """
-    user_query = "Hãy kiểm tra xem trang web hiện tại có phát sinh lỗi console hoặc lỗi mạng nào liên quan đến Extension của tôi không."
+    ws = state["workspace_path"]
+    ext_path = state.get("extension_path")
     
-    # Chạy tác vụ bất đồng bộ từ luồng đồng bộ của LangGraph
-    loop = asyncio.get_event_loop()
+    if not ext_path:
+        return {"messages": [AIMessage(content="Bỏ qua gỡ lỗi: Không tìm thấy Extension Path.")]}
+
+    user_query = (
+        f"Hãy kết nối CDP vào Chrome, nạp Extension từ thư mục '{ext_path}', "
+        f"kiểm tra xem có bất kỳ thông báo lỗi console hoặc lỗi network request nào "
+        f"liên quan đến Extension hoạt động không."
+    )
+    
+    # Kích hoạt MCP Client chạy bất đồng bộ một cách an toàn
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     if loop.is_running():
-        # Tránh xung đột nếu Event Loop đang chạy
         import nest_asyncio
         nest_asyncio.apply()
         
-    debug_result = asyncio.run(
+    debug_raw_output = loop.run_until_complete(
         run_agent_with_devtools_mcp(
             model=model,
             prompt_message=user_query,
-            chat_history=state.get("messages", [])
+            chat_history=list(state.get("messages", []))
         )
     )
     
-    return {
-        "messages": [AIMessage(content=f"📋 **[Kết quả kiểm tra DevTools]**:\n\n{debug_result}")]
+    # Sử dụng fast_model để phân tích nhanh kết quả thô xem có thực sự bị lỗi hay không
+    structured_evaluator = model.with_structured_output(RuntimeVerificationResult, method="function_calling")
+    
+    system_prompt = (
+        "Bạn là một chuyên gia QA. Hãy đọc báo cáo gỡ lỗi trình duyệt và xác định xem "
+        "ứng dụng/extension có gặp lỗi runtime nghiêm trọng nào không (như crash, undefined variables, "
+        "failed to load resource, hoặc lỗi CORS)."
+    )
+    
+    try:
+        eval_result = structured_evaluator.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=f"Báo cáo gỡ lỗi thô:\n\n{debug_raw_output}")
+        ])
+        has_error = eval_result.has_critical_error
+        error_summary = eval_result.error_summary
+    except Exception:
+        has_error = False
+        error_summary = ""
+        
+    ret_state = {
+        "browser_console_logs": debug_raw_output,
+        "messages": [AIMessage(content=f"📋 **[Kết quả kiểm tra Runtime CDP]**:\n\n{debug_raw_output}")]
     }
+    
+    if has_error:
+        ret_state["error_logs"] = f"❌ [Lỗi Runtime Trình Duyệt]: {error_summary}"
+        
+    return ret_state
+
 
 def executor_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
@@ -536,9 +578,6 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         for t in eligible_tasks
     ])
 
-    # =====================================================================
-    # GIẢI PHÁP: TRÍCH XUẤT FILE REGISTRY LÀM SINGLE SOURCE OF TRUTH CHUNG
-    # =====================================================================
     registry_context_str = ""
     if file_registry:
         registry_context_str = "\n=== 📦 NỘI DUNG MÃ NGUỒN CẬP NHẬT MỚI NHẤT (SINGLE SOURCE OF TRUTH) ===\n"
@@ -553,6 +592,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             )
 
     if task_type == "analysis":
+        # ... [Giữ nguyên phần phân tích analysis] ...
         read_files = ReadFilesTool(workspace_path=ws)
         list_directory = ListDirectoryTool(workspace_path=ws)
         search_symbols = UniversalSymbolSearchTool(workspace_path=ws)
@@ -572,7 +612,6 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         if workspace_context:
             system_prompt += f"\n--- TỔNG QUAN VỀ DỰ ÁN (THONGTIN.md) ---\n{workspace_context}\n"
             
-        # 🔔 CẬP NHẬT: Nạp registry mã nguồn vào System Prompt của chế độ Khảo sát (Analysis Mode)
         if registry_context_str:
             system_prompt += registry_context_str
             
@@ -580,17 +619,12 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             "\nHãy sử dụng các công cụ khảo sát cấu trúc hệ thống.\n"
             "\n⚠️ RÀNG BUỘC PHẠM VI NGHIÊM NGẶT (BẮT BUỘC):\n"
             "1. Bạn chỉ có quyền ĐỌC dữ liệu, tuyệt đối không chỉnh sửa mã nguồn hoặc tự ý tạo tệp tin trong bước này.\n"
-            "2. KHÔNG ĐƯỢC PHÉP tự ý định dạng tài liệu báo cáo hoàn chỉnh, tổng hợp tri thức hay viết tệp THONGTIN.md. "
-            "Nhiệm vụ của bạn chỉ là thu thập thông tin thô, liệt kê các phát hiện kỹ thuật (raw findings) thực tế. "
-            "Việc tổng hợp chúng thành một tài liệu THONGTIN.md hoàn chỉnh là nhiệm vụ ĐỘC QUYỀN của node 'synthesis' tiếp theo."
+            "2. KHÔNG ĐƯỢC PHÉP tự ý định dạng tài liệu báo cáo hoàn chỉnh, tổng hợp tri thức hay viết tệp THONGTIN.md."
         )
         if previous_findings_str:
             system_prompt += previous_findings_str
 
     else:  # development
-        web_interact_tool = WebInteractAndTestTool(workspace_path=ws)
-        # Khởi tạo công cụ Chrome DevTools MCP mới
-        chrome_devtools_tool = ChromeDevToolsMcpTool(workspace_path=ws) # <--- THÊM DÒNG NÀY
         
         read_files = ReadFilesTool(workspace_path=ws)
         write_file = WriteFileTool(workspace_path=ws)
@@ -600,12 +634,9 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         run_terminal_command = RunTerminalTool(workspace_path=ws)
         read_file_lines = ReadFileLinesTool(workspace_path=ws)
         
-        # Bổ sung chrome_devtools_tool vào danh sách tools dưới đây:
         tools = [
             read_files, write_file, apply_patch, list_directory, 
             run_terminal_command, search_symbols, read_file_lines, 
-            web_interact_tool, 
-            chrome_devtools_tool  # <--- THÊM DÒNG NÀY
         ]
         system_prompt = (
             "Bạn là một kỹ sư phần mềm thực thi chuyên nghiệp chuyên sửa lỗi và viết mới mã nguồn (Write-Access Mode).\n"
@@ -615,12 +646,20 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         if workspace_context:
             system_prompt += f"\n--- TỔNG QUAN VỀ DỰ ÁN (THONGTIN.md) ---\n{workspace_context}\n"
         
+        # =====================================================================
+        # CẬP NHẬT: PHỐI HỢP ĐỒNG BỘ ĐỂ GỠ LỖI CHROME EXTENSION QUA MCP DEVTOOLS
+        # =====================================================================
         if extension_path:
-            system_prompt += f"\nℹ️ **[Phát hiện Chrome Extension]**: Thư mục Extension đã được định vị tại: `{extension_path}`. " \
-                             f"Khi kiểm thử động trang web, hãy luôn truyền tham số `extension_path` này vào công cụ `web_interact_and_test` " \
-                             f"để trình duyệt tự động nạp Extension của bạn.\n"
+            system_prompt += (
+                f"\nℹ️ **[Phát hiện Chrome Extension]**: Thư mục Extension đã được định vị tại: `{extension_path}`.\n"
+                f"Hãy phối hợp nhịp nhàng các công cụ gỡ lỗi theo quy trình sau:\n"
+                f"1. **Tải và tương tác với Extension**: Luôn truyền tham số `extension_path` (đường dẫn tương đối) vào công cụ `web_interact_and_test` "
+                f"khi tiến hành kiểm thử động trang web nhằm đảm bảo trình duyệt tự động nạp Extension của bạn [2].\n"
+                f"2. **Gỡ lỗi và phân tích chuyên sâu (Chrome DevTools Protocol - CDP)**: Sử dụng công cụ `chrome_devtools_mcp_tool` "
+                f"với các hành động thích hợp (chọn `get_console_logs` để kiểm tra lỗi runtime trong nền, `get_network_requests` để bắt lỗi API/CORS, "
+                f"hoặc `evaluate_js` để chạy các đoạn mã kiểm tra trực tiếp qua CDP) để thu thập thông tin gỡ lỗi đầy đủ nhất khi trang web đang mở.\n"
+            )
 
-        # Nạp registry mã nguồn vào System Prompt của chế độ Phát triển (Development Mode)
         if registry_context_str:
             system_prompt += registry_context_str
             
@@ -628,7 +667,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             "\n⚠️ QUY TẮC PHẠM VI VÀ PHÒNG TRÁNH LỆCH DÒNG (BẮT BUỘC):\n"
             "1. Bạn đã được cung cấp nguồn mã nguồn mới nhất (đã đánh số dòng chi tiết) trong mục 'SINGLE SOURCE OF TRUTH' ở trên.\n"
             "2. ĐÂY LÀ NỘI DUNG MỚI NHẤT VÀ CHÍNH XÁC NHẤT. Hãy luôn sử dụng mốc dòng và nội dung từ mục này để thiết lập khối SEARCH-AND-REPLACE cho công cụ `apply_search_replace_patch`.\n"
-            "3. Nếu bạn vừa sửa đổi một file ở bước trước, nội dung file đó trong mục 'SINGLE SOURCE OF TRUTH' đã được cập nhật tự động. Bạn không cần phải gọi lại công cụ đọc trừ khi muốn kiểm tra sâu hơn.\n"
+            "3. Nếu bạn vừa sửa đổi một file ở bước trước, nội dung file đó trong mục 'SINGLE SOURCE OF TRUTH' đã được cập nhật tự động.\n"
             "\n⚠️ QUY TẮC SỬ DỤNG CÔNG CỤ:\n"
             "1. Đối với file trên 300 dòng: BẮT BUỘC dùng `apply_search_replace_patch` để áp dụng bản vá, cấm ghi đè bừa bãi.\n"
             "2. Công cụ `write_file` chỉ dùng khi tạo mới hoặc sửa các tệp ngắn dưới 300 dòng.\n"
@@ -947,7 +986,6 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
     search_symbols = UniversalSymbolSearchTool(workspace_path=ws)
     read_file_lines = ReadFileLinesTool(workspace_path=ws)
     web_interact_tool = WebInteractAndTestTool(workspace_path=ws)
-    chrome_devtools_tool = ChromeDevToolsMcpTool(workspace_path=ws)
     tools_map = {
         "read_files": read_files,
         "write_file": write_file,
@@ -957,7 +995,6 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         "search_symbols_universal": search_symbols,
         "read_file_lines": read_file_lines,
         "web_interact_and_test": web_interact_tool,
-         "chrome_devtools_mcp_tool": chrome_devtools_tool 
     }
     
     last_message = state["messages"][-1]

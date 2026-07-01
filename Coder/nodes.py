@@ -54,21 +54,14 @@ def sanitize_llm_response_content(response: AIMessage) -> AIMessage:
 def compact_reading_tool_messages(messages: List[BaseMessage]) -> List[BaseMessage]:
     compacted_messages = []
     for msg in messages:
-        if msg.type == "tool" and msg.name in ["read_files", "read_file_lines", "search_symbols_universal"]:
+        # 🛡️ CHỈ nén 'read_files' (đọc toàn bộ file), KHÔNG nén 'read_file_lines' và 'search_symbols_universal'
+        if msg.type == "tool" and msg.name in ["read_files"]:
             content_str = str(msg.content)
             found_files = []
             
             matches_read = re.findall(r"=== TỆP TIN:\s*[`']?([^`'\n]+)[`']?\s*===", content_str)
             if matches_read:
                 found_files.extend(matches_read)
-                
-            matches_lines = re.findall(r"=== NỘI DUNG TỆP KHOANH VÙNG:\s*([^ \n]+)", content_str)
-            if matches_lines:
-                found_files.extend(matches_lines)
-                
-            matches_symbols = re.findall(r"📁\s*`([^`\n]+)`", content_str)
-            if matches_symbols:
-                found_files.extend(matches_symbols)
                 
             file_info = f" của tệp {', '.join([f'`{f}`' for f in found_files])}" if found_files else ""
             
@@ -555,6 +548,8 @@ def chrome_extension_debugger_node(state: AgentState) -> Dict[str, Any]:
     return ret_state
 
 
+# THAY THẾ ĐOẠN CODE TRONG oder/nodes.py BẰNG ĐOẠN DƯỚI ĐÂY
+
 def executor_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
     plan = state["plan"]
@@ -565,6 +560,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
     task_type = state.get("task_type", "development")
     extension_path = state.get("extension_path", "")
     
+    # 1. Định vị các nhiệm vụ đủ điều kiện thực thi
     eligible_tasks = get_eligible_tasks(plan)
     if not eligible_tasks:
         pending_tasks = [t for t in plan if (t.get("status") if isinstance(t, dict) else getattr(t, "status", None)) == "pending"]
@@ -578,6 +574,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         for t in eligible_tasks
     ])
 
+    # 2. Định dạng Single Source of Truth
     registry_context_str = ""
     if file_registry:
         registry_context_str = "\n=== 📦 NỘI DUNG MÃ NGUỒN CẬP NHẬT MỚI NHẤT (SINGLE SOURCE OF TRUTH) ===\n"
@@ -591,8 +588,8 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
                 f"```{lang}\n" + "\n".join(formatted_lines) + "\n```\n"
             )
 
+    # 3. Thiết lập hệ thống công cụ và System Prompt tương ứng
     if task_type == "analysis":
-        # ... [Giữ nguyên phần phân tích analysis] ...
         read_files = ReadFilesTool(workspace_path=ws)
         list_directory = ListDirectoryTool(workspace_path=ws)
         search_symbols = UniversalSymbolSearchTool(workspace_path=ws)
@@ -624,8 +621,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         if previous_findings_str:
             system_prompt += previous_findings_str
 
-    else:  # development
-        
+    else:  # task_type == "development"
         read_files = ReadFilesTool(workspace_path=ws)
         write_file = WriteFileTool(workspace_path=ws)
         apply_patch = ApplyPatchTool(workspace_path=ws)
@@ -646,9 +642,6 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         if workspace_context:
             system_prompt += f"\n--- TỔNG QUAN VỀ DỰ ÁN (THONGTIN.md) ---\n{workspace_context}\n"
         
-        # =====================================================================
-        # CẬP NHẬT: PHỐI HỢP ĐỒNG BỘ ĐỂ GỠ LỖI CHROME EXTENSION QUA MCP DEVTOOLS
-        # =====================================================================
         if extension_path:
             system_prompt += (
                 f"\nℹ️ **[Phát hiện Chrome Extension]**: Thư mục Extension đã được định vị tại: `{extension_path}`.\n"
@@ -656,8 +649,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
                 f"1. **Tải và tương tác với Extension**: Luôn truyền tham số `extension_path` (đường dẫn tương đối) vào công cụ `web_interact_and_test` "
                 f"khi tiến hành kiểm thử động trang web nhằm đảm bảo trình duyệt tự động nạp Extension của bạn [2].\n"
                 f"2. **Gỡ lỗi và phân tích chuyên sâu (Chrome DevTools Protocol - CDP)**: Sử dụng công cụ `chrome_devtools_mcp_tool` "
-                f"với các hành động thích hợp (chọn `get_console_logs` để kiểm tra lỗi runtime trong nền, `get_network_requests` để bắt lỗi API/CORS, "
-                f"hoặc `evaluate_js` để chạy các đoạn mã kiểm tra trực tiếp qua CDP) để thu thập thông tin gỡ lỗi đầy đủ nhất khi trang web đang mở.\n"
+                f"với các hành động thích hợp để thu thập thông tin gỡ lỗi đầy đủ nhất khi trang web đang mở.\n"
             )
 
         if registry_context_str:
@@ -674,6 +666,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             "3. NGHIÊM CẤM thực hiện chạy các bộ kiểm thử tự động (như pytest, cargo test, dart test, npm test, vitest) bằng công cụ `run_terminal_command`."
         )
 
+    # 4. Gọi LLM
     model_with_tools = model.bind_tools(tools)
     optimized_history = compact_reading_tool_messages(messages)
     
@@ -684,37 +677,93 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
     response = model_with_tools.invoke(input_messages + optimized_history)
     response = sanitize_llm_response_content(response)
     
+    # =====================================================================
+    # 5. XỬ LÝ LỌC BỎ LỖI HOÀN THÀNH NHIỆM VỤ NON (DEFENSIVE PARSING)
+    # =====================================================================
     if not response.tool_calls:
-        findings = []
-        if task_type == "analysis" and response.content:
-            tasks_ids = ", ".join([str(getattr(t, "id", None) or t.get('id')) for t in eligible_tasks])
-            findings = [f"### Kết quả khảo sát các nhiệm vụ ({tasks_ids}):\n{response.content}"]
+        # Trường hợp 5.1: Nếu đây là tác vụ phân tích (Analysis) -> Trả lời suông là hoàn toàn hợp lệ
+        if task_type == "analysis":
+            findings = []
+            if response.content:
+                tasks_ids = ", ".join([str(getattr(t, "id", None) or t.get('id')) for t in eligible_tasks])
+                findings = [f"### Kết quả khảo sát các nhiệm vụ ({tasks_ids}):\n{response.content}"]
+                
+            updated_plan = []
+            eligible_ids = {t.get("id") if isinstance(t, dict) else getattr(t, "id", None) for t in eligible_tasks}
+            for t in plan:
+                if isinstance(t, dict):
+                    t_copy = dict(t)
+                    if t_copy["id"] in eligible_ids:
+                        t_copy["status"] = "completed"
+                else:
+                    t_copy = t.model_copy()
+                    if t_copy.id in eligible_ids:
+                        t_copy.status = "completed"
+                updated_plan.append(t_copy)
+
+            ret_dict = {
+                "messages": [response],
+                "plan": updated_plan,
+                "last_executed_task_ids": list(eligible_ids)
+            }
+            if findings:
+                ret_dict["step_findings"] = findings
+            return ret_dict
+
+        # Trường hợp 5.2: Nếu là tác vụ Phát triển (Development) nhưng không có tool calls
+        else:
+            # Kiểm tra xem trong lịch sử hội thoại gần nhất của chu kỳ thực thi này, 
+            # đã có bất kỳ công cụ chỉnh sửa hay kiểm tra nào thực sự được gọi chưa.
+            has_executed_physical_action = False
+            for msg in reversed(messages):
+                # Nếu gặp điểm phân luồng mới, dừng quét lịch sử
+                if isinstance(msg, HumanMessage) and "LƯU Ý SỬA LỖI" in str(msg.content):
+                    break
+                if getattr(msg, "type", None) == "tool" and msg.name in ["write_file", "apply_search_replace_patch", "run_terminal_command", "web_interact_and_test"]:
+                    has_executed_physical_action = True
+                    break
             
-        updated_plan = []
-        eligible_ids = {t.get("id") if isinstance(t, dict) else getattr(t, "id", None) for t in eligible_tasks}
-        for t in plan:
-            if isinstance(t, dict):
-                t_copy = dict(t)
-                if t_copy["id"] in eligible_ids:
-                    t_copy["status"] = "completed"
+            # Kiểm tra thêm nếu LLM có đề cập rõ ràng đến việc "hoàn thành" hay "đã làm xong" trong phản hồi văn bản
+            content_lower = response.content.lower() if response.content else ""
+            explicitly_finished = any(kw in content_lower for kw in ["đã hoàn thành", "đã hoàn tất", "done", "finished successfully"])
+
+            # Điều kiện quyết định: Chỉ đánh dấu hoàn thành nếu thực sự có hành động vật lý đã chạy hoặc có lời khẳng định rõ ràng
+            if has_executed_physical_action or explicitly_finished:
+                updated_plan = []
+                eligible_ids = {t.get("id") if isinstance(t, dict) else getattr(t, "id", None) for t in eligible_tasks}
+                for t in plan:
+                    if isinstance(t, dict):
+                        t_copy = dict(t)
+                        if t_copy["id"] in eligible_ids:
+                            t_copy["status"] = "completed"
+                    else:
+                        t_copy = t.model_copy()
+                        if t_copy.id in eligible_ids:
+                            t_copy.status = "completed"
+                    updated_plan.append(t_copy)
+
+                return {
+                    "messages": [response],
+                    "plan": updated_plan,
+                    "last_executed_task_ids": list(eligible_ids)
+                }
+            
+            # Phòng thủ chặn lỗi: Nếu LLM chỉ nói suông mà không gọi bất cứ công cụ nào và lịch sử trống rỗng
             else:
-                t_copy = t.model_copy()
-                if t_copy.id in eligible_ids:
-                    t_copy.status = "completed"
-            updated_plan.append(t_copy)
-
-        ret_dict = {
-            "messages": [response],
-            "plan": updated_plan,
-            "last_executed_task_ids": list(eligible_ids)
-        }
-        if task_type == "analysis" and findings:
-            ret_dict["step_findings"] = findings
-            
-        return ret_dict
+                warning_feedback = HumanMessage(
+                    content=(
+                        "⚠️ Cảnh báo hệ thống: Bạn đang trong luồng Phát triển (Development Mode) nhưng chưa kích hoạt "
+                        "bất kỳ công cụ sửa đổi vật lý nào (như write_file, apply_search_replace_patch). "
+                        "Hãy thực hiện viết hoặc vá mã nguồn trước khi kết thúc cuộc hội thoại."
+                    )
+                )
+                # Trả về một thông điệp ép buộc mô hình chạy lại tại executor_node mà không chuyển bước
+                return {
+                    "messages": [response, warning_feedback]
+                }
     else:
+        # Nếu LLM vẫn đang gọi các công cụ thực thi, tiếp tục luồng lặp bình thường
         return {"messages": [response]}
-
 
 def replanner_node(state: AgentState) -> Dict[str, Any]:
     replanning_count = state.get("replanning_count", 0)
@@ -725,12 +774,14 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
     workspace_context = state.get("workspace_context", "")
     error_logs = state.get("error_logs", "")
     
+    # Xác định xem có phải đang ở pha chuyển tiếp từ thám thính (T_SURVEY) sang phát triển hay không
     is_survey_transition = (
         len(plan) == 1 and 
         (plan[0].id if isinstance(plan[0], Task) else plan[0].get("id")) == "T_SURVEY" and
         (plan[0].status if isinstance(plan[0], Task) else plan[0].get("status")) == "completed"
     )
     
+    # Tránh lặp vô hạn nếu vượt ngưỡng hoặc không có lỗi
     if replanning_count >= 5 or (not error_logs and not is_survey_transition):
         action_msg = "bypass_limit" if replanning_count >= 5 else "bypass_no_error"
         proposal_message = AIMessage(
@@ -758,7 +809,7 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
             "2. Giữ nguyên nhiệm vụ 'T_SURVEY' với trạng thái là 'completed'.\n"
             "3. Bổ sung các nhiệm vụ mới (ví dụ: T1, T2...) mô tả chính xác các file cần xem, các file cần sửa dựa trên dữ liệu thật thu được từ pha khảo sát.\n"
             "4. TUYỆT ĐỐI BẮT BUỘC phải lập kế hoạch cho nhiệm vụ 'Kiểm thử tích hợp động trên trình duyệt thật' sử dụng công cụ `web_interact_and_test` "
-            "để trực tiếp nạp Extension, truy cập trang web đích (ví dụ: abc.com) và xác thực hành vi của Extension làm bước cuối cùng trong kế hoạch!\n"
+            "để trực tiếp nạp Extension, truy cập trang web đích và xác thực hành vi của Extension làm bước cuối cùng trong kế hoạch!\n"
             "5. Đặt `task_type` là 'development' (vì chúng ta sẽ sửa code và chạy trình duyệt kiểm thử)."
         )
     else:
@@ -824,28 +875,79 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
             "tasks": [t.model_dump() if hasattr(t, "model_dump") else t for t in refined_tasks]
         }
         
-        proposal_message = AIMessage(
-            content=json.dumps(proposal_data, ensure_ascii=False),
-            name="replanner_proposal"
-        )
-        
-        explanation_message = AIMessage(
-            content=f"🔄 **[Đề xuất lộ trình hành động dựa trên kết quả khảo sát]**\n\n{explanation}\n\nHệ thống đang chờ bạn phê duyệt hoặc tinh chỉnh..."
-        )
-        
-        return {
-            "replanning_count": replanning_count + 1,
-            "messages": [proposal_message, explanation_message]
-        }
-        
     except Exception as e:
-        proposal_message = AIMessage(
-            content=json.dumps({"action": "bypass_error", "error": str(e)}, ensure_ascii=False),
-            name="replanner_proposal"
+        # =====================================================================
+        # KÍCH HOẠT HỆ THỐNG DỰ PHÒNG CHỦ ĐỘNG (FAIL-SAFE ENGINE)
+        # =====================================================================
+        # Khi Local LLM qua localhost proxy bị lỗi phân tích cú pháp hoặc mất kết nối,
+        # chúng ta tự động dựng lại một Schema PlanUpdate hợp lệ theo hướng kỹ thuật.
+        
+        fail_safe_explanation = (
+            f"⚠️ [Hệ thống tự động kích hoạt chế độ Dự phòng do lỗi gọi LLM Local: {str(e)}]. "
         )
-        return {
-            "messages": [proposal_message]
+        
+        if is_survey_transition:
+            # Nếu đang chuyển từ Khảo sát sang Phát triển, bắt buộc phải sinh ra Task sửa code
+            fail_safe_explanation += "Tự động thiết lập lộ trình phát triển và kiểm thử tích hợp mặc định."
+            fallback_tasks = [
+                Task(id="T_SURVEY", description="Khảo sát cấu trúc thư mục và manifest", status="completed"),
+                Task(
+                    id="T_DEV_FALLBACK", 
+                    description="Thực hiện viết/chỉnh sửa mã nguồn trực tiếp trong workspace dựa trên yêu cầu ban đầu của người dùng.", 
+                    dependencies=["T_SURVEY"], 
+                    status="pending"
+                ),
+                Task(
+                    id="T_TEST_FALLBACK",
+                    description="Khởi chạy trình duyệt thật, nạp thử nghiệm Chrome Extension từ ổ đĩa và kiểm tra lỗi console runtime.",
+                    dependencies=["T_DEV_FALLBACK"],
+                    status="pending"
+                )
+            ]
+            updated_task_type = "development"
+        else:
+            # Nếu đang chạy sửa lỗi dở dang mà LLM bị sập, giữ nguyên các task cũ để tránh mất mát,
+            # đồng thời tiêm thêm một Task mô tả việc sửa lỗi trực tiếp.
+            fail_safe_explanation += "Bảo toàn kế hoạch hiện hành và chèn thêm nhiệm vụ sửa đổi trực tiếp."
+            fallback_tasks = []
+            for t in plan:
+                t_obj = t if isinstance(t, Task) else Task(**t)
+                fallback_tasks.append(t_obj)
+                
+            has_pending = any(t.status == "pending" for t in fallback_tasks)
+            if not has_pending:
+                fallback_tasks.append(
+                    Task(
+                        id="T_FIX_FALLBACK",
+                        description=f"Tiến hành rà soát sửa lỗi biên dịch/runtime phát sinh: {error_logs[:150]}",
+                        dependencies=[],
+                        status="pending"
+                    )
+                )
+            updated_task_type = task_type
+
+        # Xuất ra dữ liệu có định dạng cấu trúc hoàn hảo như LLM sinh thành công
+        proposal_data = {
+            "action": "propose",
+            "explanation": fail_safe_explanation,
+            "task_type": updated_task_type,
+            "tasks": [t.model_dump() for t in fallback_tasks]
         }
+        
+    # Tạo đóng gói phản hồi đồng nhất
+    proposal_message = AIMessage(
+        content=json.dumps(proposal_data, ensure_ascii=False),
+        name="replanner_proposal"
+    )
+    
+    explanation_message = AIMessage(
+        content=f"🔄 **[Đề xuất lộ trình hành động]**\n\n{proposal_data['explanation']}\n\nHệ thống đang tiến hành điều phối..."
+    )
+    
+    return {
+        "replanning_count": replanning_count + 1,
+        "messages": [proposal_message, explanation_message]
+    }
 
 
 def replanner_interrupt_node(state: AgentState) -> Dict[str, Any]:
@@ -867,12 +969,25 @@ def replanner_interrupt_node(state: AgentState) -> Dict[str, Any]:
     except Exception:
         return {}
         
-    if proposal_data.get("action") in ["bypass_limit", "bypass_no_error", "bypass_error"]:
+    # Xử lý trường hợp chạm giới hạn lập kế hoạch lại (an toàn phòng thủ)
+    if proposal_data.get("action") in ["bypass_limit", "bypass_no_error"]:
+        # Nếu đã lặp quá 5 lần, giữ nguyên kế hoạch cũ nhưng bắt buộc phải có ít nhất 1 task pending 
+        # để tránh việc router đẩy thẳng sang synthesis gây Halt luồng vô ích.
+        fallback_tasks = []
+        for t in plan:
+            fallback_tasks.append(t if isinstance(t, Task) else Task(**t))
+            
+        has_pending = any(t.status == "pending" for t in fallback_tasks)
+        if not has_pending and fallback_tasks:
+            # Khôi phục trạng thái của task cuối cùng về pending để tiếp tục sửa chữa
+            fallback_tasks[-1].status = "pending"
+            
         return {
+            "plan": fallback_tasks,
             "error_logs": "",
             "attempts": 0,
             "modified_files": [],
-            "messages": [AIMessage(content="🔄 [Bypass Replanner] Tiếp tục lộ trình thực thi hiện hành.")]
+            "messages": [AIMessage(content="🔄 [Bypass Replanner] Đã vượt ngưỡng giới hạn lập kế hoạch. Tiếp tục sửa chữa mã nguồn.")]
         }
         
     payload = {
@@ -882,22 +997,27 @@ def replanner_interrupt_node(state: AgentState) -> Dict[str, Any]:
         "prompt": (
             "Hệ thống đề xuất điều chỉnh lộ trình như trên.\n"
             "- Gửi phản hồi 'yes' hoặc rỗng để ĐỒNG Ý áp dụng kế hoạch mới.\n"
-            "- Gửi phản hồi 'skip' hoặc 'no' để BỎ QUA việc lập kế hoạch lại (Agent sẽ tiếp tục chạy kế hoạch cũ của các bước chưa hoàn thành).\n"
-            "- Gửi danh sách nhiệm vụ JSON tự chỉnh sửa để áp dụng kế hoạch thủ công."
+            "- Gửi phản hồi 'skip' hoặc 'no' để BỎ QUA việc lập kế hoạch lại.\n"
         )
     }
     
+    # Kích hoạt ngắt đồ thị chờ duyệt (hoặc tự động lấy input nếu chạy CLI không tương tác)
     user_input = interrupt(payload)
     
     if isinstance(user_input, str):
         user_input_clean = user_input.strip().lower()
         
         if user_input_clean in ["skip", "no", "cancel"]:
+            # Nếu người dùng từ chối đổi kế hoạch, ta vẫn giữ kế hoạch cũ nhưng phải đảm bảo có task pending
+            fallback_tasks = [t if isinstance(t, Task) else Task(**t) for t in plan]
+            if not any(t.status == "pending" for t in fallback_tasks) and fallback_tasks:
+                fallback_tasks[-1].status = "pending"
             return {
+                "plan": fallback_tasks,
                 "error_logs": "",           
                 "attempts": 0,
                 "modified_files": [],
-                "messages": [AIMessage(content="⏭️ **[Người dùng chọn đi tiếp]** Đã bỏ qua đợt lập kế hoạch lại theo ý muốn. Chuyển sang nhiệm vụ tiếp theo.")]
+                "messages": [AIMessage(content="⏭️ **[Người dùng bỏ qua kế hoạch mới]** Tiếp tục lộ trình thực thi hiện tại.")]
             }
             
         elif user_input_clean in ["yes", "approve", "ok", ""]:
@@ -908,10 +1028,11 @@ def replanner_interrupt_node(state: AgentState) -> Dict[str, Any]:
                 "error_logs": "",
                 "attempts": 0,
                 "modified_files": [],
-                "messages": [AIMessage(content="✅ **[Kế hoạch được duyệt]** Người dùng đã phê duyệt kế hoạch chỉnh sửa.")]
+                "messages": [AIMessage(content="✅ **[Kế hoạch được duyệt]** Áp dụng lộ trình phát triển mới thành công.")]
             }
             
         else:
+            # Xử lý JSON tự nhập từ người dùng
             try:
                 parsed_tasks = json.loads(user_input)
                 if isinstance(parsed_tasks, list):
@@ -921,50 +1042,12 @@ def replanner_interrupt_node(state: AgentState) -> Dict[str, Any]:
                         "error_logs": "",
                         "attempts": 0,
                         "modified_files": [],
-                        "messages": [AIMessage(content="✏️ **[Điều chỉnh thủ công]** Đã áp dụng kế hoạch tùy chỉnh do người dùng thiết lập.")]
+                        "messages": [AIMessage(content="✏️ **[Kế hoạch tùy chỉnh]** Đã áp dụng danh sách nhiệm vụ của bạn.")]
                     }
             except Exception:
                 pass
             
-            return {
-                "error_logs": "",
-                "attempts": 0,
-                "modified_files": [],
-                "messages": [AIMessage(content=f"⏭️ **[Đi tiếp với lưu ý]** Đã ghi nhận phản hồi của bạn: '{user_input}'. Giữ lộ trình cũ.")]
-            }
-            
-    elif isinstance(user_input, dict):
-        action = user_input.get("action", "approve")
-        if action in ["skip", "no"]:
-            return {
-                "error_logs": "",
-                "attempts": 0,
-                "modified_files": [],
-                "messages": [AIMessage(content="⏭️ **[Người dùng chọn đi tiếp]** Bỏ qua đợt lập kế hoạch lại.")]
-            }
-            
-        if "tasks" in user_input:
-            try:
-                custom_tasks = [Task(**t) for t in user_input["tasks"]]
-                return {
-                    "plan": custom_tasks,
-                    "task_type": user_input.get("task_type", task_type),
-                    "error_logs": "",
-                    "attempts": 0,
-                    "modified_files": [],
-                    "messages": [AIMessage(content="✏️ **[Đã cập nhật kế hoạch]** Áp dụng thiết kế kế hoạch thủ công từ UI.")]
-                }
-            except Exception as e:
-                refined_tasks = [Task(**t) for t in proposal_data["tasks"]]
-                return {
-                    "plan": refined_tasks,
-                    "task_type": proposal_data["task_type"],
-                    "error_logs": "",
-                    "attempts": 0,
-                    "modified_files": [],
-                    "messages": [AIMessage(content=f"⚠️ Định dạng kế hoạch tùy chỉnh không hợp lệ ({str(e)}). Tự động sử dụng bản đề xuất của AI.")]
-                }
-
+    # Mặc định tự động duyệt (Auto-approve) khi chạy không tương tác
     refined_tasks = [Task(**t) for t in proposal_data["tasks"]]
     return {
         "plan": refined_tasks,
@@ -1012,12 +1095,14 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         tool_args = tool_call["args"] or {}
         tool_id = tool_call["id"]
         
-        raw_path = tool_args.get("file_path") or tool_args.get("file_paths")
-        if raw_path:
-            if isinstance(raw_path, list):
-                impacted_files.update(raw_path)
-            else:
-                impacted_files.add(str(raw_path))
+        # 🛡️ CHỈ nạp vào Registry các file bị can thiệp bởi công cụ Ghi/Sửa hoặc Đọc toàn bộ
+        if tool_name in ["write_file", "apply_search_replace_patch", "read_files"]:
+            raw_path = tool_args.get("file_path") or tool_args.get("file_paths")
+            if raw_path:
+                if isinstance(raw_path, list):
+                    impacted_files.update(raw_path)
+                else:
+                    impacted_files.add(str(raw_path))
         
         tool_instance = tools_map.get(tool_name)
         if not tool_instance:

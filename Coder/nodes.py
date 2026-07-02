@@ -273,82 +273,150 @@ def verify_workspace_safety(workspace_path: str) -> bool:
     except Exception:
         return False
 
+def triage_node_stateful(state: AgentState) -> TaskTriage:
+    """
+    LLM Triage thông minh có trạng thái.
+    Nhận diện ngữ cảnh hội thoại và các tham số cũ để đưa ra phân loại chính xác, chống sót thông tin.
+    """
+    messages = state.get("messages", [])
+    
+    # 1. Thu thập thông tin từ phiên hoạt động cũ (Active Session Context)
+    current_workspace = state.get("workspace_path", "")
+    current_extension = state.get("extension_path", "")
+    
+    active_session_context = (
+        "=== NGỮ CẢNH PHIÊN HOẠT ĐỘNG HIỆN TẠI (ACTIVE SESSION) ===\n"
+        f"- Thư mục làm việc hiện hành (Workspace): `{current_workspace or 'Chưa thiết lập'}`\n"
+        f"- Thư mục Chrome Extension đã nhận diện: `{current_extension or 'Chưa phát hiện'}`\n"
+    )
+
+    # 2. Lấy 4 tin nhắn gần nhất để làm cửa sổ ngữ cảnh hội thoại (Conversational Context Window)
+    context_messages = []
+    if len(messages) > 1:
+        # Lấy tối đa 4 tin nhắn trước tin nhắn cuối cùng để tham chiếu
+        recent_history = messages[-5:-1]
+        context_messages.append(SystemMessage(content="--- LỊCH SỬ HỘI THOẠI GẦN NHẤT ĐỂ THAM CHIẾU NGỮ CẢNH ---"))
+        context_messages.extend(recent_history)
+
+    # 3. Trích xuất và làm sạch yêu cầu hiện tại của người dùng
+    user_msg = messages[-1]
+    user_query_text = get_text_content_safely(user_msg.content) # ĐÃ SỬ DỤNG CHÍNH XÁC DƯỚI ĐÂY
+
+    system_prompt = (
+        "Bạn là một điều phối viên Agent thông minh cấp cao (Triage Supervisor).\n"
+        "Nhiệm vụ của bạn là phân tích yêu cầu mới của người dùng để phân loại chính xác hướng xử lý.\n\n"
+        "Bạn đã được cung cấp Lịch sử hội thoại gần nhất và Thông tin phiên hoạt động hiện tại.\n"
+        "Hãy tận dụng thông tin này để giải quyết các đại từ mơ hồ như 'project này', 'nó', 'project mới tìm được'...\n\n"
+        "⚠️ QUY TẮC ĐÁNH GIÁ SỰ TRÔI LỆCH PHIÊN VÀ PHÂN LOẠI (BẮT BUỘC):\n"
+        "1. KIỂM TRA SỰ TIẾP NỐI (Follow-up Check):\n"
+        "   - Nếu yêu cầu mới là một câu hỏi hỏi thêm, yêu cầu giải thích, hoặc yêu cầu chỉnh sửa dựa trên dự án "
+        "     đang mở trong phiên hoạt động hiện tại -> Đây là một câu hỏi TIẾP NỐI (Follow-up).\n"
+        "   - Đối với câu hỏi tiếp nối, bạn KHÔNG ĐƯỢC chọn task_type = 'clarify' (yêu cầu hỏi lại path). Hãy thiết lập "
+        "     task_type dựa trên bản chất yêu cầu ('analysis' nếu chỉ hỏi đáp giải thích, 'development' nếu yêu cầu sửa code).\n"
+        "2. KIỂM TRA SỰ DỊCH CHUYỂN TIÊU ĐIỂM (Focus Shift):\n"
+        "   - Nếu yêu cầu mới muốn tập trung làm việc trực tiếp bên trong Chrome Extension đã phát hiện (`extension_path`),\n"
+        "     hãy nêu rõ điều này trong bản phân tích `detailed_analysis` của bạn để hệ thống tự động Autofocus.\n"
+        "3. KIỂM TRA YÊU CẦU ĐỘC LẬP MỚI (Context Shift):\n"
+        "   - Nếu người dùng đột ngột yêu cầu làm một việc hoàn toàn mới không liên quan đến thư mục hiện hành "
+        "     (ví dụ: đang quét desktop lại yêu cầu 'sửa lỗi app ở thư mục D:/project-abc'), hoặc yêu cầu tạo mới app "
+        "     nhưng không nói ở đâu -> Đặt task_type = 'clarify' để hệ thống hỏi lại đường dẫn mới."
+    )
+
+    structured_llm = model.with_structured_output(TaskTriage, method="function_calling")
+    
+    # Sử dụng chuỗi text đã được làm sạch an toàn trong một HumanMessage chuẩn hóa
+    triage_output = structured_llm.invoke([
+        SystemMessage(content=system_prompt),
+        SystemMessage(content=active_session_context),
+        *context_messages,
+        HumanMessage(content=f"Yêu cầu hiện tại của người dùng: {user_query_text}")
+    ])
+    
+    return triage_output
+
+
 def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
     """
-    Nút phân loại và thiết lập môi trường hoạt động cấp độ Production.
-    Xử lý an toàn bảo mật, chống OOD, tự động phân tích đường dẫn hệ thống và tương tác Human-in-the-Loop.
+    Nút phân loại và thiết lập môi trường hoạt động thông minh có kế thừa trạng thái.
+    Ngăn chặn việc hỏi lại đường dẫn phiền phức khi đang trong một mạch hội thoại liên tục.
     """
     messages = state["messages"]
-    user_msg = None
-    for msg in reversed(messages):
-        if isinstance(msg, HumanMessage) or getattr(msg, "type", None) == "human":
-            user_msg = msg
-            break
-            
-    user_query_text = get_text_content_safely(user_msg.content) if user_msg else ""
+    user_msg = messages[-1]
+    user_query_text = get_text_content_safely(user_msg.content)
     
+    # Lấy các thông số trạng thái hiện tại từ State
+    existing_workspace = state.get("workspace_path", "")
+    existing_extension = state.get("extension_path", "")
+
     # ==========================================
-    # BƯỚC 1: TIỀN XỬ LÝ ĐƯỜNG DẪN TĨNH (OS DETERMINISTIC PATH RESOLUTION)
+    # BƯỚC 1: TRÍCH XUẤT ĐƯỜNG DẪN TỪ CÂU LỆNH MỚI (NẾU CÓ)
     # ==========================================
     detected_path_str = resolve_special_system_paths(user_query_text)
     if not detected_path_str:
-        # Nếu không có từ khóa đặc biệt, quét tìm đường dẫn thô trong câu lệnh
         detected_path_str = extract_path_from_text(user_query_text)
 
     # ==========================================
-    # BƯỚC 2: PHÂN LOẠI TÁC VỤ QUA LLM (STRUCTURAL TRIAGE)
+    # BƯỚC 2: GỌI BỘ PHÂN LOẠI CÓ TRẠNG THÁI (STATEFUL TRIAGE)
     # ==========================================
-    structured_llm = model.with_structured_output(TaskTriage, method="function_calling")
-    
-    triage_prompt = (
-        "Bạn là một điều phối viên Agent thông minh cấp cao (Triage Supervisor).\n"
-        "Nhiệm vụ của bạn là phân tích yêu cầu của người dùng để phân loại chính xác hướng xử lý.\n\n"
-        "⚠️ QUY TẮC PHÂN LOẠI KHẮT KHE (BẮT BUỘC):\n"
-        "1. Nếu yêu cầu KHÔNG liên quan đến lập trình, viết code, sửa code, khảo sát hệ thống file hoặc tương tác web "
-        "   (ví dụ: hỏi thời tiết, kiến thức xã hội, nấu ăn, tán gẫu...), bạn BẮT BUỘC phải đặt task_type = 'ood'.\n"
-        "2. Nếu yêu cầu là sửa lỗi ('lỗi trong ứng dụng này', 'sửa lỗi app của tôi') hoặc chạy thử phần mềm "
-        "   nhưng người dùng KHÔNG chỉ định rõ đường dẫn thư mục hay file nào trong câu lệnh,\n"
-        "   bạn BẮT BUỘC phải đặt task_type = 'clarify' để hệ thống kích hoạt dừng luồng và hỏi lại thông tin.\n"
-        "3. Nếu yêu cầu là tạo mới hoàn toàn (ví dụ: 'tạo chrome extension', 'viết ứng dụng reactjs...'),\n"
-        "   hãy đặt task_type = 'development' và thiết lập is_simple = False để hệ thống lập kế hoạch tạo thư mục sandbox cách ly."
-    )
-    
     try:
-        triage_output = structured_llm.invoke([
-            SystemMessage(content=triage_prompt),
-            HumanMessage(content=user_query_text)
-        ])
+        triage_output = triage_node_stateful(state)
         task_type = triage_output.task_type
         is_simple = triage_output.is_simple
         detailed_analysis = triage_output.detailed_analysis
-    except Exception:
-        task_type = "clarify"
-        is_simple = False
-        detailed_analysis = "Phân tích tự động gặp sự cố. Cần kích hoạt quy trình làm rõ."
+    except Exception as e:
+        # Dự phòng an toàn nếu LLM lỗi
+        task_type = "clarify" if not existing_workspace else "analysis"
+        is_simple = True
+        detailed_analysis = f"Lỗi hệ thống phân loại, tự động kích hoạt chế độ dự phòng. Lỗi: {str(e)}"
 
     # ==========================================
-    # BƯỚC 3: XỬ LÝ CÁC KỊCH BẢN ĐẶC BIỆT (OOD & CLARIFY)
+    # BƯỚC 3: KÍCH HOẠT QUY TẮC THỪA KẾ VÀ DỊCH CHUYỂN TIÊU ĐIỂM (AUTOFOCUS PIVOT)
     # ==========================================
-    
-    # Kịch bản 3.1: Yêu cầu ngoài phạm vi (Out-Of-Domain)
-    if task_type == "ood":
-        return {
-            "plan": [],
-            "task_type": "analysis",
-            "is_simple": True,
-            "messages": [
-                AIMessage(content="🙏 Tôi là trợ lý chuyên biệt về khảo sát mã nguồn, lập trình phần mềm và tương tác Web tự động.\n"
-                                  "Yêu cầu hiện tại của bạn nằm ngoài phạm vi hỗ trợ của tôi. Vui lòng đưa ra các yêu cầu liên quan đến lập trình.")
-            ]
-        }
+    workspace_path = None
+    pivoted_msg = ""
 
-    # Kịch bản 3.2: Mơ hồ đường dẫn cần hỏi lại (Clarify via HITL Interrupt)
-    if (task_type == "clarify" or "ứng dụng này" in user_query_text.lower() or "ứng dụng của tôi" in user_query_text.lower()) and not detected_path_str:
-        
-        # Chuẩn bị payload ngắt có cấu trúc gửi về giao diện người dùng
+    # Nếu người dùng KHÔNG nhập đường dẫn mới trong câu lệnh hiện tại
+    if not detected_path_str:
+        if existing_workspace:
+            # Quy tắc 1: Nếu câu hỏi liên quan đến Chrome Extension đã tìm thấy, tự động dịch chuyển tiêu điểm (Pivot)
+            # Chúng ta quét ngữ cảnh câu hỏi xem có chứa các từ khóa liên quan đến Extension/Project mới không
+            extension_keywords = ["extension", "tiện ích", "project mới", "dự án mới", "chức năng", "popup", "manifest"]
+            is_focusing_on_extension = any(kw in user_query_text.lower() for kw in extension_keywords)
+            
+            if is_focusing_on_extension and existing_extension:
+                workspace_path = existing_extension
+                pivoted_msg = f"🎯 **[Tự động hội tụ tiêu điểm (Autofocus)]**: Nhận diện câu hỏi tập trung vào Chrome Extension, di chuyển Workspace vào: `{workspace_path}`\n"
+            else:
+                # Quy tắc 2: Thừa kế lại đường dẫn Workspace cũ từ State
+                workspace_path = existing_workspace
+                pivoted_msg = f"🔄 **[Kế thừa Workspace]**: Sử dụng lại thư mục làm việc hiện hành: `{workspace_path}`\n"
+        else:
+            # Nếu hoàn toàn chưa có workspace nào trước đó
+            workspace_path = None
+    else:
+        # Nếu người dùng chủ động nhập một đường dẫn mới, sử dụng đường dẫn mới đó
+        try:
+            resolved_path = Path(detected_path_str).expanduser().resolve()
+            if resolved_path.exists():
+                workspace_path = str(find_project_root_heuristic(resolved_path))
+            else:
+                return {
+                    "plan": [],
+                    "task_type": "analysis",
+                    "is_simple": True,
+                    "messages": [AIMessage(content=f"❌ Thất bại: Đường dẫn thư mục `{detected_path_str}` không tồn tại trên hệ thống.")]
+                }
+        except Exception as e:
+            workspace_path = None
+
+    # ==========================================
+    # BƯỚC 4: BẢO VỆ AN TOÀN VÀ HỎI LẠI NẾU THỰC SỰ TRỐNG TRƠN
+    # ==========================================
+    if not workspace_path:
+        # Chỉ ngắt đồ thị khi hoàn toàn không thừa kế được gì và không có path nhập vào
         interrupt_payload = {
             "type": "path_clarification",
-            "prompt": "Hệ thống phát hiện bạn muốn kiểm tra/sửa đổi ứng dụng nhưng chưa cung cấp đường dẫn thư mục cụ thể.",
+            "prompt": "Hệ thống phát hiện bạn muốn làm việc với ứng dụng nhưng chưa cấu hình thư mục làm việc cụ thể.",
             "fields": [
                 {
                     "name": "target_workspace_path",
@@ -359,77 +427,29 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
                 }
             ]
         }
-        
-        # Kích hoạt ngắt đồ thị LangGraph
-        # Khi đồ thị được resume, giá trị phản hồi từ giao diện sẽ được nạp vào biến user_response
         user_response = interrupt(interrupt_payload)
         
-        # Trích xuất đường dẫn được cung cấp từ phản hồi resume
         if isinstance(user_response, dict) and "target_workspace_path" in user_response:
             detected_path_str = str(user_response["target_workspace_path"]).strip()
         elif isinstance(user_response, str):
             detected_path_str = user_response.strip()
 
-    # ==========================================
-    # BƯỚC 4: THIẾT LẬP WORKSPACE AN TOÀN VÀ XỬ LÝ SANDBOX CÁCH LY
-    # ==========================================
-    workspace_path = None
-    
-    if detected_path_str:
         try:
-            # Giải quyết đường dẫn tuyệt đối đã xác minh
-            resolved_path = Path(detected_path_str).expanduser().resolve()
-            
-            if resolved_path.exists():
-                # Thực hiện Heuristic tìm project root từ đường dẫn được cung cấp
-                workspace_path = str(find_project_root_heuristic(resolved_path))
-            else:
-                # Nếu đường dẫn người dùng nhập không tồn tại vật lý
-                return {
-                    "plan": [],
-                    "task_type": "analysis",
-                    "is_simple": True,
-                    "messages": [AIMessage(content=f"❌ Thất bại: Đường dẫn thư mục `{detected_path_str}` không tồn tại trên hệ thống. Vui lòng kiểm tra lại.")]
-                }
-        except Exception as e:
-            return {
-                "plan": [],
-                "task_type": "analysis",
-                "is_simple": True,
-                "messages": [AIMessage(content=f"❌ Lỗi hệ thống khi phân tích đường dẫn: {str(e)}")]
-            }
-    else:
-        # Nếu là tác vụ tạo mới hoàn toàn (Scaffolding) và người dùng không nhập path
-        # Hệ thống tự động thiết lập thư mục Sandbox cách ly tuyệt đối nằm ngoài thư mục Agent
-        sandbox_root = Path.home() / ".agent_sandboxes"
-        sandbox_root.mkdir(parents=True, exist_ok=True)
-        
-        # Tạo ID phiên làm việc cách ly
-        session_id = user_query_text[:15].strip().replace(" ", "_")
-        session_id = re.sub(r'[^\w\-_\.]', '', session_id) or "default_session"
-        
-        sandbox_workspace = sandbox_root / session_id
-        sandbox_workspace.mkdir(parents=True, exist_ok=True)
-        workspace_path = str(sandbox_workspace.resolve())
+            workspace_path = str(Path(detected_path_str).expanduser().resolve())
+        except Exception:
+            workspace_path = "."
 
-    # ==========================================
-    # BƯỚC 5: KIỂM TRA BẢO MẬT CUỐI CÙNG (SECURITY GUARDRAIL CHECK)
-    # ==========================================
+    # Kiểm tra bảo mật ngăn cản tự sửa đổi mã nguồn Agent
     if not verify_workspace_safety(workspace_path):
         return {
             "plan": [],
             "task_type": "analysis",
             "is_simple": True,
-            "messages": [
-                AIMessage(content="🚨 **[CẢNH BÁO BẢO MẬT]**:\n"
-                                  "Hệ thống phát hiện thư mục làm việc được chỉ định trùng khớp hoặc nằm trong thư mục nguồn của Agent Coder.\n"
-                                  "Để tránh việc Agent vô tình sửa đổi nhầm mã nguồn hệ thống, yêu cầu này đã bị chặn.\n"
-                                  "Vui lòng di chuyển dự án của bạn sang một thư mục độc lập khác.")
-            ]
+            "messages": [AIMessage(content="🚨 **[CẢNH BÁO BẢO MẬT]**: Workspace nằm trong thư mục Agent. Thao tác bị từ chối.")]
         }
 
     # ==========================================
-    # BƯỚC 6: KHỞI TẠO LỘ TRÌNH (DAG PLAN INITIALIZATION)
+    # BƯỚC 5: THIẾT LẬP KẾ HOẠCH CHO LƯỢT TIẾP THEO
     # ==========================================
     plan = []
     if is_simple:
@@ -445,17 +465,17 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         plan = [
             Task(
                 id="T_SURVEY",
-                description=f"Khảo sát cấu trúc thư mục, các tệp tin cấu hình chính trong dự án tại `{workspace_path}` để hiểu kiến trúc trước khi triển khai.",
+                description=f"Khảo sát cấu trúc file và mã nguồn tại `{workspace_path}` liên quan đến yêu cầu: {user_query_text}",
                 dependencies=[],
                 status="pending"
             )
         ]
-        # Ép buộc luồng phức tạp chạy pha Khảo sát (Analysis) trước
         task_type = "analysis"
 
     triage_info_msg = (
         f"📊 **[Hệ thống Phân phối thông minh]**:\n"
-        f"- **Môi trường hoạt động (Workspace):** `{workspace_path}`\n"
+        f"{pivoted_msg}"
+        f"- **Workspace hoạt động:** `{workspace_path}`\n"
         f"- **Chế độ kiểm soát:** {'Đơn giản (Fast-Track)' if is_simple else 'Phức tạp (Multi-Step Discovery)'}\n"
         f"- **Pha hoạt động khởi động:** `{task_type.upper()}`\n\n"
         f"🎯 **[Phân tích mục tiêu kỹ thuật]**:\n{detailed_analysis}"
@@ -467,10 +487,6 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         "task_type": task_type,
         "is_simple": is_simple,
         "detailed_analysis": detailed_analysis,
-        "replanning_count": 0,
-        "modified_files": [],
-        "error_logs": "",
-        "step_findings": [],
         "messages": [AIMessage(content=triage_info_msg)]
     }
 

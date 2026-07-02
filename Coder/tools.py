@@ -12,8 +12,9 @@ from config import GitIgnoreMatcher, find_project_root_heuristic, sanitize_and_r
 from browser_subgraph import web_subgraph
 from langchain_core.callbacks import CallbackManagerForToolRun
 from langchain_core.messages import ToolMessage
-
+from langgraph.types import interrupt 
 import config
+from state import Task
 
 def get_markdown_language(file_path: str) -> str:
     ext = Path(file_path).suffix.lower()
@@ -1005,3 +1006,138 @@ class WorkspaceTools:
             return f"Lỗi thực thi lệnh terminal: {str(e)}"
         
         
+class QuestionOption(BaseModel):
+    label: str = Field(description="Nhãn mô tả trực quan hiển thị trên giao diện hoặc nút bấm.")
+    value: str = Field(description="Giá trị kỹ thuật tương ứng được lưu trữ và trả về.")
+    is_default: Optional[bool] = Field(default=False, description="Đánh dấu là phương án mặc định được hệ thống đề xuất.")
+
+class QuestionItem(BaseModel):
+    id: str = Field(description="ID định danh duy nhất của câu hỏi (tiếng Anh, viết liền không dấu, ví dụ: 'scope', 'auth_provider').")
+    question: str = Field(description="Nội dung câu hỏi cụ thể bằng tiếng Việt.")
+    type: Literal["select", "multi_select", "text"] = Field(description="Kiểu câu hỏi: 'select' (chọn một), 'multi_select' (chọn nhiều), hoặc 'text' (nhập văn bản tự do).")
+    options: Optional[List[QuestionOption]] = Field(default=None, description="Các phương án lựa chọn có sẵn (bắt buộc đối với kiểu 'select' hoặc 'multi_select').")
+    allow_custom: Optional[bool] = Field(default=False, description="Cho phép người dùng tự nhập ý kiến/phương án khác của riêng họ ngoài các phương án có sẵn.")
+
+class AskQuestionsSchema(BaseModel):
+    explanation: str = Field(description="Lời giải thích bằng tiếng Việt về lý do tại sao các câu hỏi này là quan trọng và cần được làm rõ trước khi tiếp tục thực hiện.")
+    questions: List[QuestionItem] = Field(description="Danh sách các câu hỏi có cấu trúc cần người dùng trả lời.")
+
+class AskQuestionsTool(BaseTool):
+    name: str = "ask_questions_if_underspecified"
+    description: str = (
+        "Hỏi ý kiến người dùng khi bối cảnh hoặc yêu cầu của tác vụ chưa rõ ràng (underspecified). "
+        "Bắt buộc sử dụng công cụ này khi có nhiều phương án lựa chọn mà bạn không chắc chắn. "
+        "Kết quả trả về sẽ là một chuỗi JSON chứa đầy đủ câu trả lời của người dùng cho từng câu hỏi để bạn phân tích và suy nghĩ tiếp."
+    )
+    args_schema: Type[BaseModel] = AskQuestionsSchema
+    workspace_path: str
+
+    def _run(self, explanation: str, questions: List[Union[QuestionItem, dict]]) -> str:
+        # Chuẩn hóa kiểu dữ liệu của danh sách câu hỏi để đảm bảo khả năng đóng gói JSON/Checkpoint serialization
+        serialized_questions = []
+        for q in questions:
+            if isinstance(q, BaseModel):
+                serialized_questions.append(q.model_dump())
+            elif isinstance(q, dict):
+                serialized_questions.append(q)
+            else:
+                try:
+                    serialized_questions.append(q.__dict__)
+                except AttributeError:
+                    serialized_questions.append(str(q))
+
+        payload = {
+            "type": "ask_questions_if_underspecified",
+            "explanation": explanation,
+            "questions": serialized_questions
+        }
+        
+        # Kích hoạt ngắt đồ thị và lưu giữ trạng thái luồng (Checkpoint)
+        # Khi luồng được resume, kết quả gửi từ client sẽ được nạp trực tiếp vào biến user_answers
+        user_answers = interrupt(payload)
+        
+        # Trả về kết quả dưới dạng JSON string để LLM tiếp tục đọc hiểu và xử lý logic
+        return json.dumps({
+            "status": "success",
+            "user_answers": user_answers
+        }, ensure_ascii=False)
+        
+class ProposePlanSchema(BaseModel):
+    explanation: str = Field(description="Phân tích kỹ thuật chi tiết bằng tiếng Việt về nguyên nhân lỗi và giải pháp đề xuất.")
+    tasks: List[Task] = Field(description="Danh sách các bước cụ thể cần thực hiện.")
+
+class ProposePlanTool(BaseTool):
+    name: str = "propose_implementation_plan"
+    description: str = (
+        "BẮT BUỘC gọi công cụ này đối với các tác vụ phức tạp (multi-file, thay đổi kiến trúc) "
+        "để đề xuất Kế hoạch triển khai chi tiết và tạm dừng chờ người dùng phê duyệt trước khi viết code."
+    )
+    args_schema: Type[BaseModel] = ProposePlanSchema
+    workspace_path: str
+
+    def _run(self, explanation: str, tasks: List[Union[Task, dict]]) -> str:
+        serialized_tasks = []
+        for t in tasks:
+            if isinstance(t, BaseModel):
+                serialized_tasks.append(t.model_dump())
+            elif isinstance(t, dict):
+                serialized_tasks.append(t)
+            else:
+                serialized_tasks.append(str(t))
+
+        payload = {
+            "type": "propose_implementation_plan",
+            "explanation": explanation,
+            "proposed_tasks": serialized_tasks,
+            "prompt": "Vui lòng xem xét kế hoạch triển khai trên. Gửi 'yes' để đồng ý thực hiện, hoặc nhập ý kiến để điều chỉnh."
+        }
+        
+        # Ngắt đồ thị LangGraph và lưu checkpoint chờ phản hồi từ người dùng
+        user_response = interrupt(payload)
+        
+        return json.dumps({
+            "status": "resumed_after_approval",
+            "user_feedback": user_response
+        }, ensure_ascii=False)
+
+# =====================================================================
+# CÔNG CỤ GỠ LỖI CHROME DEVTOOLS ĐỘNG (CDP MCP TOOL)
+# =====================================================================
+class ChromeDebuggerSchema(BaseModel):
+    url: str = Field(description="URL của trang web hoặc extension cần kết nối lấy nhật ký.")
+    action_prompt: str = Field(description="Mô tả hành động cần gỡ lỗi để MCP Client thực thi phân tích.")
+
+class ChromeDebuggerTool(BaseTool):
+    name: str = "chrome_devtools_debugger"
+    description: str = "Kết nối trực tiếp vào Chrome DevTools (CDP) thông qua MCP để đọc log console, network requests và phân tích lỗi runtime."
+    args_schema: Type[BaseModel] = ChromeDebuggerSchema
+    workspace_path: str
+
+    def _run(self, url: str, action_prompt: str) -> str:
+        import asyncio
+        from mcp_helper import run_agent_with_devtools_mcp
+        from config import model
+        
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        if loop.is_running():
+            import nest_asyncio
+            nest_asyncio.apply()
+
+        full_prompt = f"URL đích: {url}\nYêu cầu gỡ lỗi: {action_prompt}"
+        
+        try:
+            debug_output = loop.run_until_complete(
+                run_agent_with_devtools_mcp(
+                    model=model,
+                    prompt_message=full_prompt,
+                    chat_history=[]
+                )
+            )
+            return debug_output
+        except Exception as e:
+            return f"Lỗi khi kết nối gỡ lỗi Chrome CDP: {str(e)}"

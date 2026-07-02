@@ -15,25 +15,25 @@ class Task(BaseModel):
     description: str = Field(description="Mô tả chi tiết hành động cần thực hiện")
     dependencies: List[str] = Field(
         default_factory=list,
-        description="Mảng chứa các ID nhiệm vụ cần hoàn thành trước. Bắt buộc phải có trường này, nếu không phụ thuộc ai hãy trả về mảng rỗng []"
+        description="Mảng chứa các ID nhiệm vụ cần hoàn thành trước. Nếu không phụ thuộc hãy trả về mảng rỗng []"
     )
     status: Literal["pending", "completed"] = Field(
         default="pending", 
-        description="Trạng thái thực thi nhiệm vụ. Luôn luôn khởi tạo là 'pending'"
+        description="Trạng thái thực thi nhiệm vụ."
     )
 
 class TaskPlan(BaseModel):
     tasks: List[Task] = Field(
         default_factory=list,
-        description="Danh sách có thứ tự của các nhiệm vụ cần thực hiện (thiết lập quan hệ DAG chặt chẽ)."
+        description="Danh sách có thứ tự của các nhiệm vụ cần thực hiện (DAG)."
     )
     explanation: str = Field(
         default="",
-        description="Phân tích chiến lược triển khai và giải thích cách xử lý các tác vụ."
+        description="Phân tích chiến lược triển khai và giải thích cách xử lý các tác vụ bằng tiếng Việt."
     )
     task_type: Literal["analysis", "development"] = Field(
         default="development",
-        description="Phân loại hướng xử lý của toàn bộ yêu cầu: 'analysis' hoặc 'development'."
+        description="Phân loại hướng xử lý chính: 'analysis' hoặc 'development'."
     )
 
 class PlanUpdate(BaseModel):
@@ -80,7 +80,6 @@ def reduce_findings(left: Union[List[str], None], right: Union[List[str], None])
         return right_list[1:]
     return left_list + right_list
 
-
 def reduce_file_registry(left: Dict[str, str], right: Dict[str, str]) -> Dict[str, str]:
     merged = dict(left or {})
     if right:
@@ -103,10 +102,8 @@ class AgentState(TypedDict):
     replanning_count: int
     is_simple: bool
     detailed_analysis: str
-    # BỔ SUNG CÁC TRƯỜNG DỮ LIỆU ĐỂ KIỂM THỬ VÀ GỠ LỖI EXTENSION
     extension_path: str
     browser_console_logs: str
-    
 
 class WebInteractionState(TypedDict):
     workspace_path: str 
@@ -114,11 +111,10 @@ class WebInteractionState(TypedDict):
     action_type: Literal["explore", "test_js"]
     target_description: str
     js_code_to_test: Optional[str]
-    # BỔ SUNG TRƯỜNG TRUYỀN DẪN CHO SUBGRAPH
     extension_path: Optional[str]
     browser_console_logs: Optional[str]
     
-    # Kết quả trả về
+    # Kết quả trả về từ Subgraph
     detected_selectors: Optional[Dict[str, Any]]
     execution_success: Optional[bool]
     dom_state_after: Optional[Dict[str, Any]]

@@ -7,16 +7,16 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Dict, Any, Optional,  Tuple, List
+from typing import Dict, Any, Optional,  Tuple, List, Union
 from concurrent.futures import ThreadPoolExecutor
-
+from langgraph.errors import GraphInterrupt, GraphBubbleUp
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.types import interrupt
 from config import find_project_root_heuristic, model, sanitize_and_resolve_path, fast_model
 from mcp_helper import run_agent_with_devtools_mcp
 from state import AgentState, PlanUpdate, RuntimeVerificationResult, TaskPlan, TaskTriage, Task
 from tools import (
-    GitManager, ReadFileLinesTool, UniversalSymbolSearchTool, WebInteractAndTestTool, WorkspaceTools, 
+    AskQuestionsTool, GitManager, ReadFileLinesTool, UniversalSymbolSearchTool, WebInteractAndTestTool, WorkspaceTools, 
     ReadFilesTool, WriteFileTool, ApplyPatchTool, 
     ListDirectoryTool, RunTerminalTool, get_markdown_language
 )
@@ -560,7 +560,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
     task_type = state.get("task_type", "development")
     extension_path = state.get("extension_path", "")
     
-    # 1. Định vị các nhiệm vụ đủ điều kiện thực thi
+    # Định vị các nhiệm vụ đủ điều kiện thực thi
     eligible_tasks = get_eligible_tasks(plan)
     if not eligible_tasks:
         pending_tasks = [t for t in plan if (t.get("status") if isinstance(t, dict) else getattr(t, "status", None)) == "pending"]
@@ -574,7 +574,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         for t in eligible_tasks
     ])
 
-    # 2. Định dạng Single Source of Truth
+    # Định dạng Single Source of Truth
     registry_context_str = ""
     if file_registry:
         registry_context_str = "\n=== 📦 NỘI DUNG MÃ NGUỒN CẬP NHẬT MỚI NHẤT (SINGLE SOURCE OF TRUTH) ===\n"
@@ -588,13 +588,16 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
                 f"```{lang}\n" + "\n".join(formatted_lines) + "\n```\n"
             )
 
-    # 3. Thiết lập hệ thống công cụ và System Prompt tương ứng
+    # ĐĂNG KÝ CÔNG CỤ VÀO ĐÚNG CÁC PHÂN HỆ
     if task_type == "analysis":
         read_files = ReadFilesTool(workspace_path=ws)
         list_directory = ListDirectoryTool(workspace_path=ws)
         search_symbols = UniversalSymbolSearchTool(workspace_path=ws)
         read_file_lines = ReadFileLinesTool(workspace_path=ws)
-        tools = [read_files, list_directory, search_symbols, read_file_lines]
+        ask_questions_tool = AskQuestionsTool(workspace_path=ws) # ĐÃ THÊM KHỞI TẠO
+        
+        # Đưa vào danh sách công cụ của LLM ở trạng thái phân tích
+        tools = [read_files, list_directory, search_symbols, read_file_lines, ask_questions_tool] 
 
         previous_findings_str = ""
         existing_findings = state.get("step_findings", [])
@@ -616,7 +619,8 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             "\nHãy sử dụng các công cụ khảo sát cấu trúc hệ thống.\n"
             "\n⚠️ RÀNG BUỘC PHẠM VI NGHIÊM NGẶT (BẮT BUỘC):\n"
             "1. Bạn chỉ có quyền ĐỌC dữ liệu, tuyệt đối không chỉnh sửa mã nguồn hoặc tự ý tạo tệp tin trong bước này.\n"
-            "2. KHÔNG ĐƯỢC PHÉP tự ý định dạng tài liệu báo cáo hoàn chỉnh, tổng hợp tri thức hay viết tệp THONGTIN.md."
+            "2. KHÔNG ĐƯỢC PHÉP tự ý định dạng tài liệu báo cáo hoàn chỉnh, tổng hợp tri thức hay viết tệp THONGTIN.md.\n"
+            "3. Nếu yêu cầu người dùng quá chung chung hoặc thiếu bối cảnh cấu hình thiết yếu, hãy dùng công cụ `ask_questions_if_underspecified` để làm rõ."
         )
         if previous_findings_str:
             system_prompt += previous_findings_str
@@ -629,10 +633,13 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         list_directory = ListDirectoryTool(workspace_path=ws)
         run_terminal_command = RunTerminalTool(workspace_path=ws)
         read_file_lines = ReadFileLinesTool(workspace_path=ws)
+        ask_questions_tool = AskQuestionsTool(workspace_path=ws) # ĐÃ THÊM KHỞI TẠO
         
+        # Đưa vào danh sách công cụ của LLM ở trạng thái phát triển
         tools = [
             read_files, write_file, apply_patch, list_directory, 
-            run_terminal_command, search_symbols, read_file_lines, 
+            run_terminal_command, search_symbols, read_file_lines,
+            ask_questions_tool 
         ]
         system_prompt = (
             "Bạn là một kỹ sư phần mềm thực thi chuyên nghiệp chuyên sửa lỗi và viết mới mã nguồn (Write-Access Mode).\n"
@@ -647,7 +654,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
                 f"\nℹ️ **[Phát hiện Chrome Extension]**: Thư mục Extension đã được định vị tại: `{extension_path}`.\n"
                 f"Hãy phối hợp nhịp nhàng các công cụ gỡ lỗi theo quy trình sau:\n"
                 f"1. **Tải và tương tác với Extension**: Luôn truyền tham số `extension_path` (đường dẫn tương đối) vào công cụ `web_interact_and_test` "
-                f"khi tiến hành kiểm thử động trang web nhằm đảm bảo trình duyệt tự động nạp Extension của bạn [2].\n"
+                f"khi tiến hành kiểm thử động trang web nhằm đảm bảo trình duyệt tự động nạp Extension của bạn.\n"
                 f"2. **Gỡ lỗi và phân tích chuyên sâu (Chrome DevTools Protocol - CDP)**: Sử dụng công cụ `chrome_devtools_mcp_tool` "
                 f"với các hành động thích hợp để thu thập thông tin gỡ lỗi đầy đủ nhất khi trang web đang mở.\n"
             )
@@ -660,13 +667,14 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             "1. Bạn đã được cung cấp nguồn mã nguồn mới nhất (đã đánh số dòng chi tiết) trong mục 'SINGLE SOURCE OF TRUTH' ở trên.\n"
             "2. ĐÂY LÀ NỘI DUNG MỚI NHẤT VÀ CHÍNH XÁC NHẤT. Hãy luôn sử dụng mốc dòng và nội dung từ mục này để thiết lập khối SEARCH-AND-REPLACE cho công cụ `apply_search_replace_patch`.\n"
             "3. Nếu bạn vừa sửa đổi một file ở bước trước, nội dung file đó trong mục 'SINGLE SOURCE OF TRUTH' đã được cập nhật tự động.\n"
-            "\n⚠️ QUY TẮC SỬ DỤNG CÔNG CỤ:\n"
+            "4. Nếu thông tin dự án chưa đầy đủ, hoặc yêu cầu kỹ thuật có nhiều lựa chọn mơ hồ, hãy dùng `ask_questions_if_underspecified`.\n"
+            "\n⚠️ QUY TẮC SỬ SỬ DỤNG CÔNG CỤ:\n"
             "1. Đối với file trên 300 dòng: BẮT BUỘC dùng `apply_search_replace_patch` để áp dụng bản vá, cấm ghi đè bừa bãi.\n"
             "2. Công cụ `write_file` chỉ dùng khi tạo mới hoặc sửa các tệp ngắn dưới 300 dòng.\n"
             "3. NGHIÊM CẤM thực hiện chạy các bộ kiểm thử tự động (như pytest, cargo test, dart test, npm test, vitest) bằng công cụ `run_terminal_command`."
         )
 
-    # 4. Gọi LLM
+    # Gọi LLM
     model_with_tools = model.bind_tools(tools)
     optimized_history = compact_reading_tool_messages(messages)
     
@@ -1069,6 +1077,8 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
     search_symbols = UniversalSymbolSearchTool(workspace_path=ws)
     read_file_lines = ReadFileLinesTool(workspace_path=ws)
     web_interact_tool = WebInteractAndTestTool(workspace_path=ws)
+    ask_questions_tool = AskQuestionsTool(workspace_path=ws) # ĐÃ THÊM KHỞI TẠO TRONG TOOL_NODE
+    
     tools_map = {
         "read_files": read_files,
         "write_file": write_file,
@@ -1078,6 +1088,7 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         "search_symbols_universal": search_symbols,
         "read_file_lines": read_file_lines,
         "web_interact_and_test": web_interact_tool,
+        "ask_questions_if_underspecified": ask_questions_tool, # ĐÃ ĐĂNG KÝ VÀO THƯ VIỆN THỰC THI
     }
     
     last_message = state["messages"][-1]
@@ -1095,7 +1106,7 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         tool_args = tool_call["args"] or {}
         tool_id = tool_call["id"]
         
-        # 🛡️ CHỈ nạp vào Registry các file bị can thiệp bởi công cụ Ghi/Sửa hoặc Đọc toàn bộ
+        # Chỉ nạp vào Registry các file bị can thiệp bởi công cụ Ghi/Sửa hoặc Đọc toàn bộ
         if tool_name in ["write_file", "apply_search_replace_patch", "read_files"]:
             raw_path = tool_args.get("file_path") or tool_args.get("file_paths")
             if raw_path:
@@ -1118,8 +1129,11 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
                                 modified_files.append(str(safe_path))
                         except Exception:
                             pass
+            except (GraphInterrupt, GraphBubbleUp) as g:
+                raise g
             except Exception as e:
                 result = f"Lỗi thực thi công cụ '{tool_name}': {str(e)}"
+                
                 
         tool_messages.append(ToolMessage(content=str(result), name=tool_name, tool_call_id=tool_id))
         

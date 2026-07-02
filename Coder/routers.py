@@ -11,19 +11,31 @@ def executor_router(state: AgentState) -> Literal["tool_node", "tester", "replan
         return "replanner"
           
     last_message = messages[-1]
-    # Trường hợp 1: Agent đang gọi công cụ
+    
+    # 1. Agent đang gọi công cụ
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
         return "tool_node"
         
-    # Trường hợp 2: Agent báo cáo đã xong lượt chạy hiện tại
+    # 2. Agent báo cáo đã xong lượt chạy và có file bị sửa đổi
     if state.get("task_type") == "development" and state.get("modified_files"):
         return "tester"
         
-    # Trường hợp 3: Tác vụ đơn giản không sửa code
+    # 3. Tác vụ đơn giản không sửa code
     if state.get("is_simple"):
         return "synthesis"
         
-    # Trường hợp 4: Tác vụ phân tích phức tạp hoặc task không thay đổi code (VD: T_SURVEY đã hoàn tất)
+    # 4. CHỐT CHẶN PHÒNG THỦ: Kiểm tra xem còn nhiệm vụ nào chưa thực hiện không
+    plan = state.get("plan", [])
+    has_pending_tasks = any(
+        (t.status if isinstance(t, Task) else t.get("status")) == "pending" 
+        for t in plan
+    )
+    
+    # Nếu tất cả các bước khảo sát/phát triển đã hoàn tất -> Kết thúc luồng, không lập kế hoạch lại nữa
+    if not has_pending_tasks:
+        return "synthesis"
+        
+    # 5. Nếu vẫn còn nhiệm vụ tồn đọng -> Tiếp tục lập kế hoạch điều phối
     return "replanner"
 
 

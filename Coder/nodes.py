@@ -9,6 +9,7 @@ import subprocess
 from pathlib import Path
 from typing import Dict, Any, Optional,  Tuple, List, Union
 from concurrent.futures import ThreadPoolExecutor
+from venv import logger
 from langgraph.errors import GraphInterrupt, GraphBubbleUp
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.types import interrupt
@@ -938,14 +939,14 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
     workspace_context = state.get("workspace_context", "")
     error_logs = state.get("error_logs", "")
     
-    # Xác định xem có phải đang ở pha chuyển tiếp từ thám thính (T_SURVEY) sang phát triển hay không
+    # Xác định trạng thái chuyển tiếp từ khảo sát sang phát triển
     is_survey_transition = (
         len(plan) == 1 and 
         (plan[0].id if isinstance(plan[0], Task) else plan[0].get("id")) == "T_SURVEY" and
         (plan[0].status if isinstance(plan[0], Task) else plan[0].get("status")) == "completed"
     )
     
-    # Tránh lặp vô hạn nếu vượt ngưỡng hoặc không có lỗi
+    # Kiểm tra nếu không có lỗi phát sinh và không phải là pha chuyển đổi khảo sát
     if replanning_count >= 5 or (not error_logs and not is_survey_transition):
         action_msg = "bypass_limit" if replanning_count >= 5 else "bypass_no_error"
         proposal_message = AIMessage(
@@ -1007,219 +1008,227 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
         
         should_modify = getattr(decision, "should_modify_plan", False)
         explanation = getattr(decision, "explanation", "")
-        updated_tasks = getattr(decision, "updated_tasks", plan)
+        updated_tasks = getattr(decision, "updated_tasks", [])
         updated_task_type = getattr(decision, "task_type", task_type)
         
-        old_completed_tasks = {
-            (t.id if isinstance(t, Task) else t.get("id")): t 
-            for t in plan 
-            if (t.status if isinstance(t, Task) else t.get("status")) == "completed"
-        }
-        
+        # Nếu LLM phân tích xong và trả về danh sách nhiệm vụ rỗng
+        if not updated_tasks or not should_modify:
+            proposal_message = AIMessage(
+                content="📋 [Hệ thống tự động duyệt qua: Kế hoạch hiện tại đã tối ưu, không cần cập nhật thêm]",
+                name="replanner_proposal",
+                additional_kwargs={"proposal_payload": {"action": "bypass_no_error", "tasks": []}}
+            )
+            return {"messages": [proposal_message]}
+
+        # Chuẩn hóa danh sách task
         refined_tasks = []
-        seen_ids = set()
         for task_data in updated_tasks:
             task_obj = task_data if isinstance(task_data, Task) else Task(**task_data)
-            t_id = task_obj.id
-            if t_id in seen_ids:
-                t_id = f"{t_id}_alt_{len(seen_ids)}"
-                task_obj.id = t_id
-            seen_ids.add(t_id)
-            
-            if t_id in old_completed_tasks:
-                task_obj.status = "completed"
-                old_task = old_completed_tasks[t_id]
-                task_obj.description = old_task.description if isinstance(old_task, Task) else old_task.get("description")
             refined_tasks.append(task_obj)
             
         proposal_data = {
             "action": "propose",
             "explanation": explanation,
             "task_type": updated_task_type,
-            "tasks": [t.model_dump() if hasattr(t, "model_dump") else t for t in refined_tasks]
+            "tasks": [t.model_dump() for t in refined_tasks]
         }
         
     except Exception as e:
-        # =====================================================================
-        # KÍCH HOẠT HỆ THỐNG DỰ PHÒNG CHỦ ĐỘNG (FAIL-SAFE ENGINE)
-        # =====================================================================
-        # Khi Local LLM qua localhost proxy bị lỗi phân tích cú pháp hoặc mất kết nối,
-        # chúng ta tự động dựng lại một Schema PlanUpdate hợp lệ theo hướng kỹ thuật.
-        
-        fail_safe_explanation = (
-            f"⚠️ [Hệ thống tự động kích hoạt chế độ Dự phòng do lỗi gọi LLM Local: {str(e)}]. "
-        )
-        
-        if is_survey_transition:
-            # Nếu đang chuyển từ Khảo sát sang Phát triển, bắt buộc phải sinh ra Task sửa code
-            fail_safe_explanation += "Tự động thiết lập lộ trình phát triển và kiểm thử tích hợp mặc định."
-            fallback_tasks = [
-                Task(id="T_SURVEY", description="Khảo sát cấu trúc thư mục và manifest", status="completed"),
-                Task(
-                    id="T_DEV_FALLBACK", 
-                    description="Thực hiện viết/chỉnh sửa mã nguồn trực tiếp trong workspace dựa trên yêu cầu ban đầu của người dùng.", 
-                    dependencies=["T_SURVEY"], 
-                    status="pending"
-                ),
-                Task(
-                    id="T_TEST_FALLBACK",
-                    description="Khởi chạy trình duyệt thật, nạp thử nghiệm Chrome Extension từ ổ đĩa và kiểm tra lỗi console runtime.",
-                    dependencies=["T_DEV_FALLBACK"],
-                    status="pending"
-                )
-            ]
-            updated_task_type = "development"
-        else:
-            # Nếu đang chạy sửa lỗi dở dang mà LLM bị sập, giữ nguyên các task cũ để tránh mất mát,
-            # đồng thời tiêm thêm một Task mô tả việc sửa lỗi trực tiếp.
-            fail_safe_explanation += "Bảo toàn kế hoạch hiện hành và chèn thêm nhiệm vụ sửa đổi trực tiếp."
-            fallback_tasks = []
-            for t in plan:
-                t_obj = t if isinstance(t, Task) else Task(**t)
-                fallback_tasks.append(t_obj)
-                
-            has_pending = any(t.status == "pending" for t in fallback_tasks)
-            if not has_pending:
-                fallback_tasks.append(
-                    Task(
-                        id="T_FIX_FALLBACK",
-                        description=f"Tiến hành rà soát sửa lỗi biên dịch/runtime phát sinh: {error_logs[:150]}",
-                        dependencies=[],
-                        status="pending"
-                    )
-                )
-            updated_task_type = task_type
-
-        # Xuất ra dữ liệu có định dạng cấu trúc hoàn hảo như LLM sinh thành công
+        # Cơ chế dự phòng khẩn cấp (Fail-Safe) khi LLM lỗi
         proposal_data = {
-            "action": "propose",
-            "explanation": fail_safe_explanation,
-            "task_type": updated_task_type,
-            "tasks": [t.model_dump() for t in fallback_tasks]
+            "action": "bypass_no_error", # Bỏ qua ngắt để không gây treo đồ thị
+            "explanation": f"Kích hoạt cơ chế tự phục hồi do lỗi hệ thống: {str(e)}",
+            "task_type": task_type,
+            "tasks": []
         }
         
     # Tạo đóng gói phản hồi đồng nhất
+    # 🛡️ GIẢI PHÁP THEN CHỐT: Ghi nội dung text sạch vào content để hiển thị trên UI,
+    # cất cấu trúc JSON kỹ thuật vào additional_kwargs để phục vụ xử lý ngầm.
     proposal_message = AIMessage(
-        content=json.dumps(proposal_data, ensure_ascii=False),
-        name="replanner_proposal"
-    )
-    
-    explanation_message = AIMessage(
-        content=f"🔄 **[Đề xuất lộ trình hành động]**\n\n{proposal_data['explanation']}\n\nHệ thống đang tiến hành điều phối..."
+        content=f"🔄 **[Hệ thống đề xuất lộ trình hành động mới]**\n\n{proposal_data.get('explanation', 'Đang cập nhật lộ trình...')}",
+        name="replanner_proposal",
+        additional_kwargs={"proposal_payload": proposal_data}
     )
     
     return {
         "replanning_count": replanning_count + 1,
-        "messages": [proposal_message, explanation_message]
+        "messages": [proposal_message]
     }
 
 
 def replanner_interrupt_node(state: AgentState) -> Dict[str, Any]:
+    """
+    Nút ngắt duyệt kế hoạch thông minh (Human-in-the-Loop Gate).
+    Chỉ kích hoạt ngắt khi có kế hoạch thực sự, ẩn JSON điều khiển khỏi UI chat,
+    và tự động phân tích phản hồi tùy chỉnh của người dùng để cập nhật lộ trình.
+    """
     messages = state["messages"]
     plan = state["plan"]
-    task_type = state.get("task_type", "development")
     
-    proposal_msg = None
+    # =====================================================================
+    # BƯỚC 1: TRÍCH XUẤT PAYLOAD PHÂN TÍCH NỘI BỘ (IDEMPOTENT EXTRACTION)
+    # =====================================================================
+    proposal_payload = {}
     for msg in reversed(messages):
+        # Tìm tin nhắn chứa gói dữ liệu kế hoạch được đóng gói ẩn bởi replanner_node
         if getattr(msg, "name", None) == "replanner_proposal":
-            proposal_msg = msg
+            proposal_payload = msg.additional_kwargs.get("proposal_payload", {})
             break
             
-    if not proposal_msg:
-        return {}
+    # Nếu không tìm thấy bất kỳ đề xuất nào từ nút replanner trước đó,
+    # bảo toàn kế hoạch hiện hành và đi tiếp
+    if not proposal_payload:
+        logger.warning("[Replanner Gate] Không tìm thấy dữ liệu đề xuất từ replanner_node.")
+        return {
+            "error_logs": "",
+            "attempts": 0,
+            "modified_files": []
+        }
         
-    try:
-        proposal_data = json.loads(proposal_msg.content)
-    except Exception:
-        return {}
-        
-    # Xử lý trường hợp chạm giới hạn lập kế hoạch lại (an toàn phòng thủ)
-    if proposal_data.get("action") in ["bypass_limit", "bypass_no_error"]:
-        # Nếu đã lặp quá 5 lần, giữ nguyên kế hoạch cũ nhưng bắt buộc phải có ít nhất 1 task pending 
-        # để tránh việc router đẩy thẳng sang synthesis gây Halt luồng vô ích.
+    action = proposal_payload.get("action", "bypass_no_error")
+    proposed_tasks = proposal_payload.get("tasks", [])
+    
+    # =====================================================================
+    # BƯỚC 2: TỰ ĐỘNG DUYỆT (AUTO-APPROVE BYPASS GUARD)
+    # Ngăn chặn tuyệt đối việc bắt người dùng duyệt bản kế hoạch rỗng
+    # =====================================================================
+    if action in ["bypass_limit", "bypass_no_error"] or not proposed_tasks:
+        # Chuẩn bị lại danh sách nhiệm vụ từ kế hoạch cũ
         fallback_tasks = []
         for t in plan:
             fallback_tasks.append(t if isinstance(t, Task) else Task(**t))
             
-        has_pending = any(t.status == "pending" for t in fallback_tasks)
-        if not has_pending and fallback_tasks:
-            # Khôi phục trạng thái của task cuối cùng về pending để tiếp tục sửa chữa
-            fallback_tasks[-1].status = "pending"
-            
+        logger.info("[Replanner Gate] Tự động duyệt qua kế hoạch rỗng hoặc lệnh bypass.")
         return {
             "plan": fallback_tasks,
             "error_logs": "",
             "attempts": 0,
             "modified_files": [],
-            "messages": [AIMessage(content="🔄 [Bypass Replanner] Đã vượt ngưỡng giới hạn lập kế hoạch. Tiếp tục sửa chữa mã nguồn.")]
+            "messages": [AIMessage(content="⏭️ **[Tự động điều phối]**: Kế hoạch hiện tại đã tối ưu, hệ thống tự động hoàn tất pha duyệt.")]
         }
         
-    payload = {
+    # =====================================================================
+    # BƯỚC 3: THIẾT LẬP GIAO DIỆN INTERRUPT PAYLOAD
+    # =====================================================================
+    # Payload này sẽ được serialization thành JSON và gửi trực tiếp lên giao diện Client/Studio
+    interrupt_payload = {
         "title": "📋 ĐÁNH GIÁ & PHÊ DUYỆT KẾ HOẠCH HÀNH ĐỘNG",
-        "explanation": proposal_data["explanation"],
-        "proposed_tasks": proposal_data["tasks"],
+        "explanation": proposal_payload.get("explanation", "Hệ thống phát hiện cần thay đổi lộ trình để tiếp tục thực hiện."),
+        "proposed_tasks": proposed_tasks,
         "prompt": (
             "Hệ thống đề xuất điều chỉnh lộ trình như trên.\n"
-            "- Gửi phản hồi 'yes' hoặc rỗng để ĐỒNG Ý áp dụng kế hoạch mới.\n"
-            "- Gửi phản hồi 'skip' hoặc 'no' để BỎ QUA việc lập kế hoạch lại.\n"
+            "- Nhấn Approve (hoặc gửi phản hồi 'yes', chuỗi rỗng) để ĐỒNG Ý lộ trình mới.\n"
+            "- Gửi phản hồi 'skip' hoặc 'no' để BỎ QUA và giữ nguyên lộ trình cũ.\n"
+            "- Bạn cũng có thể sửa đổi danh sách Task trực tiếp trên giao diện để cấu hình kế hoạch tùy chỉnh."
         )
     }
     
-    # Kích hoạt ngắt đồ thị chờ duyệt (hoặc tự động lấy input nếu chạy CLI không tương tác)
-    user_input = interrupt(payload)
+    # KÍCH HOẠT NGẮT ĐỒ THỊ (LangGraph pauses here and waits for Command(resume=value))
+    user_input = interrupt(interrupt_payload)
     
+    # =====================================================================
+    # BƯỚC 4: BỘ PHÂN TÍCH PHẢN HỒI ĐA TẦNG (DEFENSIVE RESPONSE PARSER)
+    # Chạy khi đồ thị được RESUME. Xử lý tất cả các kịch bản đầu vào từ UI.
+    # =====================================================================
+    
+    # Mặc định hóa phản hồi
+    user_input_clean = ""
     if isinstance(user_input, str):
         user_input_clean = user_input.strip().lower()
+    
+    # --- Kịch bản 4.1: Đồng ý mặc định (Approval Path) ---
+    # Người dùng gửi 'yes', 'approve', 'ok', hoặc chỉ ấn Enter (chuỗi rỗng / None)
+    if user_input is None or user_input_clean in ["", "yes", "approve", "ok"]:
+        refined_tasks = [Task(**t) for t in proposed_tasks]
+        return {
+            "plan": refined_tasks,
+            "task_type": proposal_payload.get("task_type", "development"),
+            "error_logs": "",
+            "attempts": 0,
+            "modified_files": [],
+            "messages": [AIMessage(content="✅ **[Kế hoạch được duyệt]** Áp dụng lộ trình phát triển và kiểm thử mới thành công.")]
+        }
         
-        if user_input_clean in ["skip", "no", "cancel"]:
-            # Nếu người dùng từ chối đổi kế hoạch, ta vẫn giữ kế hoạch cũ nhưng phải đảm bảo có task pending
-            fallback_tasks = [t if isinstance(t, Task) else Task(**t) for t in plan]
-            if not any(t.status == "pending" for t in fallback_tasks) and fallback_tasks:
-                fallback_tasks[-1].status = "pending"
-            return {
-                "plan": fallback_tasks,
-                "error_logs": "",           
-                "attempts": 0,
-                "modified_files": [],
-                "messages": [AIMessage(content="⏭️ **[Người dùng bỏ qua kế hoạch mới]** Tiếp tục lộ trình thực thi hiện tại.")]
-            }
+    # --- Kịch bản 4.2: Từ chối / Bỏ qua (Skip/Decline Path) ---
+    # Người dùng không muốn thay đổi lộ trình, giữ nguyên kế hoạch hiện tại
+    if user_input_clean in ["skip", "no", "cancel", "decline"]:
+        fallback_tasks = []
+        for t in plan:
+            task_obj = t if isinstance(t, Task) else Task(**t)
+            fallback_tasks.append(task_obj)
             
-        elif user_input_clean in ["yes", "approve", "ok", ""]:
-            refined_tasks = [Task(**t) for t in proposal_data["tasks"]]
+        # Đảm bảo có ít nhất một task pending để hệ thống không bị dừng đột ngột
+        has_pending = any(t.status == "pending" for t in fallback_tasks)
+        if not has_pending and fallback_tasks:
+            fallback_tasks[-1].status = "pending"
+            
+        logger.info("[Replanner Gate] Người dùng từ chối kế hoạch mới. Sử dụng kế hoạch cũ.")
+        return {
+            "plan": fallback_tasks,
+            "error_logs": "",
+            "attempts": 0,
+            "modified_files": [],
+            "messages": [AIMessage(content="⏭️ **[Người dùng bỏ qua kế hoạch mới]** Tiếp tục lộ trình thực thi cũ.")]
+        }
+        
+    # --- Kịch bản 4.3: Người dùng nhập Kế hoạch tùy chỉnh (Custom Task List Path) ---
+    # Giao diện frontend hoặc Studio có thể cho phép người dùng tùy chỉnh danh sách Tasks 
+    # và gửi về dưới dạng chuỗi JSON hoặc một cấu trúc dữ liệu mảng trực tiếp.
+    custom_tasks_raw = []
+    
+    # Nếu client gửi về một list/dict trực tiếp
+    if isinstance(user_input, list):
+        custom_tasks_raw = user_input
+    elif isinstance(user_input, dict) and "tasks" in user_input:
+        custom_tasks_raw = user_input["tasks"]
+    elif isinstance(user_input, str):
+        # Thử nghiệm phân tích cú pháp chuỗi JSON nếu người dùng tự nhập tay cấu trúc mảng
+        try:
+            parsed = json.loads(user_input)
+            if isinstance(parsed, list):
+                custom_tasks_raw = parsed
+            elif isinstance(parsed, dict) and "tasks" in parsed:
+                custom_tasks_raw = parsed["tasks"]
+        except json.JSONDecodeError:
+            pass
+
+    # Nếu phân tích ra được danh sách task tùy chỉnh hợp lệ
+    if custom_tasks_raw:
+        try:
+            custom_tasks = [Task(**t) for t in custom_tasks_raw]
+            logger.info(f"[Replanner Gate] Áp dụng thành công kế hoạch tùy chỉnh gồm {len(custom_tasks)} tasks.")
             return {
-                "plan": refined_tasks,
-                "task_type": proposal_data["task_type"],
+                "plan": custom_tasks,
+                "task_type": proposal_payload.get("task_type", "development"),
                 "error_logs": "",
                 "attempts": 0,
                 "modified_files": [],
-                "messages": [AIMessage(content="✅ **[Kế hoạch được duyệt]** Áp dụng lộ trình phát triển mới thành công.")]
+                "messages": [AIMessage(content=f"✏️ **[Kế hoạch tùy chỉnh]** Đã áp dụng lộ trình gồm {len(custom_tasks)} bước do bạn thiết lập.")]
             }
+        except Exception as parse_err:
+            logger.error(f"[Replanner Gate] Lỗi định dạng dữ liệu Task tùy chỉnh: {str(parse_err)}")
             
-        else:
-            # Xử lý JSON tự nhập từ người dùng
-            try:
-                parsed_tasks = json.loads(user_input)
-                if isinstance(parsed_tasks, list):
-                    custom_tasks = [Task(**t) for t in parsed_tasks]
-                    return {
-                        "plan": custom_tasks,
-                        "error_logs": "",
-                        "attempts": 0,
-                        "modified_files": [],
-                        "messages": [AIMessage(content="✏️ **[Kế hoạch tùy chỉnh]** Đã áp dụng danh sách nhiệm vụ của bạn.")]
-                    }
-            except Exception:
-                pass
-            
-    # Mặc định tự động duyệt (Auto-approve) khi chạy không tương tác
-    refined_tasks = [Task(**t) for t in proposal_data["tasks"]]
+    # --- Kịch bản 4.4: Phản hồi tự do (Free-text Feedback Path) ---
+    # Nếu người dùng không nhập đúng từ khóa điều hướng và cũng không phải JSON,
+    # mà nhập một phản hồi văn bản tự do (ví dụ: "Hãy làm thêm bước X trước bước Y"),
+    # chúng ta sẽ chuyển tiếp ý kiến phản hồi này làm tin nhắn hệ thống đưa ngược về Executor/Replanner
+    logger.info(f"[Replanner Gate] Ghi nhận phản hồi văn bản tự do: {user_input}")
+    feedback_message = HumanMessage(
+        content=(
+            "⚠️ Ý kiến điều chỉnh lộ trình từ người dùng:\n"
+            f"'{user_input}'\n"
+            "Hãy phân tích và cập nhật lại kế hoạch hành động tương ứng dựa trên ý kiến này."
+        )
+    )
+    
+    # Hoàn trả lại kế hoạch cũ để Replanner có thể xử lý điều chỉnh lại ở lượt tiếp theo
+    fallback_tasks = [t if isinstance(t, Task) else Task(**t) for t in plan]
     return {
-        "plan": refined_tasks,
-        "task_type": proposal_data["task_type"],
-        "error_logs": "",
+        "plan": fallback_tasks,
+        "error_logs": f"Người dùng yêu cầu thay đổi lộ trình: {user_input}",
         "attempts": 0,
-        "modified_files": [],
-        "messages": [AIMessage(content="✅ **[Tự động duyệt]** Đồng ý kế hoạch điều chỉnh.")]
+        "messages": [feedback_message]
     }
 
 

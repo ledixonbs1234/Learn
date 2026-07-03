@@ -104,6 +104,7 @@ class AgentState(TypedDict):
     detailed_analysis: str
     extension_path: str
     browser_console_logs: str
+    active_skills: Dict[str, str]
 
 class WebInteractionState(TypedDict):
     workspace_path: str 
@@ -121,6 +122,18 @@ class WebInteractionState(TypedDict):
     screenshot_path: Optional[str]
     error: Optional[str]
     attempts: int
+
+
+class SkillParameter(BaseModel):
+    type: str = Field(description="Kiểu dữ liệu của tham số (string, integer, boolean, object, array).")
+    description: str = Field(description="Mô tả chi tiết bằng tiếng Việt về tham số này.")
+    required: bool = Field(default=True, description="Tham số này có bắt buộc không.")
+
+class SkillDefinition(BaseModel):
+    name: str = Field(description="Tên định danh của kỹ năng, ví dụ: 'excel_edit_cell'.")
+    description: str = Field(description="Mô tả chi tiết nhiệm vụ và trường hợp sử dụng của kỹ năng này.")
+    parameters: Dict[str, SkillParameter] = Field(description="Từ điển chứa các tham số đầu vào cần thiết.")
+    usage_example: str = Field(description="Ví dụ cụ thể về cách chuẩn bị tham số và kết quả mong đợi.")
     
 class RuntimeVerificationResult(BaseModel):
     has_critical_error: bool = Field(description="True nếu phát hiện lỗi crash, exception, lỗi CORS, hoặc lỗi console đỏ nghiêm trọng.")

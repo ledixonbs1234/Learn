@@ -2,10 +2,12 @@
 import asyncio
 import base64
 import json
+import os
 import subprocess
 import re
 from pathlib import Path
-from typing import List, Literal, Optional, Union, Type
+import sys
+from typing import Any, Dict, List, Literal, Optional, Union, Type
 from pydantic import BaseModel, Field
 from langchain_core.tools import BaseTool, tool
 from config import GitIgnoreMatcher, find_project_root_heuristic, sanitize_and_resolve_path
@@ -14,6 +16,8 @@ from langchain_core.callbacks import CallbackManagerForToolRun
 from langchain_core.messages import ToolMessage
 from langgraph.types import interrupt 
 import config
+from skills_engine import AgentSkillsEngine
+from skills_library import SkillManager
 from state import Task
 
 def get_markdown_language(file_path: str) -> str:
@@ -1141,3 +1145,77 @@ class ChromeDebuggerTool(BaseTool):
             return debug_output
         except Exception as e:
             return f"Lỗi khi kết nối gỡ lỗi Chrome CDP: {str(e)}"
+        
+class ActivateSkillSchema(BaseModel):
+    skill_name: str = Field(description="Tên của Skill cần kích hoạt lấy từ danh mục Skill khả dụng (ví dụ: 'excel-handler').")
+
+class ActivateSkillTool(BaseTool):
+    name: str = "activate_agent_skill"
+    description: str = (
+        "BẮT BUỘC gọi công cụ này để nạp toàn bộ tài liệu và hướng dẫn sử dụng "
+        "của một Skill cụ thể vào ngữ cảnh làm việc khi bạn cần thực thi các tác vụ liên quan đến Skill đó."
+    )
+    args_schema: Type[BaseModel] = ActivateSkillSchema
+    workspace_path: str
+
+    def _run(self, skill_name: str) -> str:
+        engine = AgentSkillsEngine(self.workspace_path)
+        body = engine.load_skill_body(skill_name)
+        if not body:
+            return f"Lỗi: Không tìm thấy Skill nào có tên là '{skill_name}' trong thư mục .skills/"
+        return body
+
+
+class RunSkillScriptSchema(BaseModel):
+    skill_name: str = Field(description="Tên của Skill (ví dụ: 'excel-handler').")
+    script_name: str = Field(description="Tên file script nằm trong thư mục scripts/ của Skill đó (ví dụ: 'read_excel.py').")
+    arguments: List[str] = Field(default_factory=list, description="Mảng chứa các đối số dạng chuỗi truyền vào script theo đúng thứ tự tài liệu hướng dẫn.")
+
+class RunSkillScriptTool(BaseTool):
+    name: str = "run_skill_script"
+    description: str = "Thực thi trực tiếp một file script xử lý tác vụ nằm trong thư mục scripts/ của một Skill đã kích hoạt."
+    args_schema: Type[BaseModel] = RunSkillScriptSchema
+    workspace_path: str
+
+    def _run(self, skill_name: str, script_name: str, arguments: List[str]) -> str:
+        engine = AgentSkillsEngine(self.workspace_path)
+        script_path = engine.get_script_path(skill_name, script_name)
+        
+        if not script_path:
+            return f"Lỗi: Không tìm thấy script '{script_name}' thuộc Skill '{skill_name}'."
+            
+        try:
+            resolved_workspace = str(Path(self.workspace_path).expanduser().resolve())
+            
+            # 1. THIẾT LẬP MÔI TRƯỜNG ĐỒNG BỘ UTF-8 CHO TIẾN TRÌNH CON
+            env_copy = os.environ.copy()
+            env_copy["PYTHONIOENCODING"] = "utf-8"
+            env_copy["PYTHONUTF8"] = "1"
+            
+            cmd = [sys.executable, str(script_path)] + arguments
+            
+            # 2. CHẠY TIẾN TRÌNH VỚI CHỈ ĐỊNH GIẢI MÃ ENCODING='UTF-8' RÕ RÀNG [2.1.8]
+            res = subprocess.run(
+                cmd,
+                cwd=resolved_workspace,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",  # Đảm bảo luồng chính giải mã dữ liệu dạng UTF-8 chính xác [2.1.8]
+                env=env_copy,      # Truyền biến môi trường UTF-8 xuống tiến trình con
+                timeout=30
+            )
+            
+            output = []
+            if res.stdout:
+                output.append(res.stdout.strip())
+            if res.stderr:
+                output.append(f"[LỖI TRONG RUNTIME]:\n{res.stderr.strip()}")
+                
+            if res.returncode != 0:
+                return f"❌ Thất bại (Mã lỗi {res.returncode}):\n" + "\n".join(output)
+            return f"✅ Thành công:\n" + "\n".join(output)
+            
+        except subprocess.TimeoutExpired:
+            return "❌ Lỗi: Script chạy quá thời gian chờ (Timeout 30s)."
+        except Exception as e:
+            return f"❌ Lỗi hệ thống khi khởi chạy tiến trình: {str(e)}"

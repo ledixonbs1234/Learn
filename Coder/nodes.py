@@ -15,9 +15,10 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langgraph.types import interrupt
 from config import find_project_root_heuristic, model, sanitize_and_resolve_path, fast_model
 from mcp_helper import run_agent_with_devtools_mcp
+from skills_engine import AgentSkillsEngine
 from state import AgentState, PlanUpdate, RuntimeVerificationResult, TaskPlan, TaskTriage, Task
 from tools import (
-    AskQuestionsTool, GitManager, ProposePlanTool, ReadFileLinesTool, UniversalSymbolSearchTool, WebInteractAndTestTool, WorkspaceTools, 
+    ActivateSkillTool, AskQuestionsTool, GitManager, ProposePlanTool, ReadFileLinesTool, RunSkillScriptTool, UniversalSymbolSearchTool, WebInteractAndTestTool, WorkspaceTools, 
     ReadFilesTool, WriteFileTool, ApplyPatchTool, 
     ListDirectoryTool, RunTerminalTool, get_markdown_language
 )
@@ -719,10 +720,10 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
     task_type = state.get("task_type", "development")
     extension_path = state.get("extension_path", "")
     
-    # ==========================================
-    # BƯỚC 1: TỰ ĐỘNG KHỞI TẠO NGỮ CẢNH TRƯỜNG LÀM VIỆC (BOOTSTRAP ENVIRONMENT)
-    # Chạy ngầm một lần duy nhất nếu chưa có thông tin Git hoặc Context
-    # ==========================================
+    # 1. KHỞI TẠO HOẶC LẤY TRẠNG THÁI ACTIVE SKILLS
+    active_skills = state.get("active_skills", {}) or {}
+
+    # TỰ ĐỘNG KHỞI TẠO NGỮ CẢNH TRƯỜNG LÀM VIỆC (BOOTSTRAP ENVIRONMENT)
     state_updates = {}
     git_branch = state.get("git_branch", "")
     workspace_context = state.get("workspace_context", "")
@@ -750,14 +751,12 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             workspace_context = "📋 Chưa có tệp cấu hình THONGTIN.md."
         state_updates["workspace_context"] = workspace_context
 
-    # Tìm kiếm manifest.json nếu chưa quét
     if not extension_path:
         ext_dir = find_extension_dir_heuristic(Path(ws))
         if ext_dir:
             extension_path = ext_dir
             state_updates["extension_path"] = extension_path
 
-    # Định vị các nhiệm vụ cần thực thi trong Plan
     eligible_tasks = get_eligible_tasks(plan)
     if not eligible_tasks:
         pending_tasks = [t for t in plan if (t.get("status") if isinstance(t, dict) else getattr(t, "status", None)) == "pending"]
@@ -786,26 +785,61 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
                 f"```{lang}\n" + "\n".join(formatted_lines) + "\n```\n"
             )
 
+    # =====================================================================
+    # 2. XỬ LÝ PROGRESSIVE DISCLOSURE THEO CHUẨN AGENTSKILLS.IO
+    # =====================================================================
+    # Tier 1: Quét nhanh Catalog danh mục
+    skills_engine = AgentSkillsEngine(ws)
+    catalog = skills_engine.scan_catalog()
+    
+    catalog_prompt = ""
+    if catalog:
+        catalog_prompt = "\n=== 📚 THƯ VIỆN KỸ NĂNG KHẢ DỤNG (TIER 1: CATALOG) ===\n"
+        catalog_prompt += "Dưới đây là danh sách các kỹ năng bổ sung bạn có thể sử dụng. Nếu nhiệm vụ yêu cầu sử dụng chúng, bạn PHẢI gọi công cụ `activate_agent_skill` trước để nạp hướng dẫn chi tiết của kỹ năng đó:\n"
+        for item in catalog:
+            catalog_prompt += f"- **{item['name']}**: {item['description']}\n"
+
+    # Tier 2: Đọc thông tin từ Tool Call gần nhất để lưu vết kích hoạt vào State
+    last_message = messages[-1] if messages else None
+    if last_message and getattr(last_message, "type", None) == "tool" and last_message.name == "activate_agent_skill":
+        for msg in reversed(messages):
+            if isinstance(msg, AIMessage) and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    if tc["name"] == "activate_agent_skill":
+                        requested_skill = tc["args"].get("skill_name")
+                        if requested_skill and "Lỗi" not in str(last_message.content):
+                            active_skills[requested_skill] = str(last_message.content)
+                        break
+
+    active_skills_prompt = ""
+    if active_skills:
+        active_skills_prompt = "\n=== ⚡ CÁC KỸ NĂNG ĐANG HOẠT ĐỘNG (TIER 2: INSTRUCTIONS) ===\n"
+        for s_name, s_instructions in active_skills.items():
+            active_skills_prompt += f"\n--- CHỈ DẪN KỸ NĂNG `{s_name}` ---\n{s_instructions}\n"
+
     # ==========================================
-    # BƯỚC 2: PHÂN CHIA VÀ CẤU HÌNH CÔNG CỤ THEO GIAI ĐOẠN
+    # 3. ĐĂNG KÝ VÀ KHỞI TẠO CÁC CÔNG CỤ THEO PHA
     # ==========================================
+    activate_skill_tool = ActivateSkillTool(workspace_path=ws)
+    run_skill_script_tool = RunSkillScriptTool(workspace_path=ws)
+
     if task_type == "analysis":
-        # Đăng ký đầy đủ công cụ khám phá chủ động (Active Discovery Tools)
         read_files = ReadFilesTool(workspace_path=ws)
         list_directory = ListDirectoryTool(workspace_path=ws)
         search_symbols = UniversalSymbolSearchTool(workspace_path=ws)
         read_file_lines = ReadFileLinesTool(workspace_path=ws)
         ask_questions_tool = AskQuestionsTool(workspace_path=ws)
-        propose_plan_tool = ProposePlanTool(workspace_path=ws) # Công cụ duyệt kế hoạch
+        propose_plan_tool = ProposePlanTool(workspace_path=ws)
         
-        tools = [read_files, list_directory, search_symbols, read_file_lines, ask_questions_tool, propose_plan_tool]
+        # Bổ sung 2 công cụ kỹ năng động
+        tools = [activate_skill_tool, run_skill_script_tool, read_files, list_directory, search_symbols, read_file_lines, ask_questions_tool, propose_plan_tool]
 
         system_prompt = (
             "Bạn là một chuyên gia điều tra, khảo sát mã nguồn và lập kế hoạch kỹ thuật (Active Discovery Engine).\n"
             f"Nhiệm vụ hiện tại:\n{tasks_str}\n"
             f"Thư mục làm việc: {ws}\n\n"
             "⚠️ QUY TRÌNH KHẢO SÁT CHỦ ĐỘNG VÀ ĐA ĐƯỜNG DẪN (BẮT BUỘC):\n"
-            "1. Sử dụng các công cụ `list_directory`, `search_symbols_universal`, `read_files` để thám thính và tìm hiểu "
+            "1. Sử dụng các công cụ `list_directory`, `search_symbols_universal`, `read_files` để thám thính và tìm hiểu, nếu file không hỗ trợ thì xem thử có skill nào hỗ trợ đọc file đó không."
             "   nguyên nhân gây ra vấn đề trong thư mục dự án.\n"
             "2. Đừng ngần ngại gọi nhiều công cụ thăm dò liên tục để tự xây dựng ngữ cảnh đầy đủ nhất.\n"
             "3. ĐÁNH GIÁ ĐỘ PHỨC TẠP VÀ RA QUYẾT ĐỊNH CHỌN ĐƯỜNG DẪN THỰC THI:\n"
@@ -816,10 +850,10 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             "     lên nhiều file nguồn, bạn BẮT BUỘC phải gọi công cụ `propose_implementation_plan` để phác thảo Bản kế hoạch "
             "     triển khai (DAG) chi tiết và tạm dừng chờ người dùng duyệt [2].\n"
             "4. Nếu thông tin dự án quá mơ hồ hoặc thiếu file cấu hình thiết yếu, hãy dùng `ask_questions_if_underspecified` để trưng cầu ý kiến người dùng."
+            "5. ĐỐI VỚI CÁC TÁC VỤ PHỨC TẠP: Bạn BẮT BUỘC phải gọi công cụ `propose_implementation_plan` để phác thảo Bản kế hoạch trước khi viết code."
         )
         
     else:  # task_type == "development"
-        # Đăng ký công cụ can thiệp vật lý (Write-Access Tools)
         read_files = ReadFilesTool(workspace_path=ws)
         write_file = WriteFileTool(workspace_path=ws)
         apply_patch = ApplyPatchTool(workspace_path=ws)
@@ -829,15 +863,19 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         read_file_lines = ReadFileLinesTool(workspace_path=ws)
         ask_questions_tool = AskQuestionsTool(workspace_path=ws)
         
-        tools = [read_files, write_file, apply_patch, list_directory, run_terminal_command, search_symbols, read_file_lines, ask_questions_tool]
+        # Bổ sung 2 công cụ kỹ năng động
+        tools = [activate_skill_tool, run_skill_script_tool, read_files, write_file, apply_patch, list_directory, run_terminal_command, search_symbols, read_file_lines, ask_questions_tool]
 
         system_prompt = (
             "Bạn là kỹ sư phần mềm thực thi chuyên nghiệp (Write-Access Mode).\n"
             f"Nhiệm vụ phát triển:\n{tasks_str}\n"
             f"Thư mục làm việc: {ws}\n\n"
-            "Hãy áp dụng các bản vá, viết code mới hoặc thực thi kiểm thử tĩnh để hoàn tất kế hoạch đã được phê duyệt.\n"
-            "Luôn tuân thủ nguyên tắc Search-and-Replace thông qua `apply_search_replace_patch` đối với các file lớn."
+            "Hãy áp dụng các bản vá, viết code mới hoặc thực thi kiểm thử tĩnh để hoàn tất kế hoạch đã được phê duyệt."
         )
+
+    # Ghép Catalog (Tier 1) và các kỹ năng đang hoạt động (Tier 2) vào System Prompt
+    system_prompt += catalog_prompt
+    system_prompt += active_skills_prompt
 
     if workspace_context:
         system_prompt += f"\n\n--- THÔNG TIN NỀN TẢNG THU THẬP ĐƯỢC ---\n{workspace_context}"
@@ -846,7 +884,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
     if registry_context_str:
         system_prompt += registry_context_str
 
-    # Gọi LLM
+    # Gọi LLM (Local model - Kiro qua function calling)
     model_with_tools = model.bind_tools(tools)
     optimized_history = compact_reading_tool_messages(messages)
     
@@ -857,11 +895,8 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
     response = model_with_tools.invoke(input_messages + optimized_history)
     response = sanitize_llm_response_content(response)
     
-    # ==========================================
-    # BƯỚC 3: XỬ LÝ ĐẦU RA AN TOÀN (DEFENSIVE PARSING)
-    # ==========================================
+    # 4. KIỂM TRA PHẢN HỒI VÀ HOÀN TẤT LƯỢT CHẠY
     if not response.tool_calls:
-        # Nếu đang ở pha phân tích/khảo sát nhưng LLM chọn tự trả lời trực tiếp mà không cần sửa code phức tạp
         if task_type == "analysis":
             findings = []
             if response.content:
@@ -883,15 +918,15 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             state_updates.update({
                 "messages": [response],
                 "plan": updated_plan,
-                "last_executed_task_ids": list(eligible_ids)
+                "last_executed_task_ids": list(eligible_ids),
+                "active_skills": active_skills
             })
             if findings:
                 state_updates["step_findings"] = findings
             return state_updates
         else:
-            # Xử lý logic hoàn thành cho pha development (giữ nguyên quy tắc cũ)
             has_executed_action = any(
-                getattr(msg, "type", None) == "tool" and msg.name in ["write_file", "apply_search_replace_patch", "run_terminal_command"]
+                getattr(msg, "type", None) == "tool" and msg.name in ["write_file", "apply_search_replace_patch", "run_terminal_command", "run_skill_script"]
                 for msg in reversed(messages)
             )
             content_lower = response.content.lower() if response.content else ""
@@ -914,20 +949,24 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
                 state_updates.update({
                     "messages": [response],
                     "plan": updated_plan,
-                    "last_executed_task_ids": list(eligible_ids)
+                    "last_executed_task_ids": list(eligible_ids),
+                    "active_skills": active_skills
                 })
                 return state_updates
             else:
                 warning_feedback = HumanMessage(
-                    content="⚠️ Cảnh báo: Bạn đang ở chế độ Phát triển (Development) nhưng chưa thực hiện bất kỳ thay đổi vật lý nào lên file. Hãy dùng write_file hoặc apply_search_replace_patch trước khi hoàn tất."
+                    content="⚠️ Cảnh báo: Bạn đang ở chế độ Phát triển nhưng chưa thực hiện thay đổi nào lên file hoặc kích hoạt script. Hãy chạy run_skill_script hoặc ghi file trước khi hoàn tất."
                 )
                 state_updates.update({
-                    "messages": [response, warning_feedback]
+                    "messages": [response, warning_feedback],
+                    "active_skills": active_skills
                 })
                 return state_updates
                 
-    # Nếu có gọi công cụ, tiếp tục luồng lặp bình thường
-    state_updates.update({"messages": [response]})
+    state_updates.update({
+        "messages": [response],
+        "active_skills": active_skills
+    })
     return state_updates
 
 def replanner_node(state: AgentState) -> Dict[str, Any]:
@@ -1244,6 +1283,7 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
     web_interact_tool = WebInteractAndTestTool(workspace_path=ws)
     ask_questions_tool = AskQuestionsTool(workspace_path=ws) # ĐÃ THÊM KHỞI TẠO TRONG TOOL_NODE
     
+ 
     tools_map = {
         "read_files": read_files,
         "write_file": write_file,
@@ -1254,6 +1294,8 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         "read_file_lines": read_file_lines,
         "web_interact_and_test": web_interact_tool,
         "ask_questions_if_underspecified": ask_questions_tool, # ĐÃ ĐĂNG KÝ VÀO THƯ VIỆN THỰC THI
+        "activate_agent_skill": ActivateSkillTool(workspace_path=ws),
+        "run_skill_script": RunSkillScriptTool(workspace_path=ws),
     }
     
     last_message = state["messages"][-1]
@@ -1302,10 +1344,16 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
                 
         tool_messages.append(ToolMessage(content=str(result), name=tool_name, tool_call_id=tool_id))
         
+    BINARY_EXTENSIONS = {".xlsx", ".xls", ".png", ".jpg", ".jpeg", ".zip", ".pdf", ".exe"}
+    
     for file_path in impacted_files:
         try:
             safe_path = sanitize_and_resolve_path(ws, file_path, create_parent=False)
             if safe_path.exists() and safe_path.is_file():
+                # Kiểm tra định dạng nhị phân [2]
+                if safe_path.suffix.lower() in BINARY_EXTENSIONS:
+                    continue  # Bỏ qua không nạp vào bộ nhớ text thô của file_registry [2]
+                    
                 current_content = safe_path.read_text(encoding="utf-8")
                 file_registry[file_path] = current_content
         except Exception:

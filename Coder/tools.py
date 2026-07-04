@@ -3,6 +3,7 @@ import asyncio
 import base64
 import json
 import os
+import platform
 import subprocess
 import re
 from pathlib import Path
@@ -114,8 +115,9 @@ class ListDirSchema(BaseModel):
     sub_dir: str = Field(default=".", description="Đường dẫn tương đối của thư mục cần xem.")
 
 class RunTerminalSchema(BaseModel):
-    command: str = Field(description="Lệnh terminal hệ điều hành cần thực thi trực tiếp tại thư mục gốc của workspace.")
-
+    command: str = Field(
+        description="Lệnh terminal cần thực thi. LƯU Ý: Môi trường hiện tại là Windows (cmd.exe/PowerShell). TUYỆT ĐỐI KHÔNG sử dụng cú pháp Linux như << 'EOF' hoặc heredoc. Để chạy code Python dài, hãy dùng công cụ write_file tạo script trước rồi gọi 'python script.py'."
+    )
 class ReadFileLinesSchema(BaseModel):
     file_path: str = Field(description="Đường dẫn tương đối của tệp tin trong workspace.")
     start_line: int = Field(description="Dòng bắt đầu đọc (đánh chỉ số từ 1).")
@@ -644,7 +646,11 @@ class ListDirectoryTool(BaseTool):
 
 class RunTerminalTool(BaseTool):
     name: str = "run_terminal_command"
-    description: str = "Thực thi một lệnh terminal hệ điều hành trực tiếp trong thư mục gốc của workspace."
+    description: str = (
+        "Thực thi lệnh terminal hệ điều hành tại workspace. "
+        f"Hệ điều hành Host: {platform.system()}. "
+        "Nếu là Windows, tuân thủ nghiêm ngặt cú pháp CMD/PowerShell, tránh viết lệnh Python inline quá dài chứa ký tự nháy kép phức tạp."
+    )
     args_schema: Type[BaseModel] = RunTerminalSchema
     workspace_path: str
 
@@ -983,12 +989,20 @@ class WorkspaceTools:
 
     def run_terminal(self, command: str, timeout: int = 60) -> str:
         try:
+            # 1. Tạo môi trường độc lập, ép buộc Python xuất I/O theo chuẩn UTF-8
+            env_copy = os.environ.copy()
+            env_copy["PYTHONIOENCODING"] = "utf-8"
+            env_copy["PYTHONUTF8"] = "1"
+
             res = subprocess.run(
                 command,
                 cwd=str(self.workspace),
                 shell=True,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",      # Ép giải mã luồng stdout/stderr theo UTF-8
+                errors="replace",      # Thay thế ký tự lỗi thay vì làm sập tiến trình
+                env=env_copy,          # Truyền môi trường UTF-8 xuống tiến trình con
                 timeout=timeout
             )
             
@@ -1219,3 +1233,43 @@ class RunSkillScriptTool(BaseTool):
             return "❌ Lỗi: Script chạy quá thời gian chờ (Timeout 30s)."
         except Exception as e:
             return f"❌ Lỗi hệ thống khi khởi chạy tiến trình: {str(e)}"
+        
+        
+class WriteAndRunScriptSchema(BaseModel):
+    file_path: str = Field(description="Đường dẫn tương đối của tệp tin Python cần ghi trong workspace (ví dụ: 'tinh_toan.py').")
+    content: str = Field(description="Toàn bộ nội dung tệp tin Python chi tiết cần ghi.")
+    arguments: List[str] = Field(default_factory=list, description="Mảng chứa các đối số dạng chuỗi truyền vào script khi chạy.")
+
+class WriteAndRunScriptTool(BaseTool):
+    name: str = "write_and_run_script"
+    description: str = (
+        "Ghi nội dung mã nguồn Python vào một tệp và lập tức thực thi tệp đó bằng trình thông dịch Python. "
+        "Bắt buộc sử dụng công cụ gộp này khi bạn muốn viết code phân tích dữ liệu, chẩn đoán, hoặc giải quyết bài toán và chạy ngay lập tức "
+        "để tránh lãng phí một lượt suy nghĩ của LLM."
+    )
+    args_schema: Type[BaseModel] = WriteAndRunScriptSchema
+    workspace_path: str
+
+    def _run(self, file_path: str, content: str, arguments: List[str] = []) -> str:
+        tools_mgr = WorkspaceTools(self.workspace_path)
+        
+        # 1. Thực hiện ghi file vật lý
+        write_res = tools_mgr.write_file(file_path, content)
+        if "Lỗi" in write_res:
+            return f"❌ Thất bại ở bước ghi file: {write_res}"
+            
+        # 2. Định vị đường dẫn tuyệt đối an toàn
+        try:
+            safe_path = sanitize_and_resolve_path(self.workspace_path, file_path, create_parent=False)
+        except Exception as e:
+            return f"❌ Lỗi định vị đường dẫn tệp tin: {str(e)}"
+            
+        # 3. Chuẩn bị câu lệnh thực thi đồng bộ UTF-8 bằng đúng trình thông dịch đang chạy Agent
+        import sys
+        cmd = f"\"{sys.executable}\" \"{safe_path}\""
+        if arguments:
+            cmd += " " + " ".join(f"\"{arg}\"" for arg in arguments)
+            
+        # 4. Thực thi terminal và thu thập kết quả
+        run_res = tools_mgr.run_terminal(cmd)
+        return f"📝 [Bước 1 - Ghi File]: {write_res}\n\n💻 [Bước 2 - Thực Thi]:\n{run_res}"

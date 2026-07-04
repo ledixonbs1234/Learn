@@ -38,7 +38,9 @@ class AgentSkillsEngine:
             return None
         
         content = skill_md.read_text(encoding="utf-8")
-        parts = re.split(r'^---+\s*$', content, flags=re.MULTILINE)
+        # Giới hạn maxsplit=2 để chỉ cắt ở biên của YAML Frontmatter đầu file,
+        # bảo toàn các đường kẻ ngang "---" trong nội dung Markdown phía sau.
+        parts = re.split(r'^---+\s*$', content, maxsplit=2, flags=re.MULTILINE)
         if len(parts) >= 3:
             return parts[2].strip()
         return content.strip()

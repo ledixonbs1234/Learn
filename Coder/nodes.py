@@ -19,7 +19,7 @@ from skills_engine import AgentSkillsEngine
 from state import AgentState, PlanUpdate, RuntimeVerificationResult, TaskPlan, TaskTriage, Task
 from tools import (
     ActivateSkillTool, AskQuestionsTool, GitManager, ProposePlanTool, ReadFileLinesTool, RunSkillScriptTool, UniversalSymbolSearchTool, WebInteractAndTestTool, WorkspaceTools, 
-    ReadFilesTool, WriteFileTool, ApplyPatchTool, 
+    ReadFilesTool, WriteAndRunScriptTool, WriteFileTool, ApplyPatchTool, 
     ListDirectoryTool, RunTerminalTool, get_markdown_language
 )
 
@@ -822,18 +822,32 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
     # ==========================================
     activate_skill_tool = ActivateSkillTool(workspace_path=ws)
     run_skill_script_tool = RunSkillScriptTool(workspace_path=ws)
+    write_and_run_script = WriteAndRunScriptTool(workspace_path=ws)
 
     if task_type == "analysis":
         read_files = ReadFilesTool(workspace_path=ws)
+        write_file = WriteFileTool(workspace_path=ws)
         list_directory = ListDirectoryTool(workspace_path=ws)
         search_symbols = UniversalSymbolSearchTool(workspace_path=ws)
         read_file_lines = ReadFileLinesTool(workspace_path=ws)
         ask_questions_tool = AskQuestionsTool(workspace_path=ws)
         propose_plan_tool = ProposePlanTool(workspace_path=ws)
+        run_terminal_command = RunTerminalTool(workspace_path=ws)
         
-        # Bổ sung 2 công cụ kỹ năng động
-        tools = [activate_skill_tool, run_skill_script_tool, read_files, list_directory, search_symbols, read_file_lines, ask_questions_tool, propose_plan_tool]
-
+        # Bổ sung các công cụ kỹ năng động kèm quyền ghi file và terminal phục vụ chẩn đoán chủ động
+        tools = [
+            activate_skill_tool, 
+            run_skill_script_tool, 
+            read_files, 
+            write_file, 
+            list_directory, 
+            search_symbols, 
+            read_file_lines, 
+            ask_questions_tool, 
+            propose_plan_tool,
+            run_terminal_command,
+            write_and_run_script
+        ]
         system_prompt = (
             "Bạn là một chuyên gia điều tra, khảo sát mã nguồn và lập kế hoạch kỹ thuật (Active Discovery Engine).\n"
             f"Nhiệm vụ hiện tại:\n{tasks_str}\n"
@@ -863,9 +877,20 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         read_file_lines = ReadFileLinesTool(workspace_path=ws)
         ask_questions_tool = AskQuestionsTool(workspace_path=ws)
         
-        # Bổ sung 2 công cụ kỹ năng động
-        tools = [activate_skill_tool, run_skill_script_tool, read_files, write_file, apply_patch, list_directory, run_terminal_command, search_symbols, read_file_lines, ask_questions_tool]
-
+        # Bổ sung các công cụ kỹ năng động kèm công cụ gộp
+        tools = [
+            activate_skill_tool, 
+            run_skill_script_tool, 
+            read_files, 
+            write_file, 
+            apply_patch, 
+            list_directory, 
+            run_terminal_command, 
+            search_symbols, 
+            read_file_lines, 
+            ask_questions_tool,
+            write_and_run_script
+        ]
         system_prompt = (
             "Bạn là kỹ sư phần mềm thực thi chuyên nghiệp (Write-Access Mode).\n"
             f"Nhiệm vụ phát triển:\n{tasks_str}\n"
@@ -1281,9 +1306,9 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
     search_symbols = UniversalSymbolSearchTool(workspace_path=ws)
     read_file_lines = ReadFileLinesTool(workspace_path=ws)
     web_interact_tool = WebInteractAndTestTool(workspace_path=ws)
-    ask_questions_tool = AskQuestionsTool(workspace_path=ws) # ĐÃ THÊM KHỞI TẠO TRONG TOOL_NODE
+    ask_questions_tool = AskQuestionsTool(workspace_path=ws)
+    write_and_run_script = WriteAndRunScriptTool(workspace_path=ws)
     
- 
     tools_map = {
         "read_files": read_files,
         "write_file": write_file,
@@ -1293,9 +1318,10 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         "search_symbols_universal": search_symbols,
         "read_file_lines": read_file_lines,
         "web_interact_and_test": web_interact_tool,
-        "ask_questions_if_underspecified": ask_questions_tool, # ĐÃ ĐĂNG KÝ VÀO THƯ VIỆN THỰC THI
+        "ask_questions_if_underspecified": ask_questions_tool,
         "activate_agent_skill": ActivateSkillTool(workspace_path=ws),
         "run_skill_script": RunSkillScriptTool(workspace_path=ws),
+        "write_and_run_script": write_and_run_script,
     }
     
     last_message = state["messages"][-1]

@@ -1,4 +1,5 @@
-# oder/main.py
+# main.py (Tệp tin cấu hình hoàn chỉnh đồ thị)
+
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 
@@ -12,6 +13,7 @@ builder = StateGraph(AgentState)
 builder.add_node("detect_and_triage", nodes.detect_and_triage_node) 
 builder.add_node("executor", nodes.executor_node)  
 builder.add_node("tool_node", nodes.tool_node) 
+builder.add_node("human_interaction_gate", nodes.human_interaction_gate_node) # 🌟 NODE MỚI ĐĂNG KÝ
 builder.add_node("chrome_extension_debugger", nodes.chrome_extension_debugger_node)
 builder.add_node("replanner", nodes.replanner_node)
 builder.add_node("replanner_interrupt", nodes.replanner_interrupt_node) 
@@ -21,7 +23,6 @@ builder.add_node("commit", nodes.commit_node)
 
 # THIẾT LẬP CÁC CẠNH NỐI CHÍNH (EDGES)
 builder.add_edge(START, "detect_and_triage")
-# ĐI THẲNG TỪ TRIAGE SANG EXECUTOR (Kích hoạt Active Discovery)
 builder.add_edge("detect_and_triage", "executor")
 
 # Định tuyến từ Executor
@@ -36,8 +37,20 @@ builder.add_conditional_edges(
     }
 )
 
-# Chuyển hướng từ Tool Node quay lại Executor
-builder.add_conditional_edges("tool_node", routers.tool_router, {"executor": "executor"})
+# 🌟 Cập nhật định tuyến từ Tool Node qua Gate trung gian
+builder.add_conditional_edges(
+    "tool_node", 
+    routers.tool_router, 
+    {
+        "executor": "executor",
+        "human_interaction_gate": "human_interaction_gate"
+    }
+)
+
+# Thiết lập đường truyền từ Node Gate quay lại vòng lặp của Executor
+builder.add_edge("human_interaction_gate", "executor")
+
+# Định tuyến từ các Node kiểm thử và gỡ lỗi
 builder.add_conditional_edges("tester", routers.tester_router, {
     "executor": "executor",
     "chrome_extension_debugger": "chrome_extension_debugger",
@@ -49,7 +62,6 @@ builder.add_conditional_edges("chrome_extension_debugger", routers.debugger_rout
     "replanner": "replanner",
     "synthesis": "synthesis"
 })
-
 
 builder.add_edge("replanner", "replanner_interrupt") 
 builder.add_conditional_edges("replanner_interrupt", routers.replanner_router, {

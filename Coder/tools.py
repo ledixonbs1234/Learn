@@ -1045,13 +1045,12 @@ class AskQuestionsTool(BaseTool):
     description: str = (
         "Hỏi ý kiến người dùng khi bối cảnh hoặc yêu cầu của tác vụ chưa rõ ràng (underspecified). "
         "Bắt buộc sử dụng công cụ này khi có nhiều phương án lựa chọn mà bạn không chắc chắn. "
-        "Kết quả trả về sẽ là một chuỗi JSON chứa đầy đủ câu trả lời của người dùng cho từng câu hỏi để bạn phân tích và suy nghĩ tiếp."
+        "Công cụ sẽ gửi yêu cầu và đồ thị sẽ tạm dừng ở bước tiếp theo để đợi phản hồi từ người dùng."
     )
     args_schema: Type[BaseModel] = AskQuestionsSchema
     workspace_path: str
 
     def _run(self, explanation: str, questions: List[Union[QuestionItem, dict]]) -> str:
-        # Chuẩn hóa kiểu dữ liệu của danh sách câu hỏi để đảm bảo khả năng đóng gói JSON/Checkpoint serialization
         serialized_questions = []
         for q in questions:
             if isinstance(q, BaseModel):
@@ -1070,14 +1069,10 @@ class AskQuestionsTool(BaseTool):
             "questions": serialized_questions
         }
         
-        # Kích hoạt ngắt đồ thị và lưu giữ trạng thái luồng (Checkpoint)
-        # Khi luồng được resume, kết quả gửi từ client sẽ được nạp trực tiếp vào biến user_answers
-        user_answers = interrupt(payload)
-        
-        # Trả về kết quả dưới dạng JSON string để LLM tiếp tục đọc hiểu và xử lý logic
+        # Không gọi interrupt() trực tiếp ở đây để tránh làm hỏng luồng chạy của tool_node
         return json.dumps({
-            "status": "success",
-            "user_answers": user_answers
+            "status": "requires_human_response",
+            "payload": payload
         }, ensure_ascii=False)
         
 class ProposePlanSchema(BaseModel):
@@ -1110,12 +1105,10 @@ class ProposePlanTool(BaseTool):
             "prompt": "Vui lòng xem xét kế hoạch triển khai trên. Gửi 'yes' để đồng ý thực hiện, hoặc nhập ý kiến để điều chỉnh."
         }
         
-        # Ngắt đồ thị LangGraph và lưu checkpoint chờ phản hồi từ người dùng
-        user_response = interrupt(payload)
-        
+        # Trả về tín hiệu yêu cầu tương tác thay vì gọi interrupt() trực tiếp
         return json.dumps({
-            "status": "resumed_after_approval",
-            "user_feedback": user_response
+            "status": "requires_human_response",
+            "payload": payload
         }, ensure_ascii=False)
 
 # =====================================================================

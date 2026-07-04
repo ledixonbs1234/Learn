@@ -340,48 +340,34 @@ def triage_node_stateful(state: AgentState) -> TaskTriage:
 def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
     """
     Nút phân loại và thiết lập môi trường hoạt động thông minh có kế thừa trạng thái.
-    Ngăn chặn việc hỏi lại đường dẫn phiền phức khi đang trong một mạch hội thoại liên tục.
+    Bổ sung cơ chế reset sạch các biến tạm thời qua từng lượt chạy (Turn-Flushing).
     """
     messages = state["messages"]
     user_msg = messages[-1]
     user_query_text = get_text_content_safely(user_msg.content)
     
-    # Lấy các thông số trạng thái hiện tại từ State
     existing_workspace = state.get("workspace_path", "")
     existing_extension = state.get("extension_path", "")
 
-    # ==========================================
-    # BƯỚC 1: TRÍCH XUẤT ĐƯỜNG DẪN TỪ CÂU LỆNH MỚI (NẾU CÓ)
-    # ==========================================
     detected_path_str = resolve_special_system_paths(user_query_text)
     if not detected_path_str:
         detected_path_str = extract_path_from_text(user_query_text)
 
-    # ==========================================
-    # BƯỚC 2: GỌI BỘ PHÂN LOẠI CÓ TRẠNG THÁI (STATEFUL TRIAGE)
-    # ==========================================
     try:
         triage_output = triage_node_stateful(state)
         task_type = triage_output.task_type
         is_simple = triage_output.is_simple
         detailed_analysis = triage_output.detailed_analysis
     except Exception as e:
-        # Dự phòng an toàn nếu LLM lỗi
         task_type = "clarify" if not existing_workspace else "analysis"
         is_simple = True
-        detailed_analysis = f"Lỗi hệ thống phân loại, tự động kích hoạt chế độ dự phòng. Lỗi: {str(e)}"
+        detailed_analysis = f"Lỗi hệ thống phân loại: {str(e)}"
 
-    # ==========================================
-    # BƯỚC 3: KÍCH HOẠT QUY TẮC THỪA KẾ VÀ DỊCH CHUYỂN TIÊU ĐIỂM (AUTOFOCUS PIVOT)
-    # ==========================================
     workspace_path = None
     pivoted_msg = ""
 
-    # Nếu người dùng KHÔNG nhập đường dẫn mới trong câu lệnh hiện tại
     if not detected_path_str:
         if existing_workspace:
-            # Quy tắc 1: Nếu câu hỏi liên quan đến Chrome Extension đã tìm thấy, tự động dịch chuyển tiêu điểm (Pivot)
-            # Chúng ta quét ngữ cảnh câu hỏi xem có chứa các từ khóa liên quan đến Extension/Project mới không
             extension_keywords = ["extension", "tiện ích", "project mới", "dự án mới", "chức năng", "popup", "manifest"]
             is_focusing_on_extension = any(kw in user_query_text.lower() for kw in extension_keywords)
             
@@ -389,14 +375,9 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
                 workspace_path = existing_extension
                 pivoted_msg = f"🎯 **[Tự động hội tụ tiêu điểm (Autofocus)]**: Nhận diện câu hỏi tập trung vào Chrome Extension, di chuyển Workspace vào: `{workspace_path}`\n"
             else:
-                # Quy tắc 2: Thừa kế lại đường dẫn Workspace cũ từ State
                 workspace_path = existing_workspace
                 pivoted_msg = f"🔄 **[Kế thừa Workspace]**: Sử dụng lại thư mục làm việc hiện hành: `{workspace_path}`\n"
-        else:
-            # Nếu hoàn toàn chưa có workspace nào trước đó
-            workspace_path = None
     else:
-        # Nếu người dùng chủ động nhập một đường dẫn mới, sử dụng đường dẫn mới đó
         try:
             resolved_path = Path(detected_path_str).expanduser().resolve()
             if resolved_path.exists():
@@ -406,16 +387,18 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
                     "plan": [],
                     "task_type": "analysis",
                     "is_simple": True,
-                    "messages": [AIMessage(content=f"❌ Thất bại: Đường dẫn thư mục `{detected_path_str}` không tồn tại trên hệ thống.")]
+                    "messages": [AIMessage(content=f"❌ Thất bại: Đường dẫn thư mục `{detected_path_str}` không tồn tại.")],
+                    "error_logs": "",
+                    "attempts": 0,
+                    "modified_files": [],
+                    "last_executed_task_ids": [],
+                    "replanning_count": 0,
+                    "step_findings": ["__RESET__"]
                 }
-        except Exception as e:
+        except Exception:
             workspace_path = None
 
-    # ==========================================
-    # BƯỚC 4: BẢO VỆ AN TOÀN VÀ HỎI LẠI NẾU THỰC SỰ TRỐNG TRƠN
-    # ==========================================
     if not workspace_path:
-        # Chỉ ngắt đồ thị khi hoàn toàn không thừa kế được gì và không có path nhập vào
         interrupt_payload = {
             "type": "path_clarification",
             "prompt": "Hệ thống phát hiện bạn muốn làm việc với ứng dụng nhưng chưa cấu hình thư mục làm việc cụ thể.",
@@ -441,7 +424,6 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         except Exception:
             workspace_path = "."
 
-    # Kiểm tra bảo mật ngăn cản tự sửa đổi mã nguồn Agent
     if not verify_workspace_safety(workspace_path):
         return {
             "plan": [],
@@ -450,9 +432,6 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
             "messages": [AIMessage(content="🚨 **[CẢNH BÁO BẢO MẬT]**: Workspace nằm trong thư mục Agent. Thao tác bị từ chối.")]
         }
 
-    # ==========================================
-    # BƯỚC 5: THIẾT LẬP KẾ HOẠCH CHO LƯỢT TIẾP THEO
-    # ==========================================
     plan = []
     if is_simple:
         plan = [
@@ -489,7 +468,15 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         "task_type": task_type,
         "is_simple": is_simple,
         "detailed_analysis": detailed_analysis,
-        "messages": [AIMessage(content=triage_info_msg)]
+        "messages": [AIMessage(content=triage_info_msg)],
+        
+        # 🌟 THỰC HIỆN RESET SẠCH TRẠNG THÁI TRÊN TURN MỚI
+        "error_logs": "",
+        "attempts": 0,
+        "modified_files": [],
+        "last_executed_task_ids": [],
+        "replanning_count": 0,
+        "step_findings": ["__RESET__"] # Kích hoạt bộ reducer dọn dẹp khảo sát cũ
     }
 
 
@@ -1297,6 +1284,9 @@ def replanner_interrupt_node(state: AgentState) -> Dict[str, Any]:
 
 
 def tool_node(state: AgentState) -> Dict[str, Any]:
+    """
+    Nút thực thi công cụ. Đã nâng cấp cơ chế nén Token trực tiếp cho tệp tin khi ghi nhận vào lịch sử tin nhắn.
+    """
     ws = state["workspace_path"]
     read_files = ReadFilesTool(workspace_path=ws)
     write_file = WriteFileTool(workspace_path=ws)
@@ -1331,7 +1321,6 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
     tool_messages = []
     modified_files = list(state.get("modified_files", []))
     file_registry = dict(state.get("file_registry", {}))
-    
     impacted_files = set()
     
     for tool_call in last_message.tool_calls:
@@ -1339,7 +1328,6 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         tool_args = tool_call["args"] or {}
         tool_id = tool_call["id"]
         
-        # Chỉ nạp vào Registry các file bị can thiệp bởi công cụ Ghi/Sửa hoặc Đọc toàn bộ
         if tool_name in ["write_file", "apply_search_replace_patch", "read_files"]:
             raw_path = tool_args.get("file_path") or tool_args.get("file_paths")
             if raw_path:
@@ -1362,13 +1350,23 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
                                 modified_files.append(str(safe_path))
                         except Exception:
                             pass
-            except (GraphInterrupt, GraphBubbleUp) as g:
-                raise g
             except Exception as e:
                 result = f"Lỗi thực thi công cụ '{tool_name}': {str(e)}"
                 
+        # 🌟 PHÒNG THỦ TOKEN TRỰC TIẾP: Nén nội dung file ngay tại đầu ra của Tool Message
+        if tool_name == "read_files" and "Lỗi" not in str(result):
+            found_files = []
+            raw_paths = tool_args.get("file_paths")
+            if isinstance(raw_paths, list):
+                found_files = raw_paths
+            elif isinstance(raw_paths, str):
+                found_files = [raw_paths]
                 
-        tool_messages.append(ToolMessage(content=str(result), name=tool_name, tool_call_id=tool_id))
+            file_info = f" của tệp {', '.join([f'`{f}`' for f in found_files])}" if found_files else ""
+            compacted_result = f"[Đã nạp thành công dữ liệu vật lý{file_info} vào File Registry. Hãy sử dụng cấu trúc mã nguồn cập nhật mới nhất trong System Prompt để làm việc]"
+            tool_messages.append(ToolMessage(content=compacted_result, name=tool_name, tool_call_id=tool_id))
+        else:
+            tool_messages.append(ToolMessage(content=str(result), name=tool_name, tool_call_id=tool_id))
         
     BINARY_EXTENSIONS = {".xlsx", ".xls", ".png", ".jpg", ".jpeg", ".zip", ".pdf", ".exe"}
     
@@ -1376,10 +1374,8 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         try:
             safe_path = sanitize_and_resolve_path(ws, file_path, create_parent=False)
             if safe_path.exists() and safe_path.is_file():
-                # Kiểm tra định dạng nhị phân [2]
                 if safe_path.suffix.lower() in BINARY_EXTENSIONS:
-                    continue  # Bỏ qua không nạp vào bộ nhớ text thô của file_registry [2]
-                    
+                    continue
                 current_content = safe_path.read_text(encoding="utf-8")
                 file_registry[file_path] = current_content
         except Exception:
@@ -1390,6 +1386,65 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         "modified_files": modified_files,
         "file_registry": file_registry
     }
+
+
+def human_interaction_gate_node(state: AgentState) -> Dict[str, Any]:
+    """
+    🌟 [NODE RÀO CHẮN MỚI] Node trung tâm duy nhất xử lý gọi hàm interrupt() cho các tool.
+    Hoàn toàn idempotent và không gây ra bất kỳ tác dụng phụ nào khi chạy lại.
+    """
+    messages = state["messages"]
+    
+    # Tìm kiếm ToolMessage cuối cùng chứa yêu cầu tương tác từ người dùng
+    target_tool_msg = None
+    for msg in reversed(messages):
+        if isinstance(msg, ToolMessage) and msg.name in ["ask_questions_if_underspecified", "propose_implementation_plan"]:
+            target_tool_msg = msg
+            break
+            
+    if not target_tool_msg:
+        return {}
+        
+    try:
+        data = json.loads(target_tool_msg.content)
+        if not isinstance(data, dict) or data.get("status") != "requires_human_response":
+            return {}
+        payload = data.get("payload", {})
+    except Exception:
+        return {}
+
+    # Thực hiện ngắt đồ thị một cách an toàn và lấy dữ liệu phản hồi từ client
+    user_input = interrupt(payload)
+    
+    # Tạo tin nhắn phản hồi giả lập của người dùng để LLM tiếp tục đọc hiểu
+    feedback_content = ""
+    if payload.get("type") == "ask_questions_if_underspecified":
+        feedback_content = f"### [Phản hồi của người dùng cho các câu hỏi]:\n{json.dumps(user_input, ensure_ascii=False)}"
+    else:  # propose_implementation_plan
+        feedback_content = f"### [Phê duyệt Kế hoạch hành động]:\n{user_input}"
+        
+    feedback_message = HumanMessage(
+        content=feedback_content,
+        name="human_interaction_feedback"
+    )
+    
+    state_updates = {
+        "messages": [feedback_message]
+    }
+    
+    # Nếu là phê duyệt kế hoạch, chúng ta cũng tự động nạp danh sách nhiệm vụ đã duyệt vào state["plan"]
+    if payload.get("type") == "propose_implementation_plan":
+        user_input_clean = str(user_input).strip().lower() if user_input else ""
+        if user_input_clean in ["", "yes", "approve", "ok"]:
+            proposed_tasks = payload.get("proposed_tasks", [])
+            refined_tasks = [Task(**t) for t in proposed_tasks]
+            state_updates["plan"] = refined_tasks
+            state_updates["messages"] = [
+                AIMessage(content="✅ Kế hoạch triển khai đã được phê duyệt và cấu hình vào hệ thống."),
+                feedback_message
+            ]
+
+    return state_updates
 
 
 def tester_node(state: AgentState) -> Dict[str, Any]:

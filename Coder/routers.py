@@ -1,4 +1,5 @@
 # oder/routers.py
+import json
 from typing import Literal
 from langchain_core.messages import AIMessage
 from state import AgentState, Task
@@ -87,5 +88,24 @@ def replanner_router(state: AgentState) -> Literal["executor", "synthesis"]:
         return "synthesis"
 
 
-def tool_router(state: AgentState) -> Literal["executor"]:
+def tool_router(state: AgentState) -> Literal["executor", "human_interaction_gate"]:
+    """
+    Định tuyến sau khi chạy công cụ.
+    Nếu phát hiện tín hiệu hoãn ngắt 'requires_human_response', chuyển hướng sang Node Gate.
+    """
+    messages = state["messages"]
+    
+    # Quét các tin nhắn ToolMessage của bước vừa thực thi
+    for msg in reversed(messages):
+        # Chỉ kiểm tra các tin nhắn tool trong lượt chạy vừa rồi
+        if getattr(msg, "type", None) != "tool":
+            break
+        if msg.name in ["ask_questions_if_underspecified", "propose_implementation_plan"]:
+            try:
+                data = json.loads(msg.content)
+                if isinstance(data, dict) and data.get("status") == "requires_human_response":
+                    return "human_interaction_gate"
+            except Exception:
+                pass
+                
     return "executor"

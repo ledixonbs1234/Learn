@@ -253,11 +253,14 @@ def resolve_special_system_paths(text: str) -> Optional[str]:
     return None
 
 
-def verify_workspace_safety(workspace_path: str) -> bool:
+def verify_workspace_safety(workspace_path: str, allow_explicit: bool = False) -> bool:
     """
     Hệ thống phòng thủ an toàn (Security Guardrail):
-    Ngăn chặn tuyệt đối việc Agent trỏ Workspace vào thư mục nguồn của chính nó.
+    Ngăn chặn việc Agent trỏ Workspace vào thư mục nguồn của chính nó,
+    trừ khi người dùng chủ động yêu cầu phân tích mã nguồn của chính Agent.
     """
+    if allow_explicit:
+        return True
     try:
         resolved_workspace = Path(workspace_path).expanduser().resolve()
         current_agent_dir = Path(__file__).parent.parent.resolve() # Thư mục Coder/
@@ -341,7 +344,7 @@ def triage_node_stateful(state: AgentState) -> TaskTriage:
 def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
     """
     Nút phân loại và thiết lập môi trường hoạt động thông minh có kế thừa trạng thái.
-    Đã khắc phục lỗi tranh chấp độ ưu tiên phân giải đường dẫn và mất đồng bộ trạng thái trước khi Triage.
+    Đã hỗ trợ mở khóa an toàn khi người dùng chủ động chỉ định thư mục nguồn của Agent.
     """
     messages = state["messages"]
     user_msg = messages[-1]
@@ -353,11 +356,9 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
     # =====================================================================
     # BƯỚC 1: TRÍCH XUẤT ĐƯỜNG DẪN CÓ ĐỘ ƯU TIÊN VÀ HẠN CHẾ SAI SỐT (PRECEDENCE)
     # =====================================================================
-    # Ưu tiên 1: Trích xuất đường dẫn cụ thể, tuyệt đối/tương đối hoặc đặt trong nháy từ text [2]
     detected_path_str = extract_path_from_text(user_query_text)
     
-    # Ưu tiên 2: Chỉ phân giải các thư mục đặc biệt hệ thống (Desktop, Downloads...)
-    # khi người dùng thực sự có ý định làm việc với thư mục đó HOẶC chưa cấu hình workspace nào.
+    # Chỉ phân giải các thư mục đặc biệt hệ thống khi người dùng thực sự có ý định
     if not detected_path_str:
         path_keywords = ["thư mục", "folder", "dự án", "project", "mở", "quét", "ls", "dir", "làm việc tại", "tại", "cd"]
         has_path_intent = any(kw in user_query_text.lower() for kw in path_keywords)
@@ -375,10 +376,8 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         try:
             resolved_path = Path(detected_path_str).expanduser().resolve()
             if resolved_path.exists():
-                # Tìm gốc dự án heuristic từ đường dẫn mới phát hiện [2]
                 provisional_workspace = str(find_project_root_heuristic(resolved_path))
                 
-                # Đánh giá xem đây là cuộc chuyển đổi thực sự hay là kế thừa
                 if provisional_workspace != existing_workspace and existing_workspace:
                     pivoted_msg = f"🔄 **[Chuyển đổi Workspace]**: Phát hiện yêu cầu chuyển đổi thư mục làm việc sang: `{provisional_workspace}`\n"
                 elif provisional_workspace == existing_workspace and existing_workspace:
@@ -392,12 +391,9 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
     # =====================================================================
     # BƯỚC 3: ĐỒNG BỘ TRẠNG THÁI TRƯỚC KHI GỌI TRIAGE LLM (STATE SYNCHRONIZATION)
     # =====================================================================
-    # Tạo một bản sao trạng thái tạm thời, cập nhật đường dẫn dự kiến để LLM Triage
-    # nhận diện chính xác cấu trúc và phân loại tác vụ thích hợp.
     temp_state = state.copy()
     temp_state["workspace_path"] = provisional_workspace
     
-    # Nếu phát hiện workspace mới, cập nhật tạm thời extension_path tương ứng để làm phong phú ngữ cảnh triage
     if provisional_workspace and provisional_workspace != existing_workspace:
         temp_ext = find_extension_dir_heuristic(Path(provisional_workspace))
         temp_state["extension_path"] = temp_ext or ""
@@ -417,7 +413,6 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
     # =====================================================================
     final_workspace = provisional_workspace
 
-    # Nếu LLM phân loại yêu cầu làm rõ đường dẫn hoặc chưa có workspace hợp lệ
     if task_type == "clarify" or not final_workspace:
         interrupt_payload = {
             "type": "path_clarification",
@@ -444,8 +439,12 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         except Exception:
             final_workspace = "."
 
+    # 🌟 Đánh giá xem người dùng có cung cấp đường dẫn rõ ràng trong câu lệnh hay không
+    is_user_explicit = (detected_path_str is not None)
+
     # Kiểm tra an toàn bảo mật tránh việc Agent ghi đè vào mã nguồn của chính nó
-    if not verify_workspace_safety(final_workspace):
+    # Cho phép bypass mở khóa nếu is_user_explicit là True
+    if not verify_workspace_safety(final_workspace, allow_explicit=is_user_explicit):
         return {
             "plan": [],
             "task_type": "analysis",
@@ -475,6 +474,16 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         ]
         task_type = "analysis"
 
+    # 🌟 Tạo cảnh báo an toàn động nếu phát hiện đang phân tích chính thư mục nguồn của Agent
+    safety_warning_msg = ""
+    if not verify_workspace_safety(final_workspace, allow_explicit=False) and is_user_explicit:
+        safety_warning_msg = (
+            "\n\n🚨 **[CẢNH BÁO AN TOÀN CHỦ ĐỘNG]**:\n"
+            "Hệ thống phát hiện bạn đang yêu cầu phân tích trực tiếp trên thư mục nguồn của Agent.\n"
+            "Chế độ vận hành đã được mở khóa theo yêu cầu của bạn. Vui lòng cẩn trọng khi phê duyệt "
+            "hoặc thực thi các tác vụ chỉnh sửa/ghi đè file (nếu có) để tránh làm gián đoạn hệ thống."
+        )
+
     triage_info_msg = (
         f"📊 **[Hệ thống Phân phối thông minh]**:\n"
         f"{pivoted_msg}"
@@ -482,6 +491,7 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         f"- **Chế độ kiểm soát:** {'Đơn giản (Fast-Track)' if is_simple else 'Phức tạp (Multi-Step Discovery)'}\n"
         f"- **Pha hoạt động khởi động:** `{task_type.upper()}`\n\n"
         f"🎯 **[Phân tích mục tiêu kỹ thuật]**:\n{detailed_analysis}"
+        f"{safety_warning_msg}"
     )
 
     return {
@@ -491,8 +501,6 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         "is_simple": is_simple,
         "detailed_analysis": detailed_analysis,
         "messages": [AIMessage(content=triage_info_msg)],
-        
-        # Đảm bảo dọn dẹp sạch trạng thái rác giữa các lượt chạy (Turn-Flushing)
         "error_logs": "",
         "attempts": 0,
         "modified_files": [],
@@ -500,7 +508,6 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         "replanning_count": 0,
         "step_findings": ["__RESET__"]
     }
-
 
 def get_eligible_tasks(plan: List[Any]) -> List[Any]:
     completed_ids = set()

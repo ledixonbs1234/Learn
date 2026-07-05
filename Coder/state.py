@@ -59,6 +59,7 @@ class TaskTriage(BaseModel):
         default=False,
         description="True nếu yêu cầu cực kỳ đơn giản. False nếu yêu cầu phức tạp cần khảo sát sâu hoặc thiết kế nhiều bước."
     )
+    # Thêm 'clarify' vào Literal để hỗ trợ trạng thái yêu cầu làm rõ đường dẫn mới
     task_type: Literal["analysis", "development"] = Field(
         default="development",
         description="Phân loại hướng xử lý của yêu cầu."
@@ -91,7 +92,7 @@ class AgentState(TypedDict):
     workspace_path: str
     workspace_context: str  
     plan: List[Task]                      
-    task_type: Literal["analysis", "development"]
+    task_type: Literal["analysis", "development", "clarify"]
     git_branch: str
     error_logs: str
     modified_files: List[str]

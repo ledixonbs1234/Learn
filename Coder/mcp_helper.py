@@ -1,4 +1,7 @@
 # mcp_helper.py
+import os
+import sys
+import platform
 import asyncio
 from typing import List
 from mcp import ClientSession, StdioServerParameters
@@ -6,11 +9,28 @@ from mcp.client.stdio import stdio_client
 from langchain_mcp_adapters.tools import load_mcp_tools
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage, AIMessage
 
+def get_default_browser_profile_dir() -> str:
+    """Tự động phát hiện đường dẫn User Data an toàn dựa trên Hệ điều hành."""
+    system = platform.system()
+    home = os.path.expanduser("~")
+    
+    if system == "Windows":
+        # Ưu tiên Edge hoặc Chrome mặc định
+        edge_path = os.path.join(home, "AppData", "Local", "Microsoft", "Edge", "User Data")
+        if os.path.exists(edge_path):
+            return edge_path
+        return os.path.join(home, "AppData", "Local", "Google", "Chrome", "User Data")
+    elif system == "Darwin":  # macOS
+        return os.path.join(home, "Library", "Application Support", "Google", "Chrome")
+    else:  # Linux
+        return os.path.join(home, ".config", "google-chrome")
+
 async def run_agent_with_devtools_mcp(model, prompt_message: str, chat_history: List[BaseMessage] = None):
-    """
-    Khởi chạy phiên làm việc đồng thời của LLM và Chrome DevTools MCP.
-    Đảm bảo kết nối Stdio được giữ hoạt động trong suốt quá trình xử lý tác vụ.
-    """
+    profile_dir = get_default_browser_profile_dir()
+    
+    # Đảm bảo khởi tạo thư mục profile nếu chưa tồn tại vật lý
+    os.makedirs(profile_dir, exist_ok=True)
+
     server_params = StdioServerParameters(
         command="npx",
         args=[
@@ -18,7 +38,7 @@ async def run_agent_with_devtools_mcp(model, prompt_message: str, chat_history: 
             "chrome-devtools-mcp@latest", 
             "--autoConnect", 
             "--no-usage-statistics",
-            r"--user-data-dir=C:\Users\Xon\AppData\Local\Microsoft\Edge\User Data"
+            f"--user-data-dir={profile_dir}" # Sử dụng đường dẫn động an toàn [2]
         ]
     )
     
@@ -34,22 +54,15 @@ async def run_agent_with_devtools_mcp(model, prompt_message: str, chat_history: 
     )
     
     messages = [SystemMessage(content=system_prompt)] + chat_history
+    messages.append(HumanMessage(content=prompt_message))
     
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            
-            # Tải động các công cụ của Chrome DevTools MCP
             mcp_tools = await load_mcp_tools(session)
             tools_map = {tool.name: tool for tool in mcp_tools}
-            
-            # Liên kết công cụ với mô hình (Hỗ trợ function calling của bạn)
             model_with_tools = model.bind_tools(mcp_tools)
             
-            # Đưa yêu cầu của lượt hiện tại vào ngữ cảnh lịch sử
-            messages.append(HumanMessage(content=prompt_message))
-            
-            # Chạy vòng lặp phản hồi Agent để xử lý đa bước trên trình duyệt đang mở
             for _ in range(8):
                 response = await model_with_tools.ainvoke(messages)
                 messages.append(response)

@@ -88,18 +88,18 @@ SOM_SCRIPT = """
 
 
 class BrowserSessionManager:
-    """
-    Quản lý khởi tạo trình duyệt CloakBrowser độc lập cho từng luồng.
-    Không lưu đệm tĩnh để tránh xung đột Event Loop giữa các luồng làm việc của LangGraph.
-    """
     @classmethod
     def create_page(cls, workspace_path: str, extension_path: Optional[str] = None) -> tuple:
-        """
-        Khởi tạo một context và page mới sạch sẽ trong luồng hiện tại.
-        Mọi cookies và cookies/localstorage của extension đều được bảo toàn thông qua profile_dir vật lý.
-        """
         ws_resolved = str(Path(workspace_path).resolve())
-        ext_resolved = str(Path(extension_path).resolve()) if extension_path else None
+        
+        # 🌟 VÁ LỖI: Phân giải đường dẫn extension_path dựa trên thư mục workspace tương đối
+        ext_resolved = None
+        if extension_path:
+            ext_path_obj = Path(extension_path)
+            if ext_path_obj.is_absolute():
+                ext_resolved = str(ext_path_obj.resolve())
+            else:
+                ext_resolved = str((Path(workspace_path) / ext_path_obj).resolve())
         
         profile_id = uuid.uuid5(uuid.NAMESPACE_URL, ws_resolved).hex
         profile_dir = Path.home() / ".cloak_profiles" / profile_id

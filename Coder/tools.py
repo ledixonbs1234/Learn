@@ -180,7 +180,87 @@ class SymbolNode:
         self.description = description
         self.children: List['SymbolNode'] = []
 
+class SearchKeywordSchema(BaseModel):
+    keyword: str = Field(description="Từ khóa hoặc chuỗi ký tự thô cần tìm kiếm trong mã nguồn (ví dụ: 'noiCap', 'localStorage').")
+    sub_dir: str = Field(default=".", description="Thư mục tương đối cần thực hiện quét đệ quy (mặc định là thư mục gốc '.').")
+    file_pattern: Optional[str] = Field(default=None, description="Mẫu định dạng file tùy chọn để lọc kết quả (ví dụ: '*.tsx', '*.py').")
 
+class SearchKeywordTool(BaseTool):
+    name: str = "search_keyword"
+    description: str = (
+        "Tìm kiếm đệ quy từ khóa hoặc chuỗi ký tự thô bên trong nội dung các tệp tin dự án (Grep-style).\n"
+        "Trả về danh sách tệp tin, số dòng và nội dung dòng khớp.\n"
+        "⚠️ QUY TẮC TIẾT KIỆM TOKEN:\n"
+        "Hãy luôn sử dụng công cụ này trước để định vị vị trí mã nguồn cần đọc, sau đó dùng `read_file_lines` "
+        "để chỉ đọc đúng phân đoạn dòng chứa logic đó. Tuyệt đối không đọc cả file lớn một cách lãng phí."
+    )
+    args_schema: Type[BaseModel] = SearchKeywordSchema
+    workspace_path: str
+
+    def _run(self, keyword: str, sub_dir: str = ".", file_pattern: Optional[str] = None) -> str:
+        try:
+            import fnmatch
+            safe_dir = sanitize_and_resolve_path(self.workspace_path, sub_dir, create_parent=False)
+            if not safe_dir.exists():
+                return f"Lỗi: Thư mục '{sub_dir}' không tồn tại."
+            
+            # Sử dụng lại cơ chế lọc .gitignore của hệ thống để tránh quét rác
+            matcher = GitIgnoreMatcher(Path(self.workspace_path).expanduser().resolve())
+            results = []
+            max_results_limit = 100
+            match_count = 0
+            
+            # Quét đệ quy qua các file và thư mục
+            for root, dirs, files in os.walk(str(safe_dir)):
+                # Loại bỏ các thư mục bị gitignore ngay từ bước duyệt để tối ưu hóa hiệu năng
+                dirs[:] = [d for d in dirs if not matcher.is_ignored(Path(root) / d)]
+                
+                for file_name in files:
+                    file_path = Path(root) / file_name
+                    if matcher.is_ignored(file_path):
+                        continue
+                    
+                    # Lọc theo định dạng file nếu có yêu cầu
+                    if file_pattern and not fnmatch.fnmatch(file_name, file_pattern):
+                        continue
+                    
+                    try:
+                        # Bỏ qua các file nhị phân lớn để tránh lỗi đọc file
+                        suffix = file_path.suffix.lower()
+                        BINARY_EXTENSIONS = {".xlsx", ".xls", ".png", ".jpg", ".jpeg", ".zip", ".pdf", ".exe"}
+                        if suffix in BINARY_EXTENSIONS:
+                            continue
+                            
+                        content = file_path.read_text(encoding="utf-8", errors="replace")
+                        if keyword in content:
+                            lines = content.splitlines()
+                            file_matches = []
+                            for idx, line in enumerate(lines, start=1):
+                                if keyword in line:
+                                    file_matches.append(f"  Line {idx:04d} | {line.strip()}")
+                                    match_count += 1
+                                    
+                            if file_matches:
+                                rel_path = file_path.relative_to(Path(self.workspace_path).expanduser().resolve()).as_posix()
+                                results.append(f"📄 `{rel_path}`:\n" + "\n".join(file_matches))
+                                
+                            if match_count >= max_results_limit:
+                                break
+                    except Exception:
+                        pass
+                
+                if match_count >= max_results_limit:
+                    results.append("\n⚠️ *[Thông báo]: Đạt giới hạn tối đa 100 kết quả hiển thị. Vui lòng thu hẹp từ khóa tìm kiếm.*")
+                    break
+            
+            if not results:
+                return f"Không tìm thấy tệp tin nào chứa từ khóa '{keyword}' trong thư mục '{sub_dir}'."
+                
+            header = f"=== KẾT QUẢ TÌM KIẾM TỪ KHÓA '{keyword}' ===\n\n"
+            return header + "\n\n".join(results)
+            
+        except Exception as e:
+            return f"Lỗi trong quá trình tìm kiếm từ khóa: {str(e)}"
 class UniversalSymbolSearchTool(BaseTool):
     name: str = "search_symbols_universal"
     description: str = (
@@ -905,7 +985,9 @@ class WorkspaceTools:
             if not safe_path.exists():
                 return f"Lỗi: Không tìm thấy tệp tin '{file_path}' cần áp dụng bản vá."
                 
-            pattern = r"<+{5,}\s*[sS][eE][aA][rR][cC][hH]\s*[\r\n]+(.*?)(?:[\r\n]+)=+{5,}\s*[\r\n]+(.*?)(?:[\r\n]+)>+{5,}\s*[rR][eE][pP][lL][aA][cC][eE]"
+            # 🌟 GIẢI PHÁP: Loại bỏ hoàn toàn các ký tự lặp dư thừa '+' trước '{5,}'
+            pattern = r"<{5,}\s*[sS][eE][aA][rR][cC][hH]\s*[\r\n]+(.*?)(?:[\r\n]+)={5,}\s*[\r\n]+(.*?)(?:[\r\n]+)>{5,}\s*[rR][eE][pP][lL][aA][cC][eE]"
+            
             match = re.search(pattern, patch_block, re.DOTALL)
             
             if not match:
@@ -1075,41 +1157,7 @@ class AskQuestionsTool(BaseTool):
             "payload": payload
         }, ensure_ascii=False)
         
-class ProposePlanSchema(BaseModel):
-    explanation: str = Field(description="Phân tích kỹ thuật chi tiết bằng tiếng Việt về nguyên nhân lỗi và giải pháp đề xuất.")
-    tasks: List[Task] = Field(description="Danh sách các bước cụ thể cần thực hiện.")
 
-class ProposePlanTool(BaseTool):
-    name: str = "propose_implementation_plan"
-    description: str = (
-        "BẮT BUỘC gọi công cụ này đối với các tác vụ phức tạp (multi-file, thay đổi kiến trúc) "
-        "để đề xuất Kế hoạch triển khai chi tiết và tạm dừng chờ người dùng phê duyệt trước khi viết code."
-    )
-    args_schema: Type[BaseModel] = ProposePlanSchema
-    workspace_path: str
-
-    def _run(self, explanation: str, tasks: List[Union[Task, dict]]) -> str:
-        serialized_tasks = []
-        for t in tasks:
-            if isinstance(t, BaseModel):
-                serialized_tasks.append(t.model_dump())
-            elif isinstance(t, dict):
-                serialized_tasks.append(t)
-            else:
-                serialized_tasks.append(str(t))
-
-        payload = {
-            "type": "propose_implementation_plan",
-            "explanation": explanation,
-            "proposed_tasks": serialized_tasks,
-            "prompt": "Vui lòng xem xét kế hoạch triển khai trên. Gửi 'yes' để đồng ý thực hiện, hoặc nhập ý kiến để điều chỉnh."
-        }
-        
-        # Trả về tín hiệu yêu cầu tương tác thay vì gọi interrupt() trực tiếp
-        return json.dumps({
-            "status": "requires_human_response",
-            "payload": payload
-        }, ensure_ascii=False)
 
 # =====================================================================
 # CÔNG CỤ GỠ LỖI CHROME DEVTOOLS ĐỘNG (CDP MCP TOOL)

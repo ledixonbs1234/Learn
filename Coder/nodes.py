@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+import tempfile
 from typing import Dict, Any, Optional,  Tuple, List, Union
 from concurrent.futures import ThreadPoolExecutor
 from venv import logger
@@ -18,7 +19,7 @@ from mcp_helper import run_agent_with_devtools_mcp
 from skills_engine import AgentSkillsEngine
 from state import AgentState, PlanUpdate, RuntimeVerificationResult, TaskPlan, TaskTriage, Task
 from tools import (
-    ActivateSkillTool, AskQuestionsTool, GitManager, ProposePlanTool, ReadFileLinesTool, RunSkillScriptTool, UniversalSymbolSearchTool, WebInteractAndTestTool, WorkspaceTools, 
+    ActivateSkillTool, AskQuestionsTool, GitManager, ProposePlanTool, ReadFileLinesTool, RunSkillScriptTool, SearchKeywordTool, UniversalSymbolSearchTool, WebInteractAndTestTool, WorkspaceTools, 
     ReadFilesTool, WriteAndRunScriptTool, WriteFileTool, ApplyPatchTool, 
     ListDirectoryTool, RunTerminalTool, get_markdown_language
 )
@@ -278,58 +279,53 @@ def verify_workspace_safety(workspace_path: str, allow_explicit: bool = False) -
     except Exception:
         return False
 
-def triage_node_stateful(state: AgentState) -> TaskTriage:
+def triage_node_stateful(state: AgentState, catalog_summary: str) -> TaskTriage:
     """
-    LLM Triage thông minh có trạng thái.
-    Nhận diện ngữ cảnh hội thoại và các tham số cũ để đưa ra phân loại chính xác, chống sót thông tin.
+    LLM Triage thông minh có trạng thái và có tri thức về thư viện Kỹ năng.
     """
     messages = state.get("messages", [])
     
-    # 1. Thu thập thông tin từ phiên hoạt động cũ (Active Session Context)
     current_workspace = state.get("workspace_path", "")
-    current_extension = state.get("extension_path", "")
     
     active_session_context = (
         "=== NGỮ CẢNH PHIÊN HOẠT ĐỘNG HIỆN TẠI (ACTIVE SESSION) ===\n"
         f"- Thư mục làm việc hiện hành (Workspace): `{current_workspace or 'Chưa thiết lập'}`\n"
-        f"- Thư mục Chrome Extension đã nhận diện: `{current_extension or 'Chưa phát hiện'}`\n"
     )
 
-    # 2. Lấy 4 tin nhắn gần nhất để làm cửa sổ ngữ cảnh hội thoại (Conversational Context Window)
     context_messages = []
     if len(messages) > 1:
-        # Lấy tối đa 4 tin nhắn trước tin nhắn cuối cùng để tham chiếu
         recent_history = messages[-5:-1]
         context_messages.append(SystemMessage(content="--- LỊCH SỬ HỘI THOẠI GẦN NHẤT ĐỂ THAM CHIẾU NGỮ CẢNH ---"))
         context_messages.extend(recent_history)
 
-    # 3. Trích xuất và làm sạch yêu cầu hiện tại của người dùng
     user_msg = messages[-1]
-    user_query_text = get_text_content_safely(user_msg.content) # ĐÃ SỬ DỤNG CHÍNH XÁC DƯỚI ĐÂY
+    user_query_text = get_text_content_safely(user_msg.content)
 
     system_prompt = (
         "Bạn là một điều phối viên Agent thông minh cấp cao (Triage Supervisor).\n"
         "Nhiệm vụ của bạn là phân tích yêu cầu mới của người dùng để phân loại chính xác hướng xử lý.\n\n"
         "Bạn đã được cung cấp Lịch sử hội thoại gần nhất và Thông tin phiên hoạt động hiện tại.\n"
-        "Hãy tận dụng thông tin này để giải quyết các đại từ mơ hồ như 'project này', 'nó', 'project mới tìm được'...\n\n"
+        "Hãy tận dụng thông tin này để giải quyết các đại từ mơ hồ.\n\n"
         "⚠️ QUY TẮC ĐÁNH GIÁ SỰ TRÔI LỆCH PHIÊN VÀ PHÂN LOẠI (BẮT BUỘC):\n"
-        "1. KIỂM TRA SỰ TIẾP NỐI (Follow-up Check):\n"
+        "1. KIỂM TRA SỰ TIẾP NỐI (Follow-up Check)...\n"
         "   - Nếu yêu cầu mới là một câu hỏi hỏi thêm, yêu cầu giải thích, hoặc yêu cầu chỉnh sửa dựa trên dự án "
         "     đang mở trong phiên hoạt động hiện tại -> Đây là một câu hỏi TIẾP NỐI (Follow-up).\n"
         "   - Đối với câu hỏi tiếp nối, bạn KHÔNG ĐƯỢC chọn task_type = 'clarify' (yêu cầu hỏi lại path). Hãy thiết lập "
         "     task_type dựa trên bản chất yêu cầu ('analysis' nếu chỉ hỏi đáp giải thích, 'development' nếu yêu cầu sửa code).\n"
-        "2. KIỂM TRA SỰ DỊCH CHUYỂN TIÊU ĐIỂM (Focus Shift):\n"
-        "   - Nếu yêu cầu mới muốn tập trung làm việc trực tiếp bên trong Chrome Extension đã phát hiện (`extension_path`),\n"
-        "     hãy nêu rõ điều này trong bản phân tích `detailed_analysis` của bạn để hệ thống tự động Autofocus.\n"
-        "3. KIỂM TRA YÊU CẦU ĐỘC LẬP MỚI (Context Shift):\n"
+        "2. KIỂM TRA YÊU CẦU ĐỘC LẬP MỚI (Context Shift):\n"
         "   - Nếu người dùng đột ngột yêu cầu làm một việc hoàn toàn mới không liên quan đến thư mục hiện hành "
         "     (ví dụ: đang quét desktop lại yêu cầu 'sửa lỗi app ở thư mục D:/project-abc'), hoặc yêu cầu tạo mới app "
         "     nhưng không nói ở đâu -> Đặt task_type = 'clarify' để hệ thống hỏi lại đường dẫn mới."
+        "⚠️ ÁNH XẠ KỸ NĂNG CHỦ ĐỘNG (BẮT BUỘC):\n"
+        "Dưới đây là danh sách các Kỹ năng kỹ thuật (Skills) khả dụng có sẵn trong hệ thống.\n"
+        "Nhiệm vụ cực kỳ quan trọng của bạn là đối chiếu yêu cầu hiện tại của người dùng với mô tả và điều kiện kích hoạt (triggers) của từng Kỹ năng dưới đây.\n"
+        "Nếu yêu cầu của người dùng khớp với mục đích của kỹ năng nào, bạn BẮT BUỘC phải điền chính xác tên kỹ năng đó (ví dụ: 'test-driven-development') vào trường 'recommended_skills'.\n"
+        f"{catalog_summary}"
+
     )
 
     structured_llm = model.with_structured_output(TaskTriage, method="function_calling")
     
-    # Sử dụng chuỗi text đã được làm sạch an toàn trong một HumanMessage chuẩn hóa
     triage_output = structured_llm.invoke([
         SystemMessage(content=system_prompt),
         SystemMessage(content=active_session_context),
@@ -344,21 +340,19 @@ def triage_node_stateful(state: AgentState) -> TaskTriage:
 def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
     """
     Nút phân loại và thiết lập môi trường hoạt động thông minh có kế thừa trạng thái.
-    Đã hỗ trợ mở khóa an toàn khi người dùng chủ động chỉ định thư mục nguồn của Agent.
+    Đã tích hợp tri thức thư viện kỹ năng chủ động để cấu hình Agent tối ưu ngay từ START.
     """
     messages = state["messages"]
     user_msg = messages[-1]
     user_query_text = get_text_content_safely(user_msg.content)
     
-    existing_workspace = state.get("workspace_path", "")
-    existing_extension = state.get("extension_path", "")
+    existing_workspace = state.get("workspace_path", ".")
 
     # =====================================================================
     # BƯỚC 1: TRÍCH XUẤT ĐƯỜNG DẪN CÓ ĐỘ ƯU TIÊN VÀ HẠN CHẾ SAI SỐT (PRECEDENCE)
     # =====================================================================
     detected_path_str = extract_path_from_text(user_query_text)
     
-    # Chỉ phân giải các thư mục đặc biệt hệ thống khi người dùng thực sự có ý định
     if not detected_path_str:
         path_keywords = ["thư mục", "folder", "dự án", "project", "mở", "quét", "ls", "dir", "làm việc tại", "tại", "cd"]
         has_path_intent = any(kw in user_query_text.lower() for kw in path_keywords)
@@ -389,24 +383,39 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
             pivoted_msg = f"🔄 **[Kế thừa Workspace]**: Sử dụng lại thư mục làm việc hiện hành: `{existing_workspace}`\n"
 
     # =====================================================================
-    # BƯỚC 3: ĐỒNG BỘ TRẠNG THÁI TRƯỚC KHI GỌI TRIAGE LLM (STATE SYNCHRONIZATION)
+    # BƯỚC 3: ĐỒNG BỘ TRẠNG THÁI & QUÉT THƯ VIỆN KỸ NĂNG VẬT LÝ
     # =====================================================================
     temp_state = state.copy()
     temp_state["workspace_path"] = provisional_workspace
     
+    # Khởi tạo Skills Engine dựa trên Workspace để quét danh mục kỹ năng hiện có
+    skills_engine = AgentSkillsEngine(provisional_workspace)
+    catalog = skills_engine.scan_catalog()
+    
+    catalog_summary = ""
+    if catalog:
+        catalog_summary = "\n=== 📚 DANH MỤC KỸ NĂNG HỆ THỐNG HIỆN CÓ ===\n"
+        for item in catalog:
+            catalog_summary += f"- Kỹ năng: `{item['name']}`\n  Điều kiện kích hoạt: {item['description']}\n"
+    else:
+        catalog_summary = "\n(Hệ thống hiện tại chưa nạp kỹ năng nào trong thư mục .skills/)\n"
+
     if provisional_workspace and provisional_workspace != existing_workspace:
         temp_ext = find_extension_dir_heuristic(Path(provisional_workspace))
         temp_state["extension_path"] = temp_ext or ""
 
+    # Gọi Triage Supervisor và truyền thêm tri thức về kỹ năng
     try:
-        triage_output = triage_node_stateful(temp_state)
+        triage_output = triage_node_stateful(temp_state, catalog_summary)
         task_type = triage_output.task_type
         is_simple = triage_output.is_simple
         detailed_analysis = triage_output.detailed_analysis
+        recommended_skills = triage_output.recommended_skills or []
     except Exception as e:
         task_type = "clarify" if not provisional_workspace else "analysis"
         is_simple = True
         detailed_analysis = f"Lỗi hệ thống phân loại: {str(e)}"
+        recommended_skills = []
 
     # =====================================================================
     # BƯỚC 4: RÀO CHẮN AN TOÀN & THIẾT LẬP WORKSPACE CHÍNH THỨC
@@ -439,11 +448,8 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         except Exception:
             final_workspace = "."
 
-    # 🌟 Đánh giá xem người dùng có cung cấp đường dẫn rõ ràng trong câu lệnh hay không
     is_user_explicit = (detected_path_str is not None)
 
-    # Kiểm tra an toàn bảo mật tránh việc Agent ghi đè vào mã nguồn của chính nó
-    # Cho phép bypass mở khóa nếu is_user_explicit là True
     if not verify_workspace_safety(final_workspace, allow_explicit=is_user_explicit):
         return {
             "plan": [],
@@ -451,6 +457,23 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
             "is_simple": True,
             "messages": [AIMessage(content="🚨 **[CẢNH BÁO BẢO MẬT]**: Workspace nằm trong thư mục Agent. Thao tác bị từ chối.")]
         }
+
+    # =====================================================================
+    # BƯỚC 5: TỰ ĐỘNG KHỞI TẠO VÀ BOOTSTRAP KỸ NĂNG VÀO HOẠT ĐỘNG
+    # =====================================================================
+    active_skills = state.get("active_skills", {}) or {}
+    skills_log_msg = ""
+    
+    if recommended_skills:
+        loaded_skills_list = []
+        for skill_name in recommended_skills:
+            # Đọc trực tiếp file Markdown của kỹ năng được khuyên dùng
+            body = skills_engine.load_skill_body(skill_name)
+            if body:
+                active_skills[skill_name] = body
+                loaded_skills_list.append(f"`{skill_name}`")
+        if loaded_skills_list:
+            skills_log_msg = f"- ⚡ **Kích hoạt chủ động kỹ năng:** {', '.join(loaded_skills_list)} (Nạp thẳng luật vào System Prompt)\n"
 
     # Thiết lập kế hoạch ban đầu dựa trên kết quả phân loại
     plan = []
@@ -464,24 +487,29 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
             )
         ]
     else:
+        # Nếu có kỹ năng đặc thù được kích hoạt, ghi rõ vào Plan để đảm bảo quy trình kỷ luật
+        plan_desc = "Khảo sát cấu trúc file và mã nguồn liên quan đến yêu cầu."
+        if "test-driven-development" in recommended_skills:
+            plan_desc = "Khảo sát mã nguồn, chuẩn bị viết unit test RED trước khi sửa đổi logic chính."
+        elif "spec-driven-development" in recommended_skills:
+            plan_desc = "Khảo sát và phác thảo tài liệu cấu hình SPEC.md trước khi viết code."
+            
         plan = [
             Task(
                 id="T_SURVEY",
-                description=f"Khảo sát cấu trúc file và mã nguồn tại `{final_workspace}` liên quan đến yêu cầu: {user_query_text}",
+                description=f"{plan_desc} (Thư mục: `{final_workspace}`)",
                 dependencies=[],
                 status="pending"
             )
         ]
         task_type = "analysis"
 
-    # 🌟 Tạo cảnh báo an toàn động nếu phát hiện đang phân tích chính thư mục nguồn của Agent
     safety_warning_msg = ""
     if not verify_workspace_safety(final_workspace, allow_explicit=False) and is_user_explicit:
         safety_warning_msg = (
             "\n\n🚨 **[CẢNH BÁO AN TOÀN CHỦ ĐỘNG]**:\n"
             "Hệ thống phát hiện bạn đang yêu cầu phân tích trực tiếp trên thư mục nguồn của Agent.\n"
-            "Chế độ vận hành đã được mở khóa theo yêu cầu của bạn. Vui lòng cẩn trọng khi phê duyệt "
-            "hoặc thực thi các tác vụ chỉnh sửa/ghi đè file (nếu có) để tránh làm gián đoạn hệ thống."
+            "Chế độ vận hành đã được mở khóa theo yêu cầu của bạn. Vui lòng cẩn trọng khi phê duyệt..."
         )
 
     triage_info_msg = (
@@ -489,7 +517,8 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         f"{pivoted_msg}"
         f"- **Workspace hoạt động:** `{final_workspace}`\n"
         f"- **Chế độ kiểm soát:** {'Đơn giản (Fast-Track)' if is_simple else 'Phức tạp (Multi-Step Discovery)'}\n"
-        f"- **Pha hoạt động khởi động:** `{task_type.upper()}`\n\n"
+        f"- **Pha hoạt động khởi động:** `{task_type.upper()}`\n"
+        f"{skills_log_msg}\n"
         f"🎯 **[Phân tích mục tiêu kỹ thuật]**:\n{detailed_analysis}"
         f"{safety_warning_msg}"
     )
@@ -506,7 +535,8 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         "modified_files": [],
         "last_executed_task_ids": [],
         "replanning_count": 0,
-        "step_findings": ["__RESET__"]
+        "step_findings": ["__RESET__"],
+        "active_skills": active_skills  # 🌟 Trả về trạng thái kỹ năng đã được nạp sẵn!
     }
 
 def get_eligible_tasks(plan: List[Any]) -> List[Any]:
@@ -527,7 +557,189 @@ def get_eligible_tasks(plan: List[Any]) -> List[Any]:
                 eligible.append(t)
     return eligible
 
+def doubt_reviewer_node(state: AgentState) -> Dict[str, Any]:
+    """
+    [NODE MỚI] Thực hiện rà soát đơn mô hình đối kháng (Step 3: DOUBT trong SKILL.md).
+    Chỉ chạy khi mã nguồn đã được sửa đổi và vượt qua các kiểm tra cú pháp tĩnh thành công.
+    """
+    modified_files = state.get("modified_files", [])
+    file_registry = state.get("file_registry", {})
+    doubt_attempts = state.get("doubt_attempts", 0)
+    
+    if not modified_files or doubt_attempts >= 3:
+        return {"doubt_findings": ""}
+        
+    latest_file = modified_files[-1]
+    artifact_code = file_registry.get(latest_file, "")
+    
+    if not artifact_code:
+        # Nếu chưa nạp code vào registry, thử đọc từ đĩa vật lý
+        try:
+            safe_path = sanitize_and_resolve_path(state["workspace_path"], latest_file)
+            if safe_path.exists():
+                artifact_code = safe_path.read_text(encoding="utf-8")
+        except Exception:
+            pass
 
+    if not artifact_code:
+        return {"doubt_findings": ""}
+
+    adversarial_prompt = (
+        "Bạn là một kiểm toán viên mã nguồn đối kháng chuyên nghiệp (Adversarial Reviewer).\n"
+        "Nhiệm vụ của bạn là rà soát đoạn mã nguồn dưới đây và tìm ra ít nhất 3 điểm yếu kỹ thuật, "
+        "các giả định sai lầm, các trường hợp biên chưa được xử lý, hoặc nguy cơ bảo mật tiềm ẩn.\n\n"
+        "⚠️ YÊU CẦU NGHIÊM NGẶT:\n"
+        "- Chỉ tập trung chỉ ra lỗi logic thực tế, lỗ hổng cấu trúc hoặc rủi ro runtime.\n"
+        "- TUYỆT ĐỐI KHÔNG khen ngợi, không viết tóm tắt vô nghĩa.\n"
+        "- Định dạng câu trả lời bằng tiếng Việt, rõ ràng theo từng đầu dòng kèm chỉ dẫn file:dòng cụ thể.\n\n"
+        f"ARTIFACT MÃ NGUỒN CẦN THẨM ĐỊNH ({latest_file}):\n"
+        "```\n"
+        f"{artifact_code}\n"
+        "```"
+    )
+
+    response = fast_model.invoke([
+        SystemMessage(content="Bạn đang thực thi quy trình thẩm định đối kháng thuộc kỹ năng `doubt-driven-development`."),
+        HumanMessage(content=adversarial_prompt)
+    ])
+    
+    return {
+        "doubt_findings": response.content,
+        "doubt_attempts": doubt_attempts + 1
+    }
+
+
+def doubt_gate_node(state: AgentState) -> Dict[str, Any]:
+    """
+    [NODE MỚI] Nút ngắt tương tác (Human-in-the-Loop) của Doubt-Driven Development.
+    Hiển thị các phát hiện lỗi cho người dùng, cho phép kích hoạt thẩm định chéo qua mô hình phụ (Gemini/Codex)
+    hoặc phê duyệt/yêu cầu sửa code trực tiếp.
+    """
+    doubt_findings = state.get("doubt_findings", "")
+    modified_files = state.get("modified_files", [])
+    
+    if not doubt_findings or not modified_files:
+        return {}
+
+    latest_file = modified_files[-1]
+
+    # Thiết lập payload giao diện cho interrupt
+    interrupt_payload = {
+        "title": "🔍 THẨM ĐỊNH ĐỐI KHÁNG (DOUBT-DRIVEN DEVELOPMENT)",
+        "file_under_review": latest_file,
+        "single_model_findings": doubt_findings,
+        "prompt": (
+            "Hệ thống phát hiện một số rủi ro logic tiềm ẩn trong đoạn mã nguồn bạn vừa viết.\n"
+            "- Nhấn Approve (hoặc gửi phản hồi rỗng/'yes'/'ok') để BỎ QUA và tiến hành commit.\n"
+            "- Nhập 'gemini' hoặc 'codex' để kích hoạt THẨM ĐỊNH CHÉO ngoại vi thông qua mô hình độc lập (Cross-Model Escalation).\n"
+            "- Nhập ý kiến phản hồi khác hoặc yêu cầu sửa lỗi để chuyển thông tin này quay lại cho Executor khắc phục lỗi."
+        )
+    }
+
+    # KÍCH HOẠT NGẮT ĐỒ THỊ ĐỂ ĐỢI PHẢN HỒI TỪ NGƯỜI DÙNG
+    user_input = interrupt(interrupt_payload)
+    
+    user_action = str(user_input).strip().lower() if user_input else ""
+
+    # Kịch bản 1: Người dùng phê duyệt/Bỏ qua (Bypass)
+    if user_action in ["", "yes", "approve", "ok", "skip"]:
+        return {
+            "error_logs": "",
+            "doubt_findings": "", # Xóa log nghi ngờ để đi tiếp
+            "messages": [AIMessage(content="✅ **[Doubt Bypassed]** Người dùng đã phê duyệt mã nguồn. Tiến hành hoàn tất tác vụ.")]
+        }
+
+    # Kịch bản 2: Yêu cầu thẩm định chéo qua CLI ngoại vi (Cross-Model Escalation)
+    if user_action in ["gemini", "codex"]:
+        cli_tool = user_action
+        cli_executable = "gemini" if cli_tool == "gemini" else "codex"
+        
+        # Kiểm tra sự tồn tại vật lý của CLI trong môi trường hệ thống
+        if not shutil.which(cli_executable):
+            feedback_msg = HumanMessage(
+                content=f"⚠️ Lỗi: Không tìm thấy thực thi CLI `{cli_executable}` trong biến môi trường PATH của bạn. Vui lòng kiểm tra lại cấu hình."
+            )
+            return {
+                "error_logs": f"Không tìm thấy công cụ ngoại vi `{cli_executable}`",
+                "messages": [feedback_msg]
+            }
+
+        # Chuẩn bị Prompt Thẩm định đối kháng chéo
+        file_registry = state.get("file_registry", {})
+        artifact_code = file_registry.get(latest_file, "")
+        
+        cross_prompt = (
+            f"Thẩm định đối kháng chéo (Adversarial Cross-Model Review) cho file {latest_file}.\n"
+            "Hãy tìm ra các lỗ hổng, lỗi logic hoặc điểm chưa tối ưu mà mô hình trước đã bỏ qua.\n\n"
+            "MÃ NGUỒN:\n"
+            f"{artifact_code}"
+        )
+
+        # 🛡️ PHÒNG THỦ AN TOÀN TUYỆT ĐỐI CHỐNG SHELL INJECTION (Không truyền trực tiếp qua argument)
+        # Ghi prompt đối kháng ra tệp tạm và truyền dữ liệu thông qua Standard Input (stdin)
+        try:
+            with tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8", delete=False) as temp_prompt_file:
+                temp_prompt_file.write(cross_prompt)
+                temp_prompt_file_path = temp_prompt_file.name
+
+            # Thực thi tiến trình con an toàn với chế độ sandbox hoặc luồng an toàn
+            # Cú pháp chạy: cli_executable < temp_prompt_file_path
+            with open(temp_prompt_file_path, "r", encoding="utf-8") as stdin_file:
+                # Thiết lập biến môi trường UTF-8 đồng bộ cho tiến trình con
+                env_copy = os.environ.copy()
+                env_copy["PYTHONIOENCODING"] = "utf-8"
+                env_copy["PYTHONUTF8"] = "1"
+                
+                cmd = [cli_executable]
+                # Thêm cờ bổ sung nếu là gemini để chạy không tương tác
+                if cli_executable == "gemini":
+                    cmd.extend(["--approval-mode", "plan", "-p", ""])
+                elif cli_executable == "codex":
+                    cmd.extend(["exec", "--sandbox", "read-only", "-"])
+                
+                res = subprocess.run(
+                    cmd,
+                    stdin=stdin_file,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=env_copy,
+                    timeout=45
+                )
+
+            # Dọn dẹp tệp tạm vật lý ngay lập tức
+            Path(temp_prompt_file_path).unlink(missing_ok=True)
+
+            combined_output = (res.stdout or "") + "\n" + (res.stderr or "")
+            escalated_findings = combined_output.strip()
+            
+            # Ghi nhận kết quả rà soát mới và giữ lại trạng thái ngắt để hiển thị tiếp cho người dùng
+            return {
+                "doubt_findings": f"🛡️ **[KẾT QUẢ THẨM ĐỊNH CHÉO TỪ {cli_executable.upper()}]**:\n\n{escalated_findings}",
+                "messages": [AIMessage(content=f"🔍 Kích hoạt thành công rà soát chéo từ {cli_executable.upper()}. Đang chờ ý kiến phê duyệt cuối cùng.")]
+            }
+            
+        except Exception as err:
+            return {
+                "error_logs": f"Lỗi hệ thống khi khởi chạy Cross-Model: {str(err)}",
+                "messages": [AIMessage(content=f"❌ Thao tác gọi mô hình chéo thất bại: {str(err)}")]
+            }
+
+    # Kịch bản 3: Phản hồi tự do yêu cầu sửa lỗi (Reconcile Path)
+    feedback_message = HumanMessage(
+        content=(
+            "⚠️ Yêu cầu sửa đổi mã nguồn dựa trên kết quả thẩm định đối kháng:\n"
+            f"Ý kiến người dùng: '{user_input}'\n"
+            f"Các lỗi cần khắc phục:\n{doubt_findings}"
+        )
+    )
+    
+    return {
+        "error_logs": f"Cần khắc phục lỗi logic thẩm định: {user_input}",
+        "doubt_findings": "", # Xóa log để chuẩn bị lượt kiểm tra mới sau khi sửa xong
+        "messages": [feedback_message]
+    }
 def context_loader_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
     
@@ -811,16 +1023,37 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         for item in catalog:
             catalog_prompt += f"- **{item['name']}**: {item['description']}\n"
 
-    last_message = messages[-1] if messages else None
-    if last_message and getattr(last_message, "type", None) == "tool" and last_message.name == "activate_agent_skill":
-        for msg in reversed(messages):
-            if isinstance(msg, AIMessage) and msg.tool_calls:
-                for tc in msg.tool_calls:
-                    if tc["name"] == "activate_agent_skill":
-                        requested_skill = tc["args"].get("skill_name")
-                        if requested_skill and "Lỗi" not in str(last_message.content):
-                            active_skills[requested_skill] = str(last_message.content)
-                        break
+    # 1. Thu thập tất cả ToolMessage ở lượt chạy hiện tại (các tin nhắn loại 'tool' ở cuối danh sách)
+    current_turn_tool_messages = []
+    for msg in reversed(messages):
+        if getattr(msg, "type", None) == "tool":
+            current_turn_tool_messages.append(msg)
+        else:
+            # Dừng lại khi gặp tin nhắn không phải là Tool (thường là AIMessage kích hoạt chúng)
+            break
+
+    # 2. Tìm AIMessage gần nhất chứa danh sách tool_calls
+    last_ai_message = None
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            last_ai_message = msg
+            break
+
+    # 3. Ánh xạ chính xác từng ToolMessage với tool_call tương ứng bằng tool_call_id
+    if last_ai_message and last_ai_message.tool_calls:
+        # Tạo bản đồ ánh xạ nhanh từ tool_call_id sang đối tượng ToolMessage
+        tool_results_map = {tm.tool_call_id: tm for tm in current_turn_tool_messages}
+        
+        for tc in last_ai_message.tool_calls:
+            if tc["name"] == "activate_agent_skill":
+                tc_id = tc["id"]
+                associated_tool_msg = tool_results_map.get(tc_id)
+                
+                # Kiểm tra kết quả thực thi của chính công cụ này
+                if associated_tool_msg and "Lỗi" not in str(associated_tool_msg.content):
+                    requested_skill = tc["args"].get("skill_name")
+                    if requested_skill:
+                        active_skills[requested_skill] = str(associated_tool_msg.content)
 
     active_skills_prompt = ""
     if active_skills:
@@ -831,30 +1064,38 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
     activate_skill_tool = ActivateSkillTool(workspace_path=ws)
     run_skill_script_tool = RunSkillScriptTool(workspace_path=ws)
     write_and_run_script = WriteAndRunScriptTool(workspace_path=ws)
+    search_keyword_tool = SearchKeywordTool(workspace_path=ws)
 
     if task_type == "analysis":
+        # PHA KHẢO SÁT: Chỉ cho phép đọc, tìm kiếm và đề xuất kế hoạch. Cấm tuyệt đối ghi file.
         read_files = ReadFilesTool(workspace_path=ws)
-        write_file = WriteFileTool(workspace_path=ws)
         list_directory = ListDirectoryTool(workspace_path=ws)
         search_symbols = UniversalSymbolSearchTool(workspace_path=ws)
         read_file_lines = ReadFileLinesTool(workspace_path=ws)
         ask_questions_tool = AskQuestionsTool(workspace_path=ws)
-        propose_plan_tool = ProposePlanTool(workspace_path=ws)
-        run_terminal_command = RunTerminalTool(workspace_path=ws)
         
+        # Loại bỏ hoàn toàn: write_file, write_and_run_script, apply_patch
         tools = [
-            activate_skill_tool, run_skill_script_tool, read_files, write_file, 
-            list_directory, search_symbols, read_file_lines, ask_questions_tool, 
-            propose_plan_tool, run_terminal_command, write_and_run_script
+            activate_skill_tool, 
+            run_skill_script_tool, 
+            read_files, 
+            list_directory, 
+            search_symbols, 
+            read_file_lines, 
+            ask_questions_tool, 
+            search_keyword_tool
         ]
+        
         system_prompt = (
             "Bạn là một chuyên gia điều tra, khảo sát mã nguồn và lập kế hoạch kỹ thuật (Active Discovery Engine).\n"
             f"Nhiệm vụ hiện tại:\n{tasks_str}\n"
             f"Thư mục làm việc: {ws}\n\n"
-            "⚠️ QUY TRÌNH KHẢO SÁT CHỦ ĐỘNG VÀ ĐA ĐƯỜNG DẪN (BẮT BUỘC):\n"
-            "1. Sử dụng các công cụ khảo sát tìm hiểu nguyên nhân gây ra vấn đề trong thư mục dự án.\n"
-            "2. Đừng ngần ngại gọi nhiều công cụ thăm dò liên tục để tự xây dựng ngữ cảnh đầy đủ nhất.\n"
-            "3. Nếu lỗi phức tạp, liên quan đến logic nghiệp vụ chính hoặc tác động lên nhiều file nguồn, bạn BẮT BUỘC phải gọi công cụ `propose_implementation_plan` để phác thảo Bản kế hoạch triển khai chi tiết.\n"
+            "⚠️ QUY TẮC ĐIỀU TRA TIẾT KIỆM TOKEN (BẮT BUỘC):\n"
+            "1. Nếu bạn cần tìm kiếm vị trí của một biến, một hàm, hoặc một chuỗi ký tự trong mã nguồn (như 'noiCap', 'localStorage'), "
+            "bạn BẮT BUỘC phải ưu tiên gọi công cụ `search_keyword` thay vì dùng `read_files` để đọc bừa bãi toàn bộ các file lớn.\n"
+            "2. Sau khi `search_keyword` trả về chính xác tên file và số dòng, hãy dùng `read_file_lines` "
+            "để chỉ đọc đúng phân đoạn dòng chứa logic đó.\n"
+            "3. Sau khi xác định nguyên nhân lỗi, hãy đề xuất kế hoạch sửa bằng `propose_implementation_plan`.\n"
         )
     else:
         read_files = ReadFilesTool(workspace_path=ws)
@@ -864,18 +1105,21 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         list_directory = ListDirectoryTool(workspace_path=ws)
         run_terminal_command = RunTerminalTool(workspace_path=ws)
         read_file_lines = ReadFileLinesTool(workspace_path=ws)
+        write_and_run_script = WriteAndRunScriptTool(workspace_path=ws)
         ask_questions_tool = AskQuestionsTool(workspace_path=ws)
-        
         tools = [
             activate_skill_tool, run_skill_script_tool, read_files, write_file, 
             apply_patch, list_directory, run_terminal_command, search_symbols, 
-            read_file_lines, ask_questions_tool, write_and_run_script
+            read_file_lines, ask_questions_tool, write_and_run_script,search_keyword_tool
         ]
+        
         system_prompt = (
             "Bạn là kỹ sư phần mềm thực thi chuyên nghiệp (Write-Access Mode).\n"
             f"Nhiệm vụ phát triển:\n{tasks_str}\n"
             f"Thư mục làm việc: {ws}\n\n"
-            "Hãy áp dụng các bản vá, viết code mới hoặc thực thi kiểm thử để hoàn tất kế hoạch đã được phê duyệt."
+            "⚠️ HƯỚNG DẪN TIẾT KIỆM TOKEN:\n"
+            "Luôn ưu tiên tìm kiếm vị trí cần sửa bằng `search_keyword` trước, sau đó áp dụng bản vá sửa đổi tối giản "
+            "bằng `apply_search_replace_patch` thay vì ghi đè toàn bộ tệp tin lớn.\n"
         )
 
     system_prompt += catalog_prompt + active_skills_prompt
@@ -1278,7 +1522,7 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
     web_interact_tool = WebInteractAndTestTool(workspace_path=ws)
     ask_questions_tool = AskQuestionsTool(workspace_path=ws)
     write_and_run_script = WriteAndRunScriptTool(workspace_path=ws)
-    
+    search_keyword_tool = SearchKeywordTool(workspace_path=ws)
     # 🌟 VÁ LỖI: Khởi tạo ProposePlanTool cho Node thực thi
     propose_plan_tool = ProposePlanTool(workspace_path=ws)
     
@@ -1297,6 +1541,7 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         "write_and_run_script": write_and_run_script,
         # 🌟 VÁ LỖI: Đăng ký tên định danh công cụ chính xác tương thích với mô hình
         "propose_implementation_plan": propose_plan_tool,
+        "search_keyword": search_keyword_tool,
     }
     
     last_message = state["messages"][-1]
@@ -1375,12 +1620,11 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
 
 def human_interaction_gate_node(state: AgentState) -> Dict[str, Any]:
     """
-    🌟 [NODE RÀO CHẮN MỚI] Node trung tâm duy nhất xử lý gọi hàm interrupt() cho các tool.
-    Hoàn toàn idempotent và không gây ra bất kỳ tác dụng phụ nào khi chạy lại.
+    Node rào chắn tương tác người dùng.
+    Đã sửa lỗi: Tự động nâng cấp task_type sang 'development' sau khi phê duyệt kế hoạch.
     """
     messages = state["messages"]
     
-    # Tìm kiếm ToolMessage cuối cùng chứa yêu cầu tương tác từ người dùng
     target_tool_msg = None
     for msg in reversed(messages):
         if isinstance(msg, ToolMessage) and msg.name in ["ask_questions_if_underspecified", "propose_implementation_plan"]:
@@ -1398,10 +1642,9 @@ def human_interaction_gate_node(state: AgentState) -> Dict[str, Any]:
     except Exception:
         return {}
 
-    # Thực hiện ngắt đồ thị một cách an toàn và lấy dữ liệu phản hồi từ client
+    # Thực hiện ngắt đồ thị
     user_input = interrupt(payload)
     
-    # Tạo tin nhắn phản hồi giả lập của người dùng để LLM tiếp tục đọc hiểu
     feedback_content = ""
     if payload.get("type") == "ask_questions_if_underspecified":
         feedback_content = f"### [Phản hồi của người dùng cho các câu hỏi]:\n{json.dumps(user_input, ensure_ascii=False)}"
@@ -1417,15 +1660,20 @@ def human_interaction_gate_node(state: AgentState) -> Dict[str, Any]:
         "messages": [feedback_message]
     }
     
-    # Nếu là phê duyệt kế hoạch, chúng ta cũng tự động nạp danh sách nhiệm vụ đã duyệt vào state["plan"]
+    # Xử lý phê duyệt kế hoạch triển khai
     if payload.get("type") == "propose_implementation_plan":
         user_input_clean = str(user_input).strip().lower() if user_input else ""
+        # Đồng ý nếu nhập yes, ok, approve hoặc gửi phản hồi rỗng (bấm Approve trên UI)
         if user_input_clean in ["", "yes", "approve", "ok"]:
             proposed_tasks = payload.get("proposed_tasks", [])
             refined_tasks = [Task(**t) for t in proposed_tasks]
+            
+            # CẬP NHẬT TRẠNG THÁI QUAN TRỌNG:
             state_updates["plan"] = refined_tasks
+            state_updates["task_type"] = "development"  # 🌟 CHUYỂN PHA THÀNH CÔNG sang Development!
+            
             state_updates["messages"] = [
-                AIMessage(content="✅ Kế hoạch triển khai đã được phê duyệt và cấu hình vào hệ thống."),
+                AIMessage(content="✅ **[Hệ thống]**: Kế hoạch triển khai đã được phê duyệt. Đồ thị chính thức chuyển trạng thái sang pha DEVELOPMENT (Cấp quyền ghi file)."),
                 feedback_message
             ]
 

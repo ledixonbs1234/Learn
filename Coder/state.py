@@ -1,21 +1,19 @@
-# state.py
+# Coder/state.py
 from typing import List, Dict, Any, Literal, Optional, Sequence, TypedDict, Annotated, Union
 from pydantic import BaseModel, Field
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 
-# ==========================================
-# CẤU TRÚC ĐẦU RA MONG MUỐN (STRUCTURED OUTPUT)
-# ==========================================
-class WorkspaceDetection(BaseModel):
-    workspace_path: str = Field(description="Đường dẫn tuyệt đối đã xác minh của workspace chứa dự án.")
+# =====================================================================
+# CẤU TRÚC DỮ LIỆU PYDANTIC SỬ DỤNG TRONG LẬP KẾ HOẠCH & PHÂN LOẠI
+# =====================================================================
 
 class Task(BaseModel):
     id: str = Field(description="Mã định danh duy nhất cho nhiệm vụ, ví dụ: 'T1', 'T2'")
     description: str = Field(description="Mô tả chi tiết hành động cần thực hiện")
     dependencies: List[str] = Field(
         default_factory=list,
-        description="Mảng chứa các ID nhiệm vụ cần hoàn thành trước. Nếu không phụ thuộc hãy trả về mảng rỗng []"
+        description="Mảng chứa các ID nhiệm vụ cần hoàn thành trước. Nếu không phụ thuộc trả về mảng rỗng []"
     )
     status: Literal["pending", "completed"] = Field(
         default="pending", 
@@ -23,6 +21,7 @@ class Task(BaseModel):
     )
 
 class TaskPlan(BaseModel):
+    """Bản kế hoạch DAG khởi tạo ban đầu được đề xuất bởi Kiến trúc sư."""
     tasks: List[Task] = Field(
         default_factory=list,
         description="Danh sách có thứ tự của các nhiệm vụ cần thực hiện (DAG)."
@@ -37,13 +36,14 @@ class TaskPlan(BaseModel):
     )
 
 class PlanUpdate(BaseModel):
+    """Bản cập nhật kế hoạch được sử dụng khi tái lập lộ trình (Replanning)."""
     should_modify_plan: bool = Field(
         default=False,
-        description="True nếu dựa trên kết quả thực thi vừa qua, bạn thấy cần sửa đổi hoặc bổ sung thêm nhiệm vụ mới vào kế hoạch. False nếu kế hoạch hiện tại vẫn đúng đắn và có thể tiếp tục trực tiếp."
+        description="True nếu cần sửa đổi hoặc bổ sung thêm nhiệm vụ mới vào kế hoạch. False nếu giữ nguyên."
     )
     explanation: str = Field(
         default="",
-        description="Giải thích chi tiết lý do tại sao quyết định điều chỉnh hoặc giữ nguyên kế hoạch hành động."
+        description="Giải thích chi tiết lý do điều chỉnh hoặc giữ nguyên kế hoạch."
     )
     updated_tasks: List[Task] = Field(
         default_factory=list,
@@ -55,23 +55,57 @@ class PlanUpdate(BaseModel):
     )
 
 class TaskTriage(BaseModel):
+    """Phân loại tác vụ đầu vào tại điểm xuất phát."""
     is_simple: bool = Field(
         default=False,
-        description="True nếu yêu cầu cực kỳ đơn giản. False nếu yêu cầu phức tạp cần khảo sát sâu hoặc thiết kế nhiều bước."
+        description="True nếu yêu cầu cực kỳ đơn giản. False nếu phức tạp cần lên kế hoạch nhiều bước."
     )
-    # Thêm 'clarify' vào Literal để hỗ trợ trạng thái yêu cầu làm rõ đường dẫn mới
     task_type: Literal["analysis", "development"] = Field(
         default="development",
         description="Phân loại hướng xử lý của yêu cầu."
     )
     detailed_analysis: str = Field(
         default="",
-        description="Bản phân tích chi tiết yêu cầu người dùng. Cần làm rõ: Mục đích cốt lõi, các tệp tin/thư mục dự kiến bị tác động, các ràng buộc kỹ thuật, và lộ trình gợi ý sơ bộ."
+        description="Bản phân tích chi tiết yêu cầu người dùng (Mục đích, file bị tác động, ràng buộc)."
+    )
+    recommended_skills: List[str] = Field(
+        default_factory=list,
+        description="Danh sách các tên định danh kỹ năng phù hợp nhất từ thư viện .skills/."
     )
 
-# ==========================================
+class RuntimeVerificationResult(BaseModel):
+    has_critical_error: bool = Field(description="True nếu phát hiện lỗi crash, exception nghiêm trọng.")
+    error_summary: str = Field(description="Tóm tắt lỗi runtime phát hiện được.")
+
+# =====================================================================
+# KHÔI PHỤC HOÀN TOÀN SCHEMA ĐỊNH NGHĨA KỸ NĂNG ĐỘNG (DYNAMIC SKILLS)
+# =====================================================================
+
+class SkillParameter(BaseModel):
+    type: str = Field(description="Kiểu dữ liệu của tham số (string, integer, boolean, object, array).")
+    description: str = Field(description="Mô tả chi tiết bằng tiếng Việt về tham số này.")
+    required: bool = Field(default=True, description="Tham số này có bắt buộc không.")
+
+class SkillDefinition(BaseModel):
+    name: str = Field(description="Tên định danh của kỹ năng, ví dụ: 'excel_edit_cell'.")
+    description: str = Field(description="Mô tả chi tiết nhiệm vụ và trường hợp sử dụng của kỹ năng này.")
+    parameters: Dict[str, SkillParameter] = Field(description="Từ điển chứa các tham số đầu vào cần thiết.")
+    usage_example: str = Field(description="Ví dụ cụ thể về cách chuẩn bị tham số và kết quả mong đợi.")
+
+# =====================================================================
+# HÀM BỔ TRỢ ÉP KIỂU PHÒNG THỦ TRÁNH LỖI CHECKPOINT SERIALIZATION
+# =====================================================================
+
+def ensure_task_objects(plan: List[Union[Task, dict]]) -> List[Task]:
+    """Chuyển đổi đồng bộ các dict thô thu được từ checkpoint trở lại thành đối tượng Task Pydantic [1]."""
+    if not plan:
+        return []
+    return [t if isinstance(t, Task) else Task(**t) for t in plan]
+
+# =====================================================================
 # CUSTOM REDUCERS VÀ STATE GRAPH
-# ==========================================
+# =====================================================================
+
 def reduce_findings(left: Union[List[str], None], right: Union[List[str], None]) -> List[str]:
     left_list = left or []
     right_list = right or []
@@ -106,6 +140,8 @@ class AgentState(TypedDict):
     extension_path: str
     browser_console_logs: str
     active_skills: Dict[str, str]
+    doubt_findings: str         # Lưu kết quả rà soát đối kháng
+    doubt_attempts: int
 
 class WebInteractionState(TypedDict):
     workspace_path: str 
@@ -115,27 +151,9 @@ class WebInteractionState(TypedDict):
     js_code_to_test: Optional[str]
     extension_path: Optional[str]
     browser_console_logs: Optional[str]
-    
-    # Kết quả trả về từ Subgraph
     detected_selectors: Optional[Dict[str, Any]]
     execution_success: Optional[bool]
     dom_state_after: Optional[Dict[str, Any]]
     screenshot_path: Optional[str]
     error: Optional[str]
     attempts: int
-
-
-class SkillParameter(BaseModel):
-    type: str = Field(description="Kiểu dữ liệu của tham số (string, integer, boolean, object, array).")
-    description: str = Field(description="Mô tả chi tiết bằng tiếng Việt về tham số này.")
-    required: bool = Field(default=True, description="Tham số này có bắt buộc không.")
-
-class SkillDefinition(BaseModel):
-    name: str = Field(description="Tên định danh của kỹ năng, ví dụ: 'excel_edit_cell'.")
-    description: str = Field(description="Mô tả chi tiết nhiệm vụ và trường hợp sử dụng của kỹ năng này.")
-    parameters: Dict[str, SkillParameter] = Field(description="Từ điển chứa các tham số đầu vào cần thiết.")
-    usage_example: str = Field(description="Ví dụ cụ thể về cách chuẩn bị tham số và kết quả mong đợi.")
-    
-class RuntimeVerificationResult(BaseModel):
-    has_critical_error: bool = Field(description="True nếu phát hiện lỗi crash, exception, lỗi CORS, hoặc lỗi console đỏ nghiêm trọng.")
-    error_summary: str = Field(description="Tóm tắt ngắn gọn lỗi runtime phát hiện được (nếu có).")

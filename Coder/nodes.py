@@ -982,7 +982,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             extension_path = ext_dir
             state_updates["extension_path"] = extension_path
 
-    # 🌟 VÁ LỖI: Chuẩn hóa ép kiểu phòng thủ từ dict thô về Task object khi khôi phục từ Checkpoint
+    # Ép kiểu phòng thủ từ dict thô về Task object
     parsed_plan = []
     for t in plan:
         if isinstance(t, dict):
@@ -1023,33 +1023,25 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         for item in catalog:
             catalog_prompt += f"- **{item['name']}**: {item['description']}\n"
 
-    # 1. Thu thập tất cả ToolMessage ở lượt chạy hiện tại (các tin nhắn loại 'tool' ở cuối danh sách)
     current_turn_tool_messages = []
     for msg in reversed(messages):
         if getattr(msg, "type", None) == "tool":
             current_turn_tool_messages.append(msg)
         else:
-            # Dừng lại khi gặp tin nhắn không phải là Tool (thường là AIMessage kích hoạt chúng)
             break
 
-    # 2. Tìm AIMessage gần nhất chứa danh sách tool_calls
     last_ai_message = None
     for msg in reversed(messages):
         if isinstance(msg, AIMessage):
             last_ai_message = msg
             break
 
-    # 3. Ánh xạ chính xác từng ToolMessage với tool_call tương ứng bằng tool_call_id
     if last_ai_message and last_ai_message.tool_calls:
-        # Tạo bản đồ ánh xạ nhanh từ tool_call_id sang đối tượng ToolMessage
         tool_results_map = {tm.tool_call_id: tm for tm in current_turn_tool_messages}
-        
         for tc in last_ai_message.tool_calls:
             if tc["name"] == "activate_agent_skill":
                 tc_id = tc["id"]
                 associated_tool_msg = tool_results_map.get(tc_id)
-                
-                # Kiểm tra kết quả thực thi của chính công cụ này
                 if associated_tool_msg and "Lỗi" not in str(associated_tool_msg.content):
                     requested_skill = tc["args"].get("skill_name")
                     if requested_skill:
@@ -1063,18 +1055,17 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
 
     activate_skill_tool = ActivateSkillTool(workspace_path=ws)
     run_skill_script_tool = RunSkillScriptTool(workspace_path=ws)
-    write_and_run_script = WriteAndRunScriptTool(workspace_path=ws)
     search_keyword_tool = SearchKeywordTool(workspace_path=ws)
 
     if task_type == "analysis":
-        # PHA KHẢO SÁT: Chỉ cho phép đọc, tìm kiếm và đề xuất kế hoạch. Cấm tuyệt đối ghi file.
+        # PHA KHẢO SÁT: Chỉ cho phép đọc và tìm kiếm thông tin.
         read_files = ReadFilesTool(workspace_path=ws)
         list_directory = ListDirectoryTool(workspace_path=ws)
         search_symbols = UniversalSymbolSearchTool(workspace_path=ws)
         read_file_lines = ReadFileLinesTool(workspace_path=ws)
         ask_questions_tool = AskQuestionsTool(workspace_path=ws)
         
-        # Loại bỏ hoàn toàn: write_file, write_and_run_script, apply_patch
+        # 🌟 VÁ LỖI: Loại bỏ hoàn toàn propose_plan_tool khỏi đây
         tools = [
             activate_skill_tool, 
             run_skill_script_tool, 
@@ -1087,15 +1078,14 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         ]
         
         system_prompt = (
-            "Bạn là một chuyên gia điều tra, khảo sát mã nguồn và lập kế hoạch kỹ thuật (Active Discovery Engine).\n"
+            "Bạn là một chuyên gia điều tra, khảo sát mã nguồn và thu thập dữ liệu kỹ thuật (Active Discovery Engine).\n"
             f"Nhiệm vụ hiện tại:\n{tasks_str}\n"
             f"Thư mục làm việc: {ws}\n\n"
             "⚠️ QUY TẮC ĐIỀU TRA TIẾT KIỆM TOKEN (BẮT BUỘC):\n"
-            "1. Nếu bạn cần tìm kiếm vị trí của một biến, một hàm, hoặc một chuỗi ký tự trong mã nguồn (như 'noiCap', 'localStorage'), "
-            "bạn BẮT BUỘC phải ưu tiên gọi công cụ `search_keyword` thay vì dùng `read_files` để đọc bừa bãi toàn bộ các file lớn.\n"
-            "2. Sau khi `search_keyword` trả về chính xác tên file và số dòng, hãy dùng `read_file_lines` "
-            "để chỉ đọc đúng phân đoạn dòng chứa logic đó.\n"
-            "3. Sau khi xác định nguyên nhân lỗi, hãy đề xuất kế hoạch sửa bằng `propose_implementation_plan`.\n"
+            "1. Nếu bạn cần tìm kiếm vị trí của một biến hoặc hàm, hãy ưu tiên dùng `search_keyword`.\n"
+            
+            "2. Khi đã xác định được tệp tin cần quan tâm, hãy dùng `read_file_lines` để đọc phân đoạn thay vì đọc cả file lớn.\n"
+            "3. Khi bạn đã hoàn thành việc khảo sát và nắm chắc cấu trúc, hãy kết thúc lượt bằng một văn bản tổng hợp kết quả điều tra và KHÔNG gọi thêm công cụ nào nữa. Hệ thống sẽ tự động chuyển tiếp tới pha lập kế hoạch."
         )
     else:
         read_files = ReadFilesTool(workspace_path=ws)
@@ -1110,7 +1100,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         tools = [
             activate_skill_tool, run_skill_script_tool, read_files, write_file, 
             apply_patch, list_directory, run_terminal_command, search_symbols, 
-            read_file_lines, ask_questions_tool, write_and_run_script,search_keyword_tool
+            read_file_lines, ask_questions_tool, write_and_run_script, search_keyword_tool
         ]
         
         system_prompt = (
@@ -1118,8 +1108,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             f"Nhiệm vụ phát triển:\n{tasks_str}\n"
             f"Thư mục làm việc: {ws}\n\n"
             "⚠️ HƯỚNG DẪN TIẾT KIỆM TOKEN:\n"
-            "Luôn ưu tiên tìm kiếm vị trí cần sửa bằng `search_keyword` trước, sau đó áp dụng bản vá sửa đổi tối giản "
-            "bằng `apply_search_replace_patch` thay vì ghi đè toàn bộ tệp tin lớn.\n"
+            "Ưu tiên sử dụng `apply_search_replace_patch` thay vì ghi đè lại toàn bộ tệp tin lớn bằng `write_file`.\n"
         )
 
     system_prompt += catalog_prompt + active_skills_prompt
@@ -1131,8 +1120,6 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         system_prompt += registry_context_str
 
     model_with_tools = model.bind_tools(tools)
-    
-    # 🌟 VÁ LỖI: Loại bỏ hoàn toàn compact_reading_tool_messages tại đây vì dữ liệu đã được nén từ gốc
     optimized_history = messages 
 
     input_messages = [SystemMessage(content=system_prompt)]
@@ -1153,6 +1140,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             for t in parsed_plan:
                 t_copy = t.model_copy()
                 if t_copy.id in eligible_ids:
+                    # Hoàn thành nhiệm vụ lính canh T_SURVEY
                     t_copy.status = "completed"
                 updated_plan.append(t_copy)
 
@@ -1204,7 +1192,6 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         "active_skills": active_skills
     })
     return state_updates
-
 def replanner_node(state: AgentState) -> Dict[str, Any]:
     replanning_count = state.get("replanning_count", 0)
     ws = state["workspace_path"]
@@ -1620,14 +1607,14 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
 
 def human_interaction_gate_node(state: AgentState) -> Dict[str, Any]:
     """
-    Node rào chắn tương tác người dùng.
-    Đã sửa lỗi: Tự động nâng cấp task_type sang 'development' sau khi phê duyệt kế hoạch.
+    Node rào chắn tương tác người dùng chỉ dành cho mục đích làm rõ thông tin (Clarification Questions).
+    Đã loại bỏ hoàn toàn phần xử lý kế hoạch thủ công do vai trò này được chuyển giao hoàn toàn cho Replanner.
     """
     messages = state["messages"]
     
     target_tool_msg = None
     for msg in reversed(messages):
-        if isinstance(msg, ToolMessage) and msg.name in ["ask_questions_if_underspecified", "propose_implementation_plan"]:
+        if isinstance(msg, ToolMessage) and msg.name == "ask_questions_if_underspecified":
             target_tool_msg = msg
             break
             
@@ -1642,42 +1629,18 @@ def human_interaction_gate_node(state: AgentState) -> Dict[str, Any]:
     except Exception:
         return {}
 
-    # Thực hiện ngắt đồ thị
+    # Thực hiện ngắt đồ thị để đợi câu trả lời từ người dùng cho các câu hỏi
     user_input = interrupt(payload)
     
-    feedback_content = ""
-    if payload.get("type") == "ask_questions_if_underspecified":
-        feedback_content = f"### [Phản hồi của người dùng cho các câu hỏi]:\n{json.dumps(user_input, ensure_ascii=False)}"
-    else:  # propose_implementation_plan
-        feedback_content = f"### [Phê duyệt Kế hoạch hành động]:\n{user_input}"
-        
+    feedback_content = f"### [Phản hồi của người dùng cho các câu hỏi]:\n{json.dumps(user_input, ensure_ascii=False)}"
     feedback_message = HumanMessage(
         content=feedback_content,
         name="human_interaction_feedback"
     )
     
-    state_updates = {
+    return {
         "messages": [feedback_message]
     }
-    
-    # Xử lý phê duyệt kế hoạch triển khai
-    if payload.get("type") == "propose_implementation_plan":
-        user_input_clean = str(user_input).strip().lower() if user_input else ""
-        # Đồng ý nếu nhập yes, ok, approve hoặc gửi phản hồi rỗng (bấm Approve trên UI)
-        if user_input_clean in ["", "yes", "approve", "ok"]:
-            proposed_tasks = payload.get("proposed_tasks", [])
-            refined_tasks = [Task(**t) for t in proposed_tasks]
-            
-            # CẬP NHẬT TRẠNG THÁI QUAN TRỌNG:
-            state_updates["plan"] = refined_tasks
-            state_updates["task_type"] = "development"  # 🌟 CHUYỂN PHA THÀNH CÔNG sang Development!
-            
-            state_updates["messages"] = [
-                AIMessage(content="✅ **[Hệ thống]**: Kế hoạch triển khai đã được phê duyệt. Đồ thị chính thức chuyển trạng thái sang pha DEVELOPMENT (Cấp quyền ghi file)."),
-                feedback_message
-            ]
-
-    return state_updates
 
 
 def tester_node(state: AgentState) -> Dict[str, Any]:

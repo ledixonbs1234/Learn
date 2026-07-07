@@ -7,61 +7,54 @@ from state import AgentState, Task
 def executor_router(state: AgentState) -> Literal["executor", "tool_node", "tester", "replanner", "synthesis"]:
     messages = state["messages"]
     plan = state.get("plan", [])
+    task_type = state.get("task_type", "development")
     
     if not messages:
         if state.get("is_simple"):
-            return "tester" if state.get("task_type") == "development" else "synthesis"
+            return "tester" if task_type == "development" else "synthesis"
         return "replanner"
           
     last_message = messages[-1]
     
-    # 1. Agent đang gọi công cụ
+    # 1. Agent đang gọi công cụ (ví dụ: đọc file, tìm kiếm)
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
         return "tool_node"
         
     # Check if the last message is a warning retry feedback
     if isinstance(last_message, HumanMessage) and "⚠️ Cảnh báo: Bạn chưa thực hiện chỉnh sửa" in str(last_message.content):
         return "executor"
-    has_pending_tasks = any(
-        (t.status if isinstance(t, Task) else t.get("status")) == "pending" 
-        for t in plan
-    )   
-    # 2. Agent báo cáo đã xong lượt chạy và có file bị sửa đổi ở pha Development
-    if state.get("task_type") == "development" and state.get("modified_files") and not has_pending_tasks:
-        return "tester"
-        
-    # 3. Tác vụ đơn giản không sửa code
-    if state.get("is_simple"):
-        return "synthesis"
-        
-    # =====================================================================
-    # 🌟 SỬA LỖI TẠI ĐÂY: PHÁT HIỆN CHUYỂN PHA TỪ SURVEY SANG DEVELOPMENT
-    # =====================================================================
-    # Kiểm tra xem có phải vừa hoàn thành duy nhất nhiệm vụ lính canh T_SURVEY hay không
+
+    # 2. XÁC ĐỊNH CHUYỂN PHA TỪ KHẢO SÁT SANG PHÁT TRIỂN (CỐT LÕI)
+    # Kiểm tra xem nhiệm vụ khảo sát lính canh T_SURVEY đã hoàn thành chưa
     is_survey_transition = (
         len(plan) == 1 and 
         (plan[0].id if isinstance(plan[0], Task) else plan[0].get("id")) == "T_SURVEY" and
         (plan[0].status if isinstance(plan[0], Task) else plan[0].get("status")) == "completed"
     )
     
-    if is_survey_transition:
-        # Bắt buộc rẽ nhánh sang nút 'replanner' để mô hình Kiến trúc sư đề xuất 
-        # danh sách các nhiệm vụ sửa code và viết test thực tế!
+    # Nếu T_SURVEY đã hoàn tất hoặc Executor ở pha analysis vừa dừng lại không gọi tool nữa
+    if is_survey_transition or (task_type == "analysis" and not (isinstance(last_message, AIMessage) and last_message.tool_calls)):
         return "replanner"
 
-    # 4. CHỐT CHẶN PHÒNG THỦ: Kiểm tra xem còn nhiệm vụ nào chưa thực hiện không
     has_pending_tasks = any(
         (t.status if isinstance(t, Task) else t.get("status")) == "pending" 
         for t in plan
-    )
-    
-    # Nếu thực sự tất cả các bước phát triển thực tế đã hoàn tất -> Kết thúc luồng
+    )   
+
+    # 3. Agent báo cáo đã xong lượt chạy và có file bị sửa đổi ở pha Development
+    if task_type == "development" and state.get("modified_files") and not has_pending_tasks:
+        return "tester"
+        
+    # 4. Tác vụ đơn giản không sửa code
+    if state.get("is_simple"):
+        return "synthesis"
+        
+    # 5. Nếu không còn nhiệm vụ tồn đọng -> Kết thúc
     if not has_pending_tasks:
         return "synthesis"
         
-    # 5. Nếu vẫn còn nhiệm vụ tồn đọng -> Tiếp tục lập kế hoạch điều phối
+    # 6. Nếu vẫn còn nhiệm vụ tồn đọng -> Chuyển tiếp tới replanner để cập nhật hoặc điều phối tiếp
     return "replanner"
-
 
 def tester_router(state: AgentState) -> Literal["executor", "chrome_extension_debugger", "replanner", "doubt_reviewer", "commit"]:
     """
@@ -136,14 +129,15 @@ def replanner_router(state: AgentState) -> Literal["executor", "synthesis"]:
 def tool_router(state: AgentState) -> Literal["executor", "human_interaction_gate"]:
     """
     Định tuyến sau khi chạy công cụ.
-    Nếu phát hiện tín hiệu hoãn ngắt 'requires_human_response', chuyển hướng sang Node Gate.
+    Chỉ chuyển sang human_interaction_gate nếu công cụ đặt câu hỏi 'ask_questions_if_underspecified' được kích hoạt.
     """
     messages = state["messages"]
     
     for msg in reversed(messages):
         if getattr(msg, "type", None) != "tool":
             break
-        if msg.name in ["ask_questions_if_underspecified", "propose_implementation_plan"]:
+        # Loại bỏ hoàn toàn propose_implementation_plan khỏi danh sách routing
+        if msg.name == "ask_questions_if_underspecified":
             try:
                 data = json.loads(msg.content)
                 if isinstance(data, dict) and data.get("status") == "requires_human_response":

@@ -142,6 +142,7 @@ class AgentState(TypedDict):
     active_skills: Dict[str, str]
     doubt_findings: str         # Lưu kết quả rà soát đối kháng
     doubt_attempts: int
+    recommended_skills: List[str]
 
 class WebInteractionState(TypedDict):
     workspace_path: str 

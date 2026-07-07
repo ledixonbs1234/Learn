@@ -8,18 +8,16 @@ import shutil
 import subprocess
 from pathlib import Path
 import tempfile
-from typing import Dict, Any, Optional,  Tuple, List, Union
-from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, Any, Optional,  Tuple, List
 from venv import logger
-from langgraph.errors import GraphInterrupt, GraphBubbleUp
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.types import interrupt
 from config import find_project_root_heuristic, model, sanitize_and_resolve_path, fast_model
 from mcp_helper import run_agent_with_devtools_mcp
 from skills_engine import AgentSkillsEngine
-from state import AgentState, PlanUpdate, RuntimeVerificationResult, TaskPlan, TaskTriage, Task
+from state import AgentState, PlanUpdate, RuntimeVerificationResult, TaskTriage, Task
 from tools import (
-    ActivateSkillTool, AskQuestionsTool, GitManager, ProposePlanTool, ReadFileLinesTool, RunSkillScriptTool, SearchKeywordTool, UniversalSymbolSearchTool, WebInteractAndTestTool, WorkspaceTools, 
+    ActivateSkillTool, AskQuestionsTool, GitManager, ReadFileLinesTool, RunSkillScriptTool, SearchKeywordTool, UniversalSymbolSearchTool, WebInteractAndTestTool, WorkspaceTools, 
     ReadFilesTool, WriteAndRunScriptTool, WriteFileTool, ApplyPatchTool, 
     ListDirectoryTool, RunTerminalTool, get_markdown_language
 )
@@ -463,18 +461,9 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
     # =====================================================================
     active_skills = state.get("active_skills", {}) or {}
     skills_log_msg = ""
-    
     if recommended_skills:
-        loaded_skills_list = []
-        for skill_name in recommended_skills:
-            # Đọc trực tiếp file Markdown của kỹ năng được khuyên dùng
-            body = skills_engine.load_skill_body(skill_name)
-            if body:
-                active_skills[skill_name] = body
-                loaded_skills_list.append(f"`{skill_name}`")
-        if loaded_skills_list:
-            skills_log_msg = f"- ⚡ **Kích hoạt chủ động kỹ năng:** {', '.join(loaded_skills_list)} (Nạp thẳng luật vào System Prompt)\n"
-
+        skills_log_msg = f"- 📋 **Kỹ năng đề xuất (sẽ nạp khi lập kế hoạch):** {', '.join([f'`{s}`' for s in recommended_skills])}\n"
+        
     # Thiết lập kế hoạch ban đầu dựa trên kết quả phân loại
     plan = []
     if is_simple:
@@ -487,17 +476,10 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
             )
         ]
     else:
-        # Nếu có kỹ năng đặc thù được kích hoạt, ghi rõ vào Plan để đảm bảo quy trình kỷ luật
-        plan_desc = "Khảo sát cấu trúc file và mã nguồn liên quan đến yêu cầu."
-        if "test-driven-development" in recommended_skills:
-            plan_desc = "Khảo sát mã nguồn, chuẩn bị viết unit test RED trước khi sửa đổi logic chính."
-        elif "spec-driven-development" in recommended_skills:
-            plan_desc = "Khảo sát và phác thảo tài liệu cấu hình SPEC.md trước khi viết code."
-            
         plan = [
             Task(
                 id="T_SURVEY",
-                description=f"{plan_desc} (Thư mục: `{final_workspace}`)",
+                description=f"Khảo sát cấu trúc file và mã nguồn tại `{final_workspace}` liên quan đến yêu cầu: {user_query_text} và thu thập dữ liệu để lập kế hoạch chi tiết về yêu cầu của người dùng.",
                 dependencies=[],
                 status="pending"
             )
@@ -536,7 +518,7 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         "last_executed_task_ids": [],
         "replanning_count": 0,
         "step_findings": ["__RESET__"],
-        "active_skills": active_skills  # 🌟 Trả về trạng thái kỹ năng đã được nạp sẵn!
+        "active_skills": {}  
     }
 
 def get_eligible_tasks(plan: List[Any]) -> List[Any]:
@@ -1200,7 +1182,24 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
     task_type = state.get("task_type", "development")
     workspace_context = state.get("workspace_context", "")
     error_logs = state.get("error_logs", "")
+    recommended_skills = state.get("recommended_skills", [])
+    active_skills = dict(state.get("active_skills", {}))
+    skills_engine = AgentSkillsEngine(ws)
+    loaded_skills_list = []
     
+    for skill_name in recommended_skills:
+        if skill_name not in active_skills:
+            body = skills_engine.load_skill_body(skill_name)
+            if body:
+                active_skills[skill_name] = body
+                loaded_skills_list.append(f"`{skill_name}`")
+                
+    # Xây dựng Prompt kỹ năng đang hoạt động dành riêng cho Planner
+    active_skills_prompt = ""
+    if active_skills:
+        active_skills_prompt = "\n=== ⚡ CÁC KỸ NĂNG ĐANG HOẠT ĐỘNG (INSTRUCTIONS) ===\n"
+        for s_name, s_instructions in active_skills.items():
+            active_skills_prompt += f"\n--- CHỈ DẪN KỸ NĂNG `{s_name}` ---\n{s_instructions}\n"
     # Xác định trạng thái chuyển tiếp từ khảo sát sang phát triển
     is_survey_transition = (
         len(plan) == 1 and 
@@ -1250,7 +1249,7 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
             "2. ĐỐI VỚI CÁC NHIỆM VỤ ĐÃ HOÀN THÀNH (status: 'completed'): Bắt buộc giữ nguyên ID, mô tả và trạng thái là 'completed'.\n"
             "3. Kế hoạch cập nhật của bạn chỉ tập trung hoàn toàn vào các bước thực thi khảo sát vật lý (analysis) hoặc sửa đổi mã nguồn (development)."
         )
-    
+    system_prompt += active_skills_prompt 
     if workspace_context:
         system_prompt += f"\n\n--- NGỮ CẢNH HỆ THỐNG (THONGTIN.md) ---\n{workspace_context}"
         
@@ -1280,7 +1279,7 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
                 name="replanner_proposal",
                 additional_kwargs={"proposal_payload": {"action": "bypass_no_error", "tasks": []}}
             )
-            return {"messages": [proposal_message]}
+            return {"messages": [proposal_message],"active_skills": active_skills }
 
         # Chuẩn hóa danh sách task
         refined_tasks = []
@@ -1315,7 +1314,8 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
     
     return {
         "replanning_count": replanning_count + 1,
-        "messages": [proposal_message]
+        "messages": [proposal_message],
+        "active_skills": active_skills 
     }
 
 
@@ -1511,7 +1511,6 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
     write_and_run_script = WriteAndRunScriptTool(workspace_path=ws)
     search_keyword_tool = SearchKeywordTool(workspace_path=ws)
     # 🌟 VÁ LỖI: Khởi tạo ProposePlanTool cho Node thực thi
-    propose_plan_tool = ProposePlanTool(workspace_path=ws)
     
     tools_map = {
         "read_files": read_files,
@@ -1526,8 +1525,6 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         "activate_agent_skill": ActivateSkillTool(workspace_path=ws),
         "run_skill_script": RunSkillScriptTool(workspace_path=ws),
         "write_and_run_script": write_and_run_script,
-        # 🌟 VÁ LỖI: Đăng ký tên định danh công cụ chính xác tương thích với mô hình
-        "propose_implementation_plan": propose_plan_tool,
         "search_keyword": search_keyword_tool,
     }
     

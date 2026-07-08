@@ -1375,6 +1375,7 @@ def replanner_interrupt_node(state: AgentState) -> Dict[str, Any]:
     # =====================================================================
     # Payload này sẽ được serialization thành JSON và gửi trực tiếp lên giao diện Client/Studio
     interrupt_payload = {
+        "type": "replanner_interrupt",
         "title": "📋 ĐÁNH GIÁ & PHÊ DUYỆT KẾ HOẠCH HÀNH ĐỘNG",
         "explanation": proposal_payload.get("explanation", "Hệ thống phát hiện cần thay đổi lộ trình để tiếp tục thực hiện."),
         "proposed_tasks": proposed_tasks,

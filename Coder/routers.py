@@ -4,7 +4,7 @@ from typing import Literal
 from langchain_core.messages import AIMessage, HumanMessage
 from state import AgentState, Task
 
-def executor_router(state: AgentState) -> Literal["executor", "tool_node", "tester", "replanner", "synthesis"]:
+def executor_router(state: AgentState) -> Literal["executor", "tool_node", "tester", "replanner", "synthesis", "context_compressor"]:
     messages = state["messages"]
     plan = state.get("plan", [])
     task_type = state.get("task_type", "development")
@@ -24,8 +24,10 @@ def executor_router(state: AgentState) -> Literal["executor", "tool_node", "test
     if isinstance(last_message, HumanMessage) and "⚠️ Cảnh báo: Bạn chưa thực hiện chỉnh sửa" in str(last_message.content):
         return "executor"
 
-    # 2. XÁC ĐỊNH CHUYỂN PHA TỪ KHẢO SÁT SANG PHÁT TRIỂN (CỐT LÕI)
-    # Kiểm tra xem nhiệm vụ khảo sát lính canh T_SURVEY đã hoàn thành chưa
+    # =====================================================================
+    # 2. CHỈNH SỬA TẠI ĐÂY: CHUYỂN PHA SANG ĐIỂM DỌN DẸP NGỮ CẢNH TRƯỚC KHI LẬP KẾ HOẠCH
+    # =====================================================================
+    # Kiểm tra xem nhiệm vụ khảo sát lính canh T_SURVEY đã hoàn thành chưa [1]
     is_survey_transition = (
         len(plan) == 1 and 
         (plan[0].id if isinstance(plan[0], Task) else plan[0].get("id")) == "T_SURVEY" and
@@ -34,7 +36,7 @@ def executor_router(state: AgentState) -> Literal["executor", "tool_node", "test
     
     # Nếu T_SURVEY đã hoàn tất hoặc Executor ở pha analysis vừa dừng lại không gọi tool nữa
     if is_survey_transition or (task_type == "analysis" and not (isinstance(last_message, AIMessage) and last_message.tool_calls)):
-        return "replanner"
+        return "context_compressor" # Thay vì chuyển thẳng tới "replanner", ta chuyển sang "context_compressor"
 
     has_pending_tasks = any(
         (t.status if isinstance(t, Task) else t.get("status")) == "pending" 

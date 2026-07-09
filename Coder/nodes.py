@@ -10,7 +10,7 @@ from pathlib import Path
 import tempfile
 from typing import Dict, Any, Optional,  Tuple, List
 from venv import logger
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langgraph.types import interrupt
 from config import find_project_root_heuristic, model, sanitize_and_resolve_path, fast_model
 from mcp_helper import run_agent_with_devtools_mcp
@@ -338,7 +338,8 @@ def triage_node_stateful(state: AgentState, catalog_summary: str) -> TaskTriage:
 def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
     """
     Nút phân loại và thiết lập môi trường hoạt động thông minh có kế thừa trạng thái.
-    Đã tích hợp tri thức thư viện kỹ năng chủ động để cấu hình Agent tối ưu ngay từ START.
+    CẢI TIẾN: Tự động nạp trước các kỹ năng Grilling & PRD ngay tại đầu nguồn (Triage)
+    và cấu hình động nhiệm vụ T_SURVEY để thực thi phỏng vấn trước khi lập kế hoạch.
     """
     messages = state["messages"]
     user_msg = messages[-1]
@@ -347,19 +348,16 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
     existing_workspace = state.get("workspace_path", ".")
 
     # =====================================================================
-    # BƯỚC 1: TRÍCH XUẤT ĐƯỜNG DẪN CÓ ĐỘ ƯU TIÊN VÀ HẠN CHẾ SAI SỐT (PRECEDENCE)
+    # BƯỚC 1: TRÍCH XUẤT ĐƯỜNG DẪN CO ĐỘ ƯU TIÊN (PRECEDENCE)
     # =====================================================================
     detected_path_str = extract_path_from_text(user_query_text)
-    
     if not detected_path_str:
         path_keywords = ["thư mục", "folder", "dự án", "project", "mở", "quét", "ls", "dir", "làm việc tại", "tại", "cd"]
-        has_path_intent = any(kw in user_query_text.lower() for kw in path_keywords)
-        
-        if has_path_intent or not existing_workspace:
+        if any(kw in user_query_text.lower() for kw in path_keywords) or not existing_workspace:
             detected_path_str = resolve_special_system_paths(user_query_text)
 
     # =====================================================================
-    # BƯỚC 2: XÁC ĐỊNH NGỮ CẢNH WORKSPACE TẠM THỜI (PROVISIONAL WORKSPACE)
+    # BƯỚC 2: XÁC ĐỊNH NGỮ CẢNH WORKSPACE TẠM THỜI
     # =====================================================================
     provisional_workspace = existing_workspace
     pivoted_msg = ""
@@ -369,13 +367,9 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
             resolved_path = Path(detected_path_str).expanduser().resolve()
             if resolved_path.exists():
                 provisional_workspace = str(find_project_root_heuristic(resolved_path))
-                
                 if provisional_workspace != existing_workspace and existing_workspace:
                     pivoted_msg = f"🔄 **[Chuyển đổi Workspace]**: Phát hiện yêu cầu chuyển đổi thư mục làm việc sang: `{provisional_workspace}`\n"
-                elif provisional_workspace == existing_workspace and existing_workspace:
-                    pivoted_msg = f"🔄 **[Kế thừa Workspace]**: Đường dẫn trùng khớp với thư mục hiện tại: `{existing_workspace}`\n"
-        except Exception:
-            pass
+        except Exception: pass
     else:
         if existing_workspace:
             pivoted_msg = f"🔄 **[Kế thừa Workspace]**: Sử dụng lại thư mục làm việc hiện hành: `{existing_workspace}`\n"
@@ -386,7 +380,6 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
     temp_state = state.copy()
     temp_state["workspace_path"] = provisional_workspace
     
-    # Khởi tạo Skills Engine dựa trên Workspace để quét danh mục kỹ năng hiện có
     skills_engine = AgentSkillsEngine(provisional_workspace)
     catalog = skills_engine.scan_catalog()
     
@@ -395,14 +388,12 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         catalog_summary = "\n=== 📚 DANH MỤC KỸ NĂNG HỆ THỐNG HIỆN CÓ ===\n"
         for item in catalog:
             catalog_summary += f"- Kỹ năng: `{item['name']}`\n  Điều kiện kích hoạt: {item['description']}\n"
-    else:
-        catalog_summary = "\n(Hệ thống hiện tại chưa nạp kỹ năng nào trong thư mục .skills/)\n"
 
     if provisional_workspace and provisional_workspace != existing_workspace:
         temp_ext = find_extension_dir_heuristic(Path(provisional_workspace))
         temp_state["extension_path"] = temp_ext or ""
 
-    # Gọi Triage Supervisor và truyền thêm tri thức về kỹ năng
+    # Gọi Triage Supervisor
     try:
         triage_output = triage_node_stateful(temp_state, catalog_summary)
         task_type = triage_output.task_type
@@ -415,11 +406,8 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         detailed_analysis = f"Lỗi hệ thống phân loại: {str(e)}"
         recommended_skills = []
 
-    # =====================================================================
-    # BƯỚC 4: RÀO CHẮN AN TOÀN & THIẾT LẬP WORKSPACE CHÍNH THỨC
-    # =====================================================================
+    # Rào chắn an toàn
     final_workspace = provisional_workspace
-
     if task_type == "clarify" or not final_workspace:
         interrupt_payload = {
             "type": "path_clarification",
@@ -447,52 +435,67 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
             final_workspace = "."
 
     is_user_explicit = (detected_path_str is not None)
-
     if not verify_workspace_safety(final_workspace, allow_explicit=is_user_explicit):
         return {
-            "plan": [],
-            "task_type": "analysis",
-            "is_simple": True,
-            "messages": [AIMessage(content="🚨 **[CẢNH BÁO BẢO MẬT]**: Workspace nằm trong thư mục Agent. Thao tác bị từ chối.")]
+            "plan": [], "task_type": "analysis", "is_simple": True,
+            "messages": [AIMessage(content="🚨 **[CẢNH BÁO BẢO MẬT]**: Workspace nằm trong thư mục Agent.")]
         }
 
     # =====================================================================
-    # BƯỚC 5: TỰ ĐỘNG KHỞI TẠO VÀ BOOTSTRAP KỸ NĂNG VÀO HOẠT ĐỘNG
+    # CẢI TIẾN 1: TỰ ĐỘNG NẠP TRƯỚC CÁC KỸ NĂNG PHỤC VỤ PHA KHẢO SÁT (BOOTSTRAPPING)
     # =====================================================================
-    active_skills = state.get("active_skills", {}) or {}
-    skills_log_msg = ""
-    if recommended_skills:
-        skills_log_msg = f"- 📋 **Kỹ năng đề xuất (sẽ nạp khi lập kế hoạch):** {', '.join([f'`{s}`' for s in recommended_skills])}\n"
-        
-    # Thiết lập kế hoạch ban đầu dựa trên kết quả phân loại
+# BƯỚC 4: TỰ ĐỘNG KHỞI TẠO VÀ NẠP ĐÓNG GÓI BỘ BA KỸ NĂNG (TRIAD BUNDLING)
+    # =====================================================================
+    active_skills = {}
+    skills_engine = AgentSkillsEngine(final_workspace)
+    
+    # Định nghĩa bộ ba kỹ năng nghiệp vụ bắt buộc đi cùng nhau
+    analysis_triad = ["grill-with-docs", "write-a-prd", "domain-modeling"]
+    
+    # Kiểm tra xem Supervisor có đề xuất bất kỳ kỹ năng nào trong bộ ba này không
+    requires_triad = any(skill in recommended_skills for skill in analysis_triad)
+    
+    if requires_triad:
+        # Tự động nạp toàn bộ bộ ba để Agent có đầy đủ quy trình và định dạng tệp tin
+        for skill_name in analysis_triad:
+            body = skills_engine.load_skill_body(skill_name)
+            if body:
+                active_skills[skill_name] = body
+                
+    # Nạp các kỹ năng kỹ thuật khác được đề xuất ngoài bộ ba trên
+    for skill_name in recommended_skills:
+        if skill_name not in active_skills:
+            body = skills_engine.load_skill_body(skill_name)
+            if body:
+                active_skills[skill_name] = body
+
+    # =====================================================================
+    # BƯỚC 5: THIẾT LẬP KẾ HOẠCH DỰA TRÊN KỸ NĂNG ĐỀ XUẤT (DYNAMIC TASK SPEC)
+    # =====================================================================
     plan = []
     if is_simple:
         plan = [
-            Task(
-                id="T1",
-                description=f"Thực hiện trực tiếp tác vụ tại `{final_workspace}`: {user_query_text}",
-                dependencies=[],
-                status="pending"
-            )
+            Task(id="T1", description=f"Thực hiện trực tiếp tác vụ tại `{final_workspace}`: {user_query_text}", dependencies=[], status="pending")
         ]
     else:
-        plan = [
-            Task(
-                id="T_SURVEY",
-                description=f"Khảo sát cấu trúc file và mã nguồn tại `{final_workspace}` liên quan đến yêu cầu: {user_query_text} và thu thập dữ liệu để lập kế hoạch chi tiết về yêu cầu của người dùng.",
-                dependencies=[],
-                status="pending"
+        # Nếu bộ ba Grilling được kích hoạt, ép buộc Agent phải hoàn tất phỏng vấn và sinh PRD trong pha khảo sát
+        if requires_triad:
+            survey_desc = (
+                f"Sử dụng kỹ năng `grill-with-docs` để thực hiện phiên phỏng vấn/chất vấn không khoan nhượng nhằm "
+                f"làm rõ yêu cầu về: {user_query_text}. Đồng thời cập nhật bảng thuật ngữ (`CONTEXT.md`) sử dụng kỹ năng `domain-modeling`, "
+                f"tạo các quyết định kiến trúc (ADRs) và đúc kết thành tệp `PRD.md` bằng skill `write-a-prd`."
             )
+        else:
+            survey_desc = f"Khảo sát cấu trúc file và mã nguồn tại `{final_workspace}` liên quan đến yêu cầu: {user_query_text} và thu thập dữ liệu để lập kế hoạch chi tiết."
+
+        plan = [
+            Task(id="T_SURVEY", description=survey_desc, dependencies=[], status="pending")
         ]
         task_type = "analysis"
 
-    safety_warning_msg = ""
-    if not verify_workspace_safety(final_workspace, allow_explicit=False) and is_user_explicit:
-        safety_warning_msg = (
-            "\n\n🚨 **[CẢNH BÁO AN TOÀN CHỦ ĐỘNG]**:\n"
-            "Hệ thống phát hiện bạn đang yêu cầu phân tích trực tiếp trên thư mục nguồn của Agent.\n"
-            "Chế độ vận hành đã được mở khóa theo yêu cầu của bạn. Vui lòng cẩn trọng khi phê duyệt..."
-        )
+    skills_log_msg = ""
+    if recommended_skills:
+        skills_log_msg = f"- 📋 **Kỹ năng đề xuất (Đã nạp sẵn cho pha khảo sát):** {', '.join([f'`{s}`' for s in recommended_skills])}\n"
 
     triage_info_msg = (
         f"📊 **[Hệ thống Phân phối thông minh]**:\n"
@@ -502,7 +505,6 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         f"- **Pha hoạt động khởi động:** `{task_type.upper()}`\n"
         f"{skills_log_msg}\n"
         f"🎯 **[Phân tích mục tiêu kỹ thuật]**:\n{detailed_analysis}"
-        f"{safety_warning_msg}"
     )
 
     return {
@@ -518,9 +520,9 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         "last_executed_task_ids": [],
         "replanning_count": 0,
         "step_findings": ["__RESET__"],
-        "active_skills": {}  
+        "active_skills": active_skills, # Đã có sẵn chỉ dẫn Grilling trong state!
+        "recommended_skills": recommended_skills
     }
-
 def get_eligible_tasks(plan: List[Any]) -> List[Any]:
     completed_ids = set()
     for t in plan:
@@ -918,7 +920,107 @@ def chrome_extension_debugger_node(state: AgentState) -> Dict[str, Any]:
         
     return ret_state
 
+# =====================================================================
+# THÊM NÚT DỌN DẸP NGỮ CẢNH (CONTEXT COMPRESSOR NODE) VÀO CUỐI FILE
+# =====================================================================
+def context_compressor_node(state: AgentState) -> Dict[str, Any]:
+    """
+    [NODE THU GỌN CONTEXT CÓ RÀO CHẮN AN TOÀN]
+    Chỉ thực hiện xóa tin nhắn (CGC) khi phiên Grilling thực sự diễn ra và thành công.
+    Nếu chỉ là khảo sát kỹ thuật thông thường (không grilling), nút này sẽ giữ nguyên
+    toàn bộ lịch sử tin nhắn thám thính và chuyển giao nguyên vẹn cho Planner.
+    """
+    messages = state.get("messages", [])
+    ws = state["workspace_path"]
+    active_skills = state.get("active_skills", {}) or {}
+    workspace_root = Path(ws).expanduser().resolve()
+    
+    # =====================================================================
+    # 1. KIỂM TRA ĐIỀU KIỆN KÍCH HOẠT THỰC TẾ (SAFE-GUARD CHECK)
+    # =====================================================================
+    # Kiểm tra xem Agent có thực sự gọi công cụ kích hoạt Grilling/PRD hay không
+    grilling_activated = "grill-with-docs" in active_skills or "write-a-prd" in active_skills
+    
+    # 2. ĐỒNG BỘ TOÀN BỘ TÀI LIỆU VẬT LÝ VÀO STATE
+    compiled_context_parts = []
+    
+    # Thử đọc PRD.md hoặc THONGTIN.md
+    prd_path = workspace_root / "PRD.md"
+    thongtin_path = workspace_root / "THONGTIN.md"
+    if prd_path.exists():
+        try:
+            compiled_context_parts.append(f"### [PRODUCT REQUIREMENTS DOCUMENT (PRD.md)]\n{prd_path.read_text(encoding='utf-8')}")
+        except Exception: pass
+    elif thongtin_path.exists():
+        try:
+            compiled_context_parts.append(f"### [THÔNG TIN DỰ ÁN (THONGTIN.md)]\n{thongtin_path.read_text(encoding='utf-8')}")
+        except Exception: pass
 
+    # Đọc CONTEXT.md (Glossary)
+    context_file_path = workspace_root / "CONTEXT.md"
+    if context_file_path.exists():
+        try:
+            compiled_context_parts.append(f"### [BẢNG THUẬT NGỮ NGHIỆP VỤ (CONTEXT.md)]\n{context_file_path.read_text(encoding='utf-8')}")
+        except Exception: pass
+
+    # Đọc danh sách các quyết định kiến trúc (ADRs)
+    adr_dir = workspace_root / "docs" / "adr"
+    if adr_dir.exists() and adr_dir.is_dir():
+        adr_texts = []
+        try:
+            for adr_file in sorted(adr_dir.glob("*.md")):
+                adr_texts.append(f"#### Tệp {adr_file.name}:\n{adr_file.read_text(encoding='utf-8')}")
+            if adr_texts:
+                compiled_context_parts.append("### [QUYẾT ĐỊNH KIẾN TRÚC (ARCHITECTURAL DECISIONS - ADRs)]\n" + "\n\n".join(adr_texts))
+        except Exception: pass
+
+    super_context = "\n\n---\n\n".join(compiled_context_parts)
+    if not super_context:
+        super_context = state.get("workspace_context", "")
+
+    # =====================================================================
+    # 3. ĐIỀU HƯỚNG BẢO VỆ CONTEXT (SAFE-GUARD RULE)
+    # =====================================================================
+    # Nếu không có grilling thực sự, HOẶC không có file PRD/Glossary vật lý nào được tạo ra:
+    # -> BỎ QUA VIỆC XÓA TIN NHẮN để tránh mất dữ liệu khảo sát thô.
+    if not grilling_activated or not (prd_path.exists() or context_file_path.exists()):
+        return {
+            "workspace_context": super_context
+            # Không trả về deletion_list, toàn bộ lịch sử tin nhắn được bảo toàn nguyên vẹn
+        }
+
+    # =====================================================================
+    # 4. THỰC HIỆN DỌN DẸP KHI ĐỦ ĐIỀU KIỆN (CHỈ KHI CÓ GRILLING THÀNH CÔNG)
+    # =====================================================================
+    if len(messages) <= 2:
+        return {"workspace_context": super_context}
+        
+    deletion_list = []
+    for msg in messages[1:]:
+        if msg.id:
+            deletion_list.append(RemoveMessage(id=msg.id)) # Đánh dấu xóa tin nhắn [2]
+            
+    clean_checkpoint_msg = AIMessage(
+        content=(
+            "🔄 **[Hệ thống dọn dẹp Ngữ cảnh & Đồng bộ Domain Model]**:\n"
+            "Phát hiện phiên đối thoại chất vấn nghiệp vụ (Grilling) đã diễn ra thành công.\n"
+            "Hệ thống đã dọn dẹp lịch sử tin nhắn thô để tiết kiệm token, giải phóng các kỹ năng "
+            "khảo sát (Garbage Collection) và đồng bộ hóa tài liệu "
+            "(PRD, CONTEXT.md, ADRs) vào bộ nhớ ngữ cảnh của Graph."
+        )
+    )
+    
+    # Thực hiện thu gom rác ngữ cảnh cho các kỹ năng đã hoàn thành nhiệm vụ
+    cleaned_active_skills = dict(active_skills)
+    discovery_triad = ["grill-with-docs", "write-a-prd", "domain-modeling"]
+    for skill_name in discovery_triad:
+        cleaned_active_skills.pop(skill_name, None)
+    
+    return {
+        "workspace_context": super_context,
+        "messages": deletion_list + [clean_checkpoint_msg],
+        "active_skills": cleaned_active_skills
+    }
 # THAY THẾ ĐOẠN CODE TRONG oder/nodes.py BẰNG ĐOẠN DƯỚI ĐÂY
 
 def executor_node(state: AgentState) -> Dict[str, Any]:
@@ -1040,14 +1142,17 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
     search_keyword_tool = SearchKeywordTool(workspace_path=ws)
 
     if task_type == "analysis":
-        # PHA KHẢO SÁT: Chỉ cho phép đọc và tìm kiếm thông tin.
+        # PHA KHẢO SÁT: Đọc hiểu mã nguồn, phỏng vấn nghiệp vụ và thiết lập tài liệu đặc tả (PRD, CONTEXT, ADRs)
         read_files = ReadFilesTool(workspace_path=ws)
         list_directory = ListDirectoryTool(workspace_path=ws)
         search_symbols = UniversalSymbolSearchTool(workspace_path=ws)
         read_file_lines = ReadFileLinesTool(workspace_path=ws)
         ask_questions_tool = AskQuestionsTool(workspace_path=ws)
         
-        # 🌟 VÁ LỖI: Loại bỏ hoàn toàn propose_plan_tool khỏi đây
+        # Cấp thêm quyền ghi tệp tin tài liệu nghiệp vụ
+        write_file = WriteFileTool(workspace_path=ws)
+        apply_patch = ApplyPatchTool(workspace_path=ws)
+        
         tools = [
             activate_skill_tool, 
             run_skill_script_tool, 
@@ -1056,18 +1161,23 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             search_symbols, 
             read_file_lines, 
             ask_questions_tool, 
-            search_keyword_tool
+            search_keyword_tool,
+            write_file,
+            apply_patch
         ]
         
         system_prompt = (
-            "Bạn là một chuyên gia điều tra, khảo sát mã nguồn và thu thập dữ liệu kỹ thuật (Active Discovery Engine).\n"
+            "Bạn là một chuyên gia khảo sát mã nguồn, phỏng vấn nghiệp vụ và thiết lập mô hình miền (Active Discovery & Glossary Engine).\n"
             f"Nhiệm vụ hiện tại:\n{tasks_str}\n"
             f"Thư mục làm việc: {ws}\n\n"
-            "⚠️ QUY TẮC ĐIỀU TRA TIẾT KIỆM TOKEN (BẮT BUỘC):\n"
-            "1. Nếu bạn cần tìm kiếm vị trí của một biến hoặc hàm, hãy ưu tiên dùng `search_keyword`.\n"
-            
-            "2. Khi đã xác định được tệp tin cần quan tâm, hãy dùng `read_file_lines` để đọc phân đoạn thay vì đọc cả file lớn.\n"
-            "3. Khi bạn đã hoàn thành việc khảo sát và nắm chắc cấu trúc, hãy kết thúc lượt bằng một văn bản tổng hợp kết quả điều tra và KHÔNG gọi thêm công cụ nào nữa. Hệ thống sẽ tự động chuyển tiếp tới pha lập kế hoạch."
+            "⚠️ QUY TẮC THIẾT LẬP TÀI LIỆU & KHẢO SÁT (BẮT BUỘC):\n"
+            "1. Bạn có quyền đọc mã nguồn và viết/cập nhật các tệp tài liệu đặc tả quan trọng như `CONTEXT.md`, các quyết định kiến trúc (ADRs) trong `docs/adr/`, và `PRD.md`.\n"
+            "   TUYỆT ĐỐI KHÔNG sửa đổi các tệp tin mã nguồn chạy thật (code) của ứng dụng trong pha khảo sát này.\n"
+            "2. Nếu bạn cần tìm kiếm vị trí của một biến hoặc hàm, hãy ưu tiên dùng `search_keyword`.\n"
+            "3. Khi đã xác định được tệp tin cần quan tâm, hãy dùng `read_file_lines` để đọc phân đoạn thay vì đọc cả file lớn.\n"
+            "4. Thúc đẩy tiến trình phỏng vấn không khoan nhượng (Grilling): hãy tiếp tục gọi `ask_questions_if_underspecified` nếu các "
+            "phương án kỹ thuật chưa được làm rõ tuyệt đối. Chỉ hoàn tất nhiệm vụ khảo sát khi đã ghi đầy đủ tài liệu đặc tả vật lý xuống đĩa.\n"
+            "5. Khi hoàn tất toàn bộ đặc tả tài liệu, kết thúc lượt bằng một văn bản tổng hợp kết quả điều tra (không gọi thêm công cụ). Hệ thống sẽ tự động chuyển tiếp tới pha lập kế hoạch."
         )
     else:
         read_files = ReadFilesTool(workspace_path=ws)

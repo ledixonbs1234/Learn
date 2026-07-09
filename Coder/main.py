@@ -22,7 +22,7 @@ builder.add_node("replanner_interrupt", nodes.replanner_interrupt_node)
 builder.add_node("tester", nodes.tester_node)
 builder.add_node("synthesis", nodes.synthesis_node)
 builder.add_node("commit", nodes.commit_node)
-
+builder.add_node("context_compressor", nodes.context_compressor_node)
 # 🌟 ĐĂNG KÝ CÁC NÚT THẨM ĐỊNH ĐỐI KHÁNG MỚI (DOUBT-DRIVEN WORKFLOW)
 builder.add_node("doubt_reviewer", nodes.doubt_reviewer_node)
 builder.add_node("doubt_gate", nodes.doubt_gate_node)
@@ -42,10 +42,11 @@ builder.add_conditional_edges(
         "tool_node": "tool_node",                  
         "tester": "tester",
         "replanner": "replanner",
-        "synthesis": "synthesis"
+        "synthesis": "synthesis",
+        "context_compressor": "context_compressor" 
     }
 )
-
+builder.add_edge("context_compressor", "replanner")
 # Cập nhật định tuyến từ Tool Node qua Gate tương tác trung gian
 builder.add_conditional_edges(
     "tool_node", 

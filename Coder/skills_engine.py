@@ -32,18 +32,30 @@ class AgentSkillsEngine:
         return catalog
 
     def load_skill_body(self, skill_name: str) -> Optional[str]:
-        """Tier 2: Đọc toàn bộ nội dung hướng dẫn sử dụng trong file SKILL.md."""
-        skill_md = self.skills_dir / skill_name / "SKILL.md"
+        """Tier 2: Đọc toàn bộ nội dung hướng dẫn sử dụng trong file SKILL.md và các tài liệu định dạng bổ sung."""
+        skill_dir = self.skills_dir / skill_name
+        skill_md = skill_dir / "SKILL.md"
         if not skill_md.exists():
             return None
         
         content = skill_md.read_text(encoding="utf-8")
-        # Giới hạn maxsplit=2 để chỉ cắt ở biên của YAML Frontmatter đầu file,
-        # bảo toàn các đường kẻ ngang "---" trong nội dung Markdown phía sau.
         parts = re.split(r'^---+\s*$', content, maxsplit=2, flags=re.MULTILINE)
-        if len(parts) >= 3:
-            return parts[2].strip()
-        return content.strip()
+        body = parts[2].strip() if len(parts) >= 3 else content.strip()
+        
+        # Tự động quét và bổ sung các file định dạng vệ tinh trong cùng thư mục (ví dụ: ADR-FORMAT.md, CONTEXT-FORMAT.md)
+        extra_docs = []
+        if skill_dir.exists():
+            for file_path in skill_dir.glob("*.md"):
+                if file_path.name != "SKILL.md":
+                    try:
+                        file_content = file_path.read_text(encoding="utf-8")
+                        extra_docs.append(f"\n\n### 📄 TIÊU CHUẨN ĐỊNH DẠNG BỔ SUNG: `{file_path.name}`\n{file_content}")
+                    except Exception:
+                        pass
+        if extra_docs:
+            body += "\n" + "\n".join(extra_docs)
+            
+        return body
 
     def get_script_path(self, skill_name: str, script_name: str) -> Optional[Path]:
         """Tier 3: Trả về đường dẫn tuyệt đối của script thực thi."""

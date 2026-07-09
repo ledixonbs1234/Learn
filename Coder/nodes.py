@@ -13,7 +13,7 @@ from venv import logger
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langgraph.types import interrupt
 from config import find_project_root_heuristic, model, sanitize_and_resolve_path, fast_model
-from mcp_helper import run_agent_with_devtools_mcp
+from mcp_helper import run_agent_with_devtools_mcp, run_agent_with_flutter_skill_mcp
 from skills_engine import AgentSkillsEngine
 from state import AgentState, PlanUpdate, RuntimeVerificationResult, TaskTriage, Task
 from tools import (
@@ -1427,7 +1427,54 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
         "messages": [proposal_message],
         "active_skills": active_skills 
     }
+def flutter_testing_node(state: AgentState) -> Dict[str, Any]:
+    """
+    [NODE MỚI] Thực hiện kiểm thử E2E tự động bằng AI thông qua flutter-skill MCP.
+    """
+    ws = state["workspace_path"]
+    pubspec_path = Path(ws) / "pubspec.yaml"
+    
+    # Rào chắn kiểm tra: Nếu không phải dự án Flutter hoặc Mobile liên quan, bỏ qua
+    if not pubspec_path.exists():
+        return {"messages": [AIMessage(content="Bỏ qua kiểm thử Flutter: Không tìm thấy pubspec.yaml trong thư mục gốc.")]}
 
+    user_query = (
+        "Hãy thực hiện kiểm tra giao diện ứng dụng. "
+        "Kết nối vào ứng dụng đang chạy, kiểm tra xem màn hình chính có hiển thị đầy đủ các thành phần "
+        "và thử thực hiện một kịch bản nhấn thử vào các nút chức năng chính để đảm bảo không bị lỗi."
+    )
+    
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    if loop.is_running():
+        import nest_asyncio
+        nest_asyncio.apply()
+        
+    # Gọi MCP Server để tương tác trực tiếp với ứng dụng Flutter
+    test_output = loop.run_until_complete(
+        run_agent_with_flutter_skill_mcp(
+            model=model,
+            prompt_message=user_query,
+            chat_history=list(state.get("messages", [])),
+            workspace_path=ws
+        )
+    )
+    
+    # Phân tích kết quả chạy test
+    has_error = "lỗi" in test_output.lower() or "failed" in test_output.lower()
+    
+    ret_state = {
+        "messages": [AIMessage(content=f"📋 **[Kết quả kiểm thử tự động với Flutter-Skill]**:\n\n{test_output}")]
+    }
+    
+    if has_error:
+        ret_state["error_logs"] = f"❌ [Lỗi E2E Flutter UI]: Phát hiện bất thường trong quá trình tương tác ứng dụng.\nChi tiết: {test_output}"
+        
+    return ret_state
 
 def replanner_interrupt_node(state: AgentState) -> Dict[str, Any]:
     """

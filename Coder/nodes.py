@@ -485,28 +485,14 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
     # =====================================================================
 # BƯỚC 4: TỰ ĐỘNG KHỞI TẠO VÀ NẠP ĐÓNG GÓI BỘ BA KỸ NĂNG (TRIAD BUNDLING)
     # =====================================================================
-    active_skills = {}
-    skills_engine = AgentSkillsEngine(final_workspace)
-    
-    # Định nghĩa bộ ba kỹ năng nghiệp vụ bắt buộc đi cùng nhau
+    active_skills = {} 
+    # Không tự động nạp trước (Bootstrapping) bất kỳ kỹ năng nào ở đầu nguồn.
+    # Hệ thống tuân thủ mô hình nạp khi cần (On-Demand) - Kỹ năng chỉ được nạp 
+    # khi Agent chủ động phát ra hành động Tool Call 'activate_agent_skill'.
+
+    # Kiểm tra xem yêu cầu nạp bộ ba kỹ năng phân tích nghiệp vụ có được khuyến nghị không
     analysis_triad = ["grill-with-docs", "write-a-prd", "domain-modeling"]
-    
-    # Kiểm tra xem Supervisor có đề xuất bất kỳ kỹ năng nào trong bộ ba này không
     requires_triad = any(skill in recommended_skills for skill in analysis_triad)
-    
-    if requires_triad:
-        # Tự động nạp toàn bộ bộ ba để Agent có đầy đủ quy trình và định dạng tệp tin
-        for skill_name in analysis_triad:
-            body = skills_engine.load_skill_body(skill_name)
-            if body:
-                active_skills[skill_name] = body
-                
-    # Nạp các kỹ năng kỹ thuật khác được đề xuất ngoài bộ ba trên
-    for skill_name in recommended_skills:
-        if skill_name not in active_skills:
-            body = skills_engine.load_skill_body(skill_name)
-            if body:
-                active_skills[skill_name] = body
 
     # =====================================================================
     # BƯỚC 5: THIẾT LẬP KẾ HOẠCH DỰA TRÊN KỸ NĂNG ĐỀ XUẤT (DYNAMIC TASK SPEC)
@@ -517,12 +503,13 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
             Task(id="T1", description=f"Thực hiện trực tiếp tác vụ tại `{final_workspace}`: {user_query_text}", dependencies=[], status="pending")
         ]
     else:
-        # Nếu bộ ba Grilling được kích hoạt, ép buộc Agent phải hoàn tất phỏng vấn và sinh PRD trong pha khảo sát
+        # Nếu bộ ba khảo sát được đề xuất, ép buộc Agent phải chạy quy trình JIT để kích hoạt các kỹ năng này trong lộ trình
         if requires_triad:
             survey_desc = (
-                f"Sử dụng kỹ năng `grill-with-docs` để thực hiện phiên phỏng vấn/chất vấn không khoan nhượng nhằm "
-                f"làm rõ yêu cầu về: {user_query_text}. Đồng thời cập nhật bảng thuật ngữ (`CONTEXT.md`) sử dụng kỹ năng `domain-modeling`, "
-                f"tạo các quyết định kiến trúc (ADRs) và đúc kết thành tệp `PRD.md` bằng skill `write-a-prd`."
+                f"Bắt đầu pha khảo sát. Bạn hãy gọi công cụ `activate_agent_skill` để kích hoạt tuần tự và "
+                f"thực thi các kỹ năng `grill-with-docs` (chất vấn làm rõ yêu cầu về: {user_query_text}), "
+                f"`domain-modeling` (đồng bộ bảng thuật ngữ vào `CONTEXT.md`), "
+                f"và `write-a-prd` (thiết lập tệp đặc tả `PRD.md`)."
             )
         else:
             survey_desc = f"Khảo sát cấu trúc file và mã nguồn tại `{final_workspace}` liên quan đến yêu cầu: {user_query_text} và thu thập dữ liệu để lập kế hoạch chi tiết."
@@ -1240,6 +1227,12 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             "Bạn là một chuyên gia khảo sát mã nguồn, phỏng vấn nghiệp vụ và thiết lập mô hình miền (Active Discovery & Glossary Engine).\n"
             f"Nhiệm vụ hiện tại:\n{tasks_str}\n"
             f"Thư mục làm việc: {ws}\n\n"
+            "⚠️ QUY TẮC KÍCH HOẠT & TUÂN THỦ KỸ NĂNG (BẮT BUỘC):\n"
+            "1. Trước khi thực hiện một hành động chuyên biệt có kỹ năng tương ứng trong danh sách '=== THƯ VIỆN KỸ NĂNG KHẢ DỤNG (TIER 1) ===' "
+            "mà chưa được kích hoạt, bạn BẮT BUỘC phải gọi công cụ `activate_agent_skill` để nạp hướng dẫn kỹ năng đó.\n"
+            "2. Khi kỹ năng đã được kích hoạt (hiển thị tại '=== ⚡ CÁC KỸ NĂNG ĐANG HOẠT ĐỘNG (TIER 2) ==='), bạn BẮT BUỘC phải tuân thủ tuyệt đối "
+            "tất cả cấu trúc, quy trình làm việc và định dạng tệp tin được ghi rõ trong chỉ dẫn của kỹ năng đó. Tuyệt đối không tự suy diễn cấu trúc.\n"
+            "3. Nếu kỹ năng chứa các kịch bản chạy bổ trợ (scripts), hãy sử dụng công cụ `run_skill_script` để chạy thay vì viết lại mã thô.\n\n"
             "⚠️ QUY TẮC THIẾT LẬP TÀI LIỆU & KHẢO SÁT (BẮT BUỘC):\n"
             "1. Bạn có quyền đọc mã nguồn và viết/cập nhật các tệp tài liệu đặc tả quan trọng như `CONTEXT.md`, các quyết định kiến trúc (ADRs) trong `docs/adr/`, và `PRD.md`.\n"
             "   TUYỆT ĐỐI KHÔNG sửa đổi các tệp tin mã nguồn chạy thật (code) của ứng dụng trong pha khảo sát này.\n"
@@ -1271,6 +1264,12 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             "Bạn là kỹ sư phần mềm thực thi chuyên nghiệp (Write-Access Mode).\n"
             f"Nhiệm vụ phát triển:\n{tasks_str}\n"
             f"Thư mục làm việc: {ws}\n\n"
+            "⚠️ QUY TẮC KÍCH HOẠT & TUÂN THỦ KỸ NĂNG (BẮT BUỘC):\n"
+            "1. Trước khi thực hiện viết code, sửa lỗi, hoặc viết test, hãy rà soát danh sách '=== THƯ VIỆN KỸ NĂNG KHẢ DỤNG (TIER 1) ==='. "
+            "Nếu có kỹ năng hỗ trợ phù hợp (ví dụ: 'test-driven-development'), bạn BẮT BUỘC phải gọi công cụ `activate_agent_skill` để tải chỉ dẫn sâu.\n"
+            "2. Khi thực thi các tác vụ thuộc kỹ năng đã kích hoạt (hiển thị tại '=== ⚡ CÁC KỸ NĂNG ĐANG HOẠT ĐỘNG (TIER 2) ==='), bạn "
+            "phải tuân thủ 100% các tiêu chuẩn kỹ thuật đề ra trong tài liệu của kỹ năng đó.\n"
+            "3. Ưu tiên chạy các script chuyên dụng của kỹ năng bằng `run_skill_script` thay vì tự gõ lệnh terminal thủ công nếu hệ thống có sẵn.\n\n"
             "⚠️ HƯỚNG DẪN TIẾT KIỆM TOKEN:\n"
             "Ưu tiên sử dụng `apply_search_replace_patch` thay vì ghi đè lại toàn bộ tệp tin lớn bằng `write_file`.\n"
         )
@@ -1367,19 +1366,11 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
     task_type = state.get("task_type", "development")
     workspace_context = state.get("workspace_context", "")
     error_logs = state.get("error_logs", "")
-    recommended_skills = state.get("recommended_skills", [])
     active_skills = dict(state.get("active_skills", {}))
-    skills_engine = AgentSkillsEngine(ws)
-    loaded_skills_list = []
     
-    for skill_name in recommended_skills:
-        if skill_name not in active_skills:
-            body = skills_engine.load_skill_body(skill_name)
-            if body:
-                active_skills[skill_name] = body
-                loaded_skills_list.append(f"`{skill_name}`")
-                
-    # Xây dựng Prompt kỹ năng đang hoạt động dành riêng cho Planner
+    # Tuân thủ mô hình Just-In-Time (JIT) - Replanner không tự động tải body của kỹ năng vào active_skills.
+    # Trạng thái active_skills chỉ phản ánh các kỹ năng đã được nạp qua công cụ thực thi của Executor.
+    # Replanner chỉ đọc danh mục kỹ năng (Tier 1 Catalog) để đưa ra đề xuất điều phối lộ trình.
     active_skills_prompt = ""
     if active_skills:
         active_skills_prompt = "\n=== ⚡ CÁC KỸ NĂNG ĐANG HOẠT ĐỘNG (INSTRUCTIONS) ===\n"
@@ -1415,7 +1406,12 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
             "Bạn là một Kiến trúc sư kiêm Điều phối viên dự án phần mềm cấp cao.\n"
             f"Nhiệm vụ: Dựa trên dữ liệu khảo sát và thám thính dự án vừa qua tại '{ws}' (ở các tin nhắn trước), "
             "hãy thiết kế một lộ trình hành động (DAG updated_tasks) hoàn chỉnh để giải quyết trọn vẹn yêu cầu của người dùng.\n\n"
-            "⚠️ QUY TẮC THIẾT KẾ KẾ HOẠCH PHÁT TRIỂN & KIỂM THỬ (BẮT BUỘC):\n"
+            "⚠️ QUY TẮC PHÂN PHỐI KỸ NĂNG VÀO LỘ TRÌNH (BẮT BUỘC):\n"
+            "1. Hãy đối chiếu yêu cầu của lộ trình với danh mục kỹ năng hiện có trong hệ thống.\n"
+            "2. Nếu một nhiệm vụ đòi hỏi quy trình kỹ thuật đặc thù (ví dụ: phát triển kèm viết test, thao tác Excel, cấu hình PRD), "
+            "bạn BẮT BUỘC phải ghi rõ yêu cầu kích hoạt kỹ năng tương ứng vào mô tả nhiệm vụ (Task Description).\n"
+            "   (Ví dụ: '...Bắt buộc gọi công cụ activate_agent_skill để kích hoạt kỹ năng test-driven-development trước khi tiến hành viết code...')\n\n"
+            "⚠️ QUY TẮC THIẾT LẬP KẾ HOẠCH PHÁT TRIỂN & KIỂM THỬ (BẮT BUỘC):\n"
             "1. Đặt `should_modify_plan` là True để áp dụng kế hoạch mới.\n"
             "2. Giữ nguyên nhiệm vụ 'T_SURVEY' với trạng thái là 'completed'.\n"
             "3. Bổ sung các nhiệm vụ mới (ví dụ: T1, T2...) mô tả chính xác các file cần xem, các file cần sửa dựa trên dữ liệu thật thu được từ pha khảo sát.\n"
@@ -1429,6 +1425,9 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
             f"Nhiệm vụ: Đánh giá tiến trình thực thi kế hoạch tại thư mục làm việc '{ws}'.\n\n"
             "Hệ thống vừa phát hiện lỗi nghiêm trọng không thể tự gỡ lỗi ở cấp độ cục bộ.\n"
             "Hãy đề xuất một kế hoạch điều chỉnh (được cập nhật trong updated_tasks) để giải quyết triệt để lỗi này.\n\n"
+            "⚠️ QUY TẮC PHÂN PHỐI KỸ NĂNG VÀO LỘ TRÌNH (BẮT BUỘC):\n"
+            "- Nếu phát hiện lỗi có liên quan đến việc vận hành lệch chuẩn quy trình của một kỹ năng, hãy thêm một nhiệm vụ cụ thể "
+            "yêu cầu Executor kích hoạt kỹ năng đó bằng `activate_agent_skill` để rà soát và cấu trúc lại mã nguồn theo chuẩn.\n\n"
             "⚠️ QUY TẮC CẬP NHẬT KẾ HOẠCH CHO PRODUCTION (BẮT BUỘC):\n"
             "1. Đặt `should_modify_plan` là True và cập nhật danh sách nhiệm vụ trong `updated_tasks` để giải quyết vấn đề.\n"
             "2. ĐỐI VỚI CÁC NHIỆM VỤ ĐÃ HOÀN THÀNH (status: 'completed'): Bắt buộc giữ nguyên ID, mô tả và trạng thái là 'completed'.\n"
@@ -1727,6 +1726,12 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         tool_args = tool_call["args"] or {}
         tool_id = tool_call["id"]
         
+        if tool_name == "complete_agent_task":
+            t_id = tool_args.get("task_id")
+            if t_id:
+                completed_task_ids.append(t_id)
+        
+        
         if tool_name in ["write_file", "apply_search_replace_patch", "read_files"]:
             raw_path = tool_args.get("file_path") or tool_args.get("file_paths")
             if raw_path:
@@ -1734,6 +1739,8 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
                     impacted_files.update(raw_path)
                 else:
                     impacted_files.add(str(raw_path))
+        
+        
         
         tool_instance = tools_map.get(tool_name)
         if not tool_instance:

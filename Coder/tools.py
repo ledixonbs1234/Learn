@@ -1087,7 +1087,7 @@ class WorkspaceTools:
         except Exception as e:
             return f"Lỗi liệt kê thư mục: {str(e)}"
 
-    def run_terminal(self, command: str, timeout: int = 60) -> str:
+    def run_terminal(self, command: str, timeout: int = 120) -> str:
         try:
             # 1. Tạo môi trường độc lập, ép buộc Python xuất I/O theo chuẩn UTF-8
             env_copy = os.environ.copy()

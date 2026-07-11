@@ -952,11 +952,10 @@ def context_compressor_node(state: AgentState) -> Dict[str, Any]:
     """
     [NODE THU GỌN CONTEXT CHỌN LỌC - SELECTIVE MEMORY GC]
     Thực hiện dọn dẹp thông minh:
-    - Bảo vệ toàn bộ ý kiến/nội dung của người dùng (HumanMessage).
-    - Bảo vệ tin nhắn phân loại chiến lược của detect_and_triage_node.
-    - Bảo vệ bản tổng hợp khảo sát cuối cùng của executor_node.
-    - Đồng bộ hóa các tài liệu vật lý (PRD, CONTEXT, ADRs) vào workspace_context.
-    - Xóa bỏ toàn bộ tin nhắn công cụ (ToolMessages) và tin nhắn gọi công cụ trung gian để tiết kiệm token.
+    - Trích xuất tóm tắt tiến trình vận hành để lưu tạm thời vào AgentState (RAM).
+    - Bảo vệ toàn bộ ý kiến thảo luận gốc của người dùng (HumanMessage).
+    - Xóa bỏ toàn bộ tin nhắn công cụ (ToolMessages) thô để tối ưu hóa bộ nhớ token.
+    - Trộn động tài liệu vật lý thuần khiết và nhật ký lịch sử tạm thời thành workspace_context.
     """
     messages = state.get("messages", [])
     ws = state["workspace_path"]
@@ -964,47 +963,27 @@ def context_compressor_node(state: AgentState) -> Dict[str, Any]:
     workspace_root = Path(ws).expanduser().resolve()
     
     # =====================================================================
-    # 1. ĐỒNG BỘ TOÀN BỘ TÀI LIỆU VẬT LÝ VÀO STATE
+    # 1. TRÍCH XUẤT TÓM TẮT TỪ CUỘC GỌI HOÀN THÀNH TASK GẦN NHẤT
     # =====================================================================
-    compiled_context_parts = []
-    
-    # Đọc PRD.md
-    prd_path = workspace_root / "PRD.md"
-    if prd_path.exists():
-        try:
-            compiled_context_parts.append(f"### [PRODUCT REQUIREMENTS DOCUMENT (PRD.md)]\n{prd_path.read_text(encoding='utf-8')}")
-        except Exception:
-            pass
+    latest_task_summary = ""
+    task_id = ""
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                if tc["name"] == "complete_agent_task":
+                    latest_task_summary = tc["args"].get("summary", "")
+                    task_id = tc["args"].get("task_id", "")
+                    break
+            if latest_task_summary:
+                break
 
-    # Đọc CONTEXT.md (Ngữ cảnh dự án & Thuật ngữ)
-    context_file_path = workspace_root / "CONTEXT.md"
-    if context_file_path.exists():
-        try:
-            compiled_context_parts.append(f"### [NGỮ CẢNH DỰ ÁN & THUẬT NGỮ (CONTEXT.md)]\n{context_file_path.read_text(encoding='utf-8')}")
-        except Exception:
-            pass
-
-    # Đọc danh sách các quyết định kiến trúc (ADRs)
-    adr_dir = workspace_root / "docs" / "adr"
-    if adr_dir.exists() and adr_dir.is_dir():
-        adr_texts = []
-        try:
-            for adr_file in sorted(adr_dir.glob("*.md")):
-                adr_texts.append(f"#### Tệp {adr_file.name}:\n{adr_file.read_text(encoding='utf-8')}")
-            if adr_texts:
-                compiled_context_parts.append("### [QUYẾT ĐỊNH KIẾN TRÚC (ARCHITECTURAL DECISIONS - ADRs)]\n" + "\n\n".join(adr_texts))
-        except Exception:
-            pass
-
-    super_context = "\n\n---\n\n".join(compiled_context_parts)
-    if not super_context:
-        super_context = state.get("workspace_context", "")
+    new_summaries = []
+    if latest_task_summary:
+        new_summaries.append(f"Task {task_id}: {latest_task_summary}")
 
     # =====================================================================
-    # 2. XÁC ĐỊNH DANH SÁCH TIN NHẮN CẦN GIỮ LẠI (SELECTIVE KEEP LIST)
+    # 2. LẬP DANH SÁCH DỌN DẸP TIN NHẮN RÁC (SELECTIVE MEMORY GC)
     # =====================================================================
-    
-    # A. Nhận diện tin nhắn của detect_and_triage_node bằng cách quét từ khóa đặc trưng
     triage_msg_id = None
     for msg in messages:
         if msg.type == "ai" or isinstance(msg, AIMessage):
@@ -1013,33 +992,65 @@ def context_compressor_node(state: AgentState) -> Dict[str, Any]:
                 triage_msg_id = msg.id
                 break
                 
-    # B. Nhận diện tin nhắn tổng hợp cuối cùng từ executor node pha khảo sát.
-    # Do Node Compressor chạy ngay sau khi Executor kết thúc pha khảo sát mà không gọi thêm công cụ,
-    # nên tin nhắn cuối cùng trong danh sách (messages[-1]) chính là bản báo cáo tổng hợp này.
     final_summary_id = None
     if messages:
         last_msg = messages[-1]
-        # Đảm bảo đây là tin nhắn AI và không phải là một lượt gọi công cụ đang dở dang
         if (last_msg.type == "ai" or isinstance(last_msg, AIMessage)) and not getattr(last_msg, "tool_calls", None):
             final_summary_id = last_msg.id
 
-    # C. Lập danh sách xóa chọn lọc (Chỉ xóa Scaffolding, bảo tồn Milestones)
     deletion_list = []
+    has_kept_root_user_msg = False
+    
     for msg in messages:
-        # Bỏ qua nếu tin nhắn không có ID (không thể gửi RemoveMessage)
         if not msg.id:
             continue
             
         is_human = (msg.type == "human" or isinstance(msg, HumanMessage))
+        
+        # Luôn bảo vệ tin nhắn yêu cầu gốc của người dùng
+        if is_human and not has_kept_root_user_msg:
+            has_kept_root_user_msg = True
+            continue
+            
         is_triage = (msg.id == triage_msg_id)
         is_final_summary = (msg.id == final_summary_id)
         
-        # Nếu không thuộc diện cần giữ lại -> Đưa vào danh sách dọn dẹp
+        # Xóa toàn bộ tin nhắn gọi công cụ trung gian và ToolMessage rác
         if not (is_human or is_triage or is_final_summary):
             deletion_list.append(RemoveMessage(id=msg.id))
 
     # =====================================================================
-    # 3. THU GOM RÁC CÁC KỸ NĂNG VÀ THIẾT LẬP CHECKPOINT
+    # 3. TRỘN ĐỘNG CONTEXT VẬT LÝ VÀ NHẬT KÝ TẠM THỜI (DYNAMIC MERGING)
+    # =====================================================================
+    compiled_context_parts = []
+    
+    # A. Nạp tài liệu PRD.md thuần khiết từ đĩa
+    prd_path = workspace_root / "PRD.md"
+    if prd_path.exists():
+        try:
+            compiled_context_parts.append(f"### [YÊU CẦU SẢN PHẨM (PRD.md)]\n{prd_path.read_text(encoding='utf-8')}")
+        except Exception:
+            pass
+
+    # B. Nạp tài liệu kiến trúc CONTEXT.md thuần khiết từ đĩa (KHÔNG bị ô nhiễm lịch sử)
+    context_file_path = workspace_root / "CONTEXT.md"
+    if context_file_path.exists():
+        try:
+            compiled_context_parts.append(f"### [KIẾN TRÚC HỆ THỐNG & THUẬT NGỮ (CONTEXT.md)]\n{context_file_path.read_text(encoding='utf-8')}")
+        except Exception:
+            pass
+
+    # C. Trộn lịch sử các task đã hoàn thành từ bộ đệm của State Graph [1]
+    historical_summaries = state.get("completed_task_summaries", []) + new_summaries
+    if historical_summaries:
+        history_block = "### [LỊCH SỬ THỰC THI PHIÊN CHẠY (BỘ NHỚ TẠM THỜI IN-MEMORY)]\n"
+        history_block += "\n".join([f"- {s}" for s in historical_summaries])
+        compiled_context_parts.append(history_block)
+
+    super_context = "\n\n---\n\n".join(compiled_context_parts)
+
+    # =====================================================================
+    # 4. THU GỌN KỸ NĂNG VÀ TRẢ VỀ TRẠNG THÁI
     # =====================================================================
     cleaned_active_skills = dict(active_skills)
     discovery_triad = ["grill-with-docs", "write-a-prd", "domain-modeling"]
@@ -1048,21 +1059,18 @@ def context_compressor_node(state: AgentState) -> Dict[str, Any]:
     
     clean_checkpoint_msg = AIMessage(
         content=(
-            "🔄 **[Hệ thống dọn dẹp Ngữ cảnh & Đồng bộ Domain Model]**:\n"
-            "Phát hiện kết thúc pha khảo sát chủ động thành công.\n"
-            "Hệ thống đã dọn dẹp chọn lọc toàn bộ nhật ký gọi công cụ (Tool Logs GC) "
-            "nhưng vẫn bảo vệ nguyên vẹn các mốc tri thức quan trọng gồm:\n"
-            "- Toàn bộ ý kiến thảo luận của bạn.\n"
-            "- Bản phân tích phân phối thông minh từ triage node.\n"
-            "- Văn bản tổng hợp kết quả điều tra cuối cùng của Executor.\n"
-            "Bộ nhớ ngữ cảnh đã được tối ưu hóa thành công để bàn giao cho pha lập kế hoạch."
+            f"🔄 **[Hệ thống nén ngữ cảnh]**:\n"
+            f"- Đã lưu tóm tắt nhiệm vụ `{task_id or 'N/A'}` vào bộ đệm trạng thái tạm thời.\n"
+            f"- Đã thu gọn và giải phóng thành công lịch sử tin nhắn rác khỏi bộ nhớ RAM.\n"
+            f"- Tệp cấu hình vật lý `CONTEXT.md` được bảo vệ hoàn toàn sạch sẽ."
         )
     )
     
     return {
         "workspace_context": super_context,
         "messages": deletion_list + [clean_checkpoint_msg],
-        "active_skills": cleaned_active_skills
+        "active_skills": cleaned_active_skills,
+        "completed_task_summaries": new_summaries  # Bộ rút gọn (Reducer) tự động cộng dồn [1]
     }
 # THAY THẾ ĐOẠN CODE TRONG oder/nodes.py BẰNG ĐOẠN DƯỚI ĐÂY
 
@@ -1239,8 +1247,14 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             "2. Nếu bạn cần tìm kiếm vị trí của một biến hoặc hàm, hãy ưu tiên dùng `search_keyword`.\n"
             "3. Khi đã xác định được tệp tin cần quan tâm, hãy dùng `read_file_lines` để đọc phân đoạn thay vì đọc cả file lớn.\n"
             "4. Thúc đẩy tiến trình phỏng vấn không khoan nhượng (Grilling): hãy tiếp tục gọi `ask_questions_if_underspecified` nếu các "
-            "phương án kỹ thuật chưa được làm rõ tuyệt đối. Chỉ hoàn tất nhiệm vụ khảo sát khi đã ghi đầy đủ tài liệu đặc tả vật lý xuống đĩa.\n"
-            "5. Khi hoàn tất toàn bộ đặc tả tài liệu, kết thúc lượt bằng một văn bản tổng hợp kết quả điều tra (không gọi thêm công cụ). Hệ thống sẽ tự động chuyển tiếp tới pha lập kế hoạch."
+            "phương án kỹ thuật chưa được làm rõ tuyệt đối. Chỉ hoàn tất nhiệm vụ khảo sát khi đã ghi đầy đủ tài liệu đặc tả vật lý xuống đĩa.\n\n"
+            "⚠️ QUY TẮC BẮT BUỘC KHI HOÀN TẤT NHIỆM VỤ KHẢO SÁT:\n"
+            "Do toàn bộ nhật ký gọi công cụ thô sẽ bị dọn dẹp khỏi RAM ngay sau khi nhiệm vụ kết thúc để tiết kiệm token [1], "
+            "bản tóm tắt (summary) của bạn khi gọi công cụ `complete_agent_task` BẮT BUỘC phải chứa đầy đủ thông tin khảo sát súc tích theo cấu trúc:\n"
+            "- [Cấu trúc thư mục mới]: Liệt kê các thư mục, tệp tin cấu hình quan trọng đã phát hiện.\n"
+            "- [Phát hiện Kỹ thuật chính]: Chỉ rõ file, class, hàm nào đóng vai trò cốt lõi cho tính năng cần xây dựng.\n"
+            "- [Kết quả Phỏng vấn & Đặc tả]: Tóm tắt các quyết định nghiệp vụ then chốt đã đồng thuận với người dùng.\n"
+            "- [Đường dẫn Tài liệu]: Xác nhận các tệp PRD.md, CONTEXT.md đã được tạo/cập nhật đầy đủ thông tin tương ứng ở đâu."
         )
     else:
         read_files = ReadFilesTool(workspace_path=ws)
@@ -1271,7 +1285,18 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             "phải tuân thủ 100% các tiêu chuẩn kỹ thuật đề ra trong tài liệu của kỹ năng đó.\n"
             "3. Ưu tiên chạy các script chuyên dụng của kỹ năng bằng `run_skill_script` thay vì tự gõ lệnh terminal thủ công nếu hệ thống có sẵn.\n\n"
             "⚠️ HƯỚNG DẪN TIẾT KIỆM TOKEN:\n"
-            "Ưu tiên sử dụng `apply_search_replace_patch` thay vì ghi đè lại toàn bộ tệp tin lớn bằng `write_file`.\n"
+            "Ưu tiên sử dụng `apply_search_replace_patch` thay vì ghi đè lại toàn bộ tệp tin lớn bằng `write_file`.\n\n"
+            "⚠️ QUY TẮC BẮT BUỘC KHI GỌI CÔNG CỤ complete_agent_task (BẢO VỆ NGỮ CẢNH):\n"
+            "Do toàn bộ lịch sử tin nhắn thô, logs chạy terminal, và mã nguồn cũ sẽ bị dọn dẹp sạch khỏi RAM ngay sau bước này để tiết kiệm token [1], "
+            "bản tóm tắt (summary) của bạn trong công cụ complete_agent_task bắt buộc phải đóng vai trò là CẦU NỐI TRI THỨC không hao hụt (Lossless Bridge). "
+            "Bạn TUYỆT ĐỐI KHÔNG được viết tóm tắt chung chung (ví dụ: 'Đã sửa tệp config.py'). "
+            "Bản tóm tắt của bạn BẮT BUỘC phải ghi nhận chi tiết, chính xác các điểm kỹ thuật sau:\n"
+            "1. [Tệp tin thay đổi]: Ghi cụ thể đường dẫn tương đối của các file đã tạo mới hoặc chỉnh sửa (ví dụ: `src/config.py`).\n"
+            "2. [Chi tiết sửa đổi Code]: Liệt kê chính xác tên Class, Hàm, API endpoints, hoặc Biến được khai báo mới hoặc thay đổi logic "
+            "(ví dụ: 'Thêm hàm fetch_user_data(user_id: int) -> dict trong Class UserManager, trả về JSON gồm {id, name, email}').\n"
+            "3. [Phương án kỹ thuật & Giải thuật]: Giải thích ngắn gọn cách bạn giải quyết vấn đề (ví dụ: 'Sử dụng cơ chế Lock để ngăn race condition khi khởi tạo luồng').\n"
+            "4. [Lưu ý & Chỉ dẫn kế thừa cho Task sau]: Ghi rõ các điểm cần chú ý để Task tiếp theo có thể import hoặc gọi chính xác "
+            "(ví dụ: 'Task tiếp theo khi làm việc với Router cần import fetch_user_data từ src/config.py và truyền đối số dạng integer')."
         )
 
     system_prompt += catalog_prompt + active_skills_prompt
@@ -1692,7 +1717,6 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
     ask_questions_tool = AskQuestionsTool(workspace_path=ws)
     write_and_run_script = WriteAndRunScriptTool(workspace_path=ws)
     search_keyword_tool = SearchKeywordTool(workspace_path=ws)
-    
     complete_task_tool = CompleteTaskTool(workspace_path=ws) 
     
     tools_map = {
@@ -1721,16 +1745,17 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
     file_registry = dict(state.get("file_registry", {}))
     impacted_files = set()
     completed_task_ids = []
+    
     for tool_call in last_message.tool_calls:
         tool_name = tool_call["name"]
         tool_args = tool_call["args"] or {}
         tool_id = tool_call["id"]
         
+        # BỔ SUNG: Nhận diện cuộc gọi hoàn thành task để cập nhật lộ trình
         if tool_name == "complete_agent_task":
             t_id = tool_args.get("task_id")
             if t_id:
                 completed_task_ids.append(t_id)
-        
         
         if tool_name in ["write_file", "apply_search_replace_patch", "read_files"]:
             raw_path = tool_args.get("file_path") or tool_args.get("file_paths")
@@ -1739,8 +1764,6 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
                     impacted_files.update(raw_path)
                 else:
                     impacted_files.add(str(raw_path))
-        
-        
         
         tool_instance = tools_map.get(tool_name)
         if not tool_instance:
@@ -1759,7 +1782,6 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
             except Exception as e:
                 result = f"Lỗi thực thi công cụ '{tool_name}': {str(e)}"
                 
-        # 🌟 PHÒNG THỦ TOKEN TRỰC TIẾP: Nén nội dung file ngay tại đầu ra của Tool Message
         if tool_name == "read_files" and "Lỗi" not in str(result):
             found_files = []
             raw_paths = tool_args.get("file_paths")
@@ -1805,7 +1827,7 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         "messages": tool_messages,
         "modified_files": modified_files,
         "file_registry": file_registry,
-        "plan": updated_plan # Đồng bộ kế hoạch mới cập nhật vào state
+        "plan": updated_plan
     }
 
 

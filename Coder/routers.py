@@ -128,17 +128,31 @@ def replanner_router(state: AgentState) -> Literal["executor", "synthesis"]:
         return "synthesis"
 
 
-def tool_router(state: AgentState) -> Literal["executor", "human_interaction_gate"]:
+def tool_router(state: AgentState) -> Literal["executor", "human_interaction_gate", "context_compressor"]:
     """
     Định tuyến sau khi chạy công cụ.
-    Chỉ chuyển sang human_interaction_gate nếu công cụ đặt câu hỏi 'ask_questions_if_underspecified' được kích hoạt.
+    - Chuyển hướng sang 'context_compressor' ngay lập tức nếu vừa hoàn thành một Task để dọn dẹp RAM [1].
+    - Chuyển sang 'human_interaction_gate' nếu cần hỏi ý kiến người dùng.
+    - Mặc định quay về 'executor' để tiếp tục xử lý công cụ khác.
     """
     messages = state["messages"]
     
+    # Kiểm tra xem cuộc gọi công cụ gần nhất có chứa complete_agent_task không
+    last_ai_message = None
+    for msg in reversed(messages):
+        if msg.type == "ai" or isinstance(msg, AIMessage):
+            last_ai_message = msg
+            break
+            
+    if last_ai_message and getattr(last_ai_message, "tool_calls", None):
+        if any(tc["name"] == "complete_agent_task" for tc in last_ai_message.tool_calls):
+            # Kích hoạt dọn dẹp và nén ngữ cảnh khẩn cấp trước khi đi tiếp [1]
+            return "context_compressor"
+    
+    # Kiểm tra yêu cầu tương tác người dùng
     for msg in reversed(messages):
         if getattr(msg, "type", None) != "tool":
             break
-        # Loại bỏ hoàn toàn propose_implementation_plan khỏi danh sách routing
         if msg.name == "ask_questions_if_underspecified":
             try:
                 data = json.loads(msg.content)
@@ -148,5 +162,4 @@ def tool_router(state: AgentState) -> Literal["executor", "human_interaction_gat
                 pass
                 
     return "executor"
-
 

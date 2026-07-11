@@ -57,7 +57,8 @@ builder.add_conditional_edges(
     routers.tool_router, 
     {
         "executor": "executor",
-        "human_interaction_gate": "human_interaction_gate"
+        "human_interaction_gate": "human_interaction_gate",
+        "context_compressor": "context_compressor"  # <--- BỔ SUNG ĐƯỜNG NỐI NÀY ĐỂ KÍCH HOẠT LUỒNG NÉN [1]
     }
 )
 builder.add_edge("human_interaction_gate", "executor")

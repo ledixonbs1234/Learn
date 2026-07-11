@@ -121,6 +121,12 @@ def reduce_file_registry(left: Dict[str, str], right: Dict[str, str]) -> Dict[st
         merged.update(right)
     return merged
 
+# BỔ SUNG: Bộ rút gọn tích lũy lịch sử tóm tắt trong RAM [1]
+def reduce_summaries(left: List[str], right: List[str]) -> List[str]:
+    left_list = left or []
+    right_list = right or []
+    return left_list + right_list
+
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
     workspace_path: str
@@ -143,6 +149,7 @@ class AgentState(TypedDict):
     doubt_findings: str         # Lưu kết quả rà soát đối kháng
     doubt_attempts: int
     recommended_skills: List[str]
+    completed_task_summaries: Annotated[List[str], reduce_summaries]
 
 class WebInteractionState(TypedDict):
     workspace_path: str 

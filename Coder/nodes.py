@@ -17,7 +17,7 @@ from mcp_helper import run_agent_with_devtools_mcp
 from skills_engine import AgentSkillsEngine
 from state import AgentState, PlanUpdate, RuntimeVerificationResult, TaskTriage, Task
 from tools import (
-    ActivateSkillTool, AskQuestionsTool, CompleteTaskTool, GitManager, ReadFileLinesTool, RunSkillScriptTool, SearchKeywordTool, UniversalSymbolSearchTool, WebInteractAndTestTool, WorkspaceTools, 
+    ActivateSkillTool, AskQuestionsTool, CompleteTaskTool, GitManager, QueryOpenWikiTool, ReadFileLinesTool, RunSkillScriptTool, SearchKeywordTool, UniversalSymbolSearchTool, WebInteractAndTestTool, WorkspaceTools, 
     ReadFilesTool, WriteAndRunScriptTool, WriteFileTool, ApplyPatchTool, 
     ListDirectoryTool, RunTerminalTool, get_markdown_language
 )
@@ -1072,7 +1072,133 @@ def context_compressor_node(state: AgentState) -> Dict[str, Any]:
         "active_skills": cleaned_active_skills,
         "completed_task_summaries": new_summaries  # Bộ rút gọn (Reducer) tự động cộng dồn [1]
     }
-# THAY THẾ ĐOẠN CODE TRONG oder/nodes.py BẰNG ĐOẠN DƯỚI ĐÂY
+    
+    
+# =====================================================================
+# 🌟 NÚT CHƯNG CẤT TRI THỨC TOÀN CỤC (GLOBAL FLUXMEM DISTILLATION)
+# =====================================================================
+def fluxmem_distillation_node(state: AgentState) -> Dict[str, Any]:
+    """
+    [CẬP NHẬT CHỮA LỖI] Phân tích vết lịch sử chạy thực tế của tác vụ vừa hoàn thành,
+    chưng cất thành kỹ năng quy trình (Procedural Skill) và lưu trực tiếp vào thư mục OpenWiki toàn cục.
+    """
+    messages = state.get("messages", [])
+    ws = state["workspace_path"]
+    plan = state.get("plan", [])
+    
+    # 1. Định vị Task hoàn thành gần nhất
+    latest_task_id = ""
+    latest_task_desc = "Tác vụ thực thi hệ thống"
+    
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                if tc["name"] == "complete_agent_task":
+                    latest_task_id = tc["args"].get("task_id", "")
+                    break
+            if latest_task_id:
+                break
+                
+    if not latest_task_id:
+        return {} 
+        
+    for t in plan:
+        t_id = t.id if isinstance(t, Task) else t.get("id")
+        if t_id == latest_task_id:
+            latest_task_desc = t.description if isinstance(t, Task) else t.get("description")
+            break
+
+    # 2. Xây dựng stepsPrompt từ vết lịch sử gọi công cụ thực tế
+    current_task_messages = []
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and "📊 [Hệ thống Phân phối thông minh]" in str(msg.content):
+            break
+        current_task_messages.insert(0, msg)
+        
+    steps_prompt_parts = []
+    for m in current_task_messages:
+        if isinstance(m, AIMessage) and m.tool_calls:
+            for tc in m.tool_calls:
+                steps_prompt_parts.append(
+                    f"- **AI đã gọi công cụ:** `{tc['name']}` với các đối số: `{json.dumps(tc['args'], ensure_ascii=False)}`"
+                )
+        elif m.type == "tool":
+            content_str = str(m.content)
+            if len(content_str) > 800:
+                content_str = content_str[:800] + "... [Đã cắt bớt dữ liệu thô dài] ..."
+            steps_prompt_parts.append(f"  -> *Kết quả phản hồi của công cụ:* {content_str}")
+
+    steps_prompt = "\n".join(steps_prompt_parts) if steps_prompt_parts else "Không ghi nhận lượt gọi công cụ trực tiếp."
+
+    # 3. Chuẩn bị Prompt Chưng cất
+    system_prompt = (
+        "Bạn là Chuyên gia chưng cất kỹ năng (FluxMem Distillation Agent).\n"
+        "Dưới đây là vết lịch sử chạy thực tế thành công của Agent:\n\n"
+        f"[MỤC TIÊU]: \"{latest_task_desc}\"\n"
+        "[HÀNH ĐỘNG CHI TIẾT]:\n"
+        f"{steps_prompt}\n\n"
+        "Hãy viết một quy trình (Procedural Skill) gồm 3-5 bước tổng quát hóa, mô tả chính xác cách thiết thiết kế, biên tập, các công cụ tối ưu cần gọi và cách phòng ngừa lỗi biên dịch cho mục tiêu này.\n"
+        "Chỉ trả về nội dung quy trình dạng Markdown, không viết thêm lời mở đầu hay giải thích"
+    )
+
+    try:
+        # Gọi mô hình để chưng cất tri thức thành định dạng MD tinh khiết
+        distilled_response = fast_model.invoke([
+            SystemMessage(content=system_prompt)
+        ])
+        
+        procedural_skill_md = distilled_response.content
+        
+        # 4. Lưu vật lý vào thư mục OpenWiki toàn cục (~/.openwiki/wiki)
+        wiki_dir = Path("~/.openwiki/wiki").expanduser().resolve()
+        wiki_dir.mkdir(parents=True, exist_ok=True)
+        
+        # =====================================================================
+        # 🌟 GIẢI PHÁP SỬA LỖI ĐẶT TÊN FILE (LLM-BASED SLUG GENERATOR)
+        # =====================================================================
+        try:
+            slug_prompt = (
+                "Dựa vào mô tả nhiệm vụ sau, hãy tạo ra một định danh (slug) ngắn gọn từ 2-4 từ, "
+                "viết thường, KHÔNG dấu, phân cách bằng duy nhất dấu gạch dưới, mô tả khái quát kỹ năng kỹ thuật "
+                "cốt lõi của tác vụ này.\n"
+                "⚠️ YÊU CẦU NGHIÊM NGẶT:\n"
+                "- TUYỆT ĐỐI KHÔNG bao gồm bất kỳ đường dẫn thư mục, ổ đĩa C:/, tên file cục bộ, hoặc tên người dùng nào.\n"
+                "- Nếu nhiệm vụ là cào dữ liệu, slug có thể là 'web_data_scraping'.\n"
+                "- Nếu nhiệm vụ là cấu hình database, slug có thể là 'database_configuration'.\n\n"
+                f"Mô tả nhiệm vụ ban đầu: {latest_task_desc}\n\n"
+                "Chỉ trả về chuỗi định danh duy nhất (ví dụ: 'setup_playwright_scraper', 'write_prd_specification'):"
+            )
+            slug_response = fast_model.invoke([SystemMessage(content=slug_prompt)])
+            safe_task_name = slug_response.content.strip().lower()
+            
+            # Bộ lọc bảo vệ: Loại bỏ tất cả ký tự không phải chữ cái thường, số và dấu gạch dưới
+            safe_task_name = re.sub(r'[^a-z0-9_]', '', safe_task_name)
+            if not safe_task_name:
+                safe_task_name = f"procedural_task_{latest_task_id.lower()}"
+        except Exception as slug_err:
+            print(f"[Cảnh báo] Lỗi sinh slug bằng AI: {str(slug_err)}. Chuyển sang fallback phòng ngự.")
+            safe_task_name = f"procedural_task_{latest_task_id.lower()}"
+            
+        file_name = f"skill_{safe_task_name}.md"
+        dest_file = wiki_dir / file_name
+        # =====================================================================
+        
+        dest_file.write_text(procedural_skill_md, encoding="utf-8")
+        
+        log_msg = (
+            f"⚡ **[Global FluxMem Distillation]**: Đã chưng cất tri thức thành công! "
+            f"Lưu trữ vật lý tại OpenWiki toàn cục: `~/.openwiki/wiki/{file_name}`."
+        )
+        return {
+            "messages": [AIMessage(content=log_msg)]
+        }
+    except Exception as e:
+        print(f"[Cảnh báo] Lỗi trong quá trình chưng cất quy trình toàn cục: {str(e)}")
+        return {}
+
+
+
+
 
 def executor_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
@@ -1192,6 +1318,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
     run_skill_script_tool = RunSkillScriptTool(workspace_path=ws)
     search_keyword_tool = SearchKeywordTool(workspace_path=ws)
     complete_task_tool = CompleteTaskTool(workspace_path=ws)
+    query_openwiki = QueryOpenWikiTool(workspace_path=ws)
     parsed_plan = []
     for t in plan:
         if isinstance(t, dict):
@@ -1228,13 +1355,21 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             search_keyword_tool,
             write_file,
             apply_patch,
-            complete_task_tool
+            complete_task_tool,
+            query_openwiki
         ]
         
         system_prompt = (
             "Bạn là một chuyên gia khảo sát mã nguồn, phỏng vấn nghiệp vụ và thiết lập mô hình miền (Active Discovery & Glossary Engine).\n"
             f"Nhiệm vụ hiện tại:\n{tasks_str}\n"
             f"Thư mục làm việc: {ws}\n\n"
+            
+            # 🌟 CHỈ DẪN TRUY XUẤT OPENWIKI TOÀN CỤC CHO PHA KHẢO SÁT
+            "⚠️ HƯỚNG DẪN TRUY XUẤT TRI THỨC TOÀN CỤC (JUST-IN-TIME RETRIEVAL):\n"
+            "1. Hệ thống của bạn tích hợp bộ nhớ tri thức toàn cục (Global Brain) lưu tại thư mục hệ thống: `~/.openwiki/wiki/`.\n"
+            "2. Trước khi khảo sát hay thiết kế, bạn BẮT BUỘC phải gọi công cụ `query_global_openwiki` để kiểm tra "
+            "xem có quy trình, mẫu thiết kế hoặc lưu ý tránh lỗi biên dịch nào đã được đúc kết từ trước liên quan đến nhiệm vụ này hay không.\n"
+            "3. Nếu tìm thấy file kỹ năng phù hợp, hãy áp dụng chính xác quy trình và các lưu ý phòng ngừa lỗi biên dịch vào dự án hiện tại.\n\n"
             "⚠️ QUY TẮC KÍCH HOẠT & TUÂN THỦ KỸ NĂNG (BẮT BUỘC):\n"
             "1. Trước khi thực hiện một hành động chuyên biệt có kỹ năng tương ứng trong danh sách '=== THƯ VIỆN KỸ NĂNG KHẢ DỤNG (TIER 1) ===' "
             "mà chưa được kích hoạt, bạn BẮT BUỘC phải gọi công cụ `activate_agent_skill` để nạp hướng dẫn kỹ năng đó.\n"
@@ -1271,13 +1406,20 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         tools = [
             activate_skill_tool, run_skill_script_tool, read_files, write_file, 
             apply_patch, list_directory, run_terminal_command, search_symbols, 
-            read_file_lines, ask_questions_tool, write_and_run_script, search_keyword_tool,complete_task_tool
+            read_file_lines, ask_questions_tool, write_and_run_script, search_keyword_tool,complete_task_tool,query_openwiki
         ]
         
         system_prompt = (
             "Bạn là kỹ sư phần mềm thực thi chuyên nghiệp (Write-Access Mode).\n"
             f"Nhiệm vụ phát triển:\n{tasks_str}\n"
             f"Thư mục làm việc: {ws}\n\n"
+            
+            # 🌟 CHỈ DẪN TRUY XUẤT OPENWIKI TOÀN CỤC CHO PHA PHÁT TRIỂN
+            "⚠️ HƯỚNG DẪN TRUY XUẤT TRI THỨC TOÀN CỤC (JUST-IN-TIME RETRIEVAL):\n"
+            "1. Hệ thống của bạn tích hợp bộ nhớ tri thức toàn cục (Global Brain) lưu tại thư mục hệ thống: `~/.openwiki/wiki/`.\n"
+            "2. Trước khi sửa đổi mã nguồn hoặc viết code phức tạp, bạn BẮT BUỘC phải gọi công cụ `query_global_openwiki` "
+            "để tra cứu xem các dự án trước đã đúc kết được quy trình tối ưu hay cách sửa lỗi tương ứng chưa.\n"
+            "3. Nếu tìm thấy file kỹ năng phù hợp, hãy áp dụng chính xác quy trình và các lưu ý phòng ngừa lỗi biên dịch từ tài liệu đó.\n\n"
             "⚠️ QUY TẮC KÍCH HOẠT & TUÂN THỦ KỸ NĂNG (BẮT BUỘC):\n"
             "1. Trước khi thực hiện viết code, sửa lỗi, hoặc viết test, hãy rà soát danh sách '=== THƯ VIỆN KỸ NĂNG KHẢ DỤNG (TIER 1) ==='. "
             "Nếu có kỹ năng hỗ trợ phù hợp (ví dụ: 'test-driven-development'), bạn BẮT BUỘC phải gọi công cụ `activate_agent_skill` để tải chỉ dẫn sâu.\n"
@@ -1718,6 +1860,7 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
     write_and_run_script = WriteAndRunScriptTool(workspace_path=ws)
     search_keyword_tool = SearchKeywordTool(workspace_path=ws)
     complete_task_tool = CompleteTaskTool(workspace_path=ws) 
+    query_openwiki = QueryOpenWikiTool(workspace_path=ws)
     
     tools_map = {
         "read_files": read_files,
@@ -1733,6 +1876,7 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         "run_skill_script": RunSkillScriptTool(workspace_path=ws),
         "write_and_run_script": write_and_run_script,
         "search_keyword": search_keyword_tool,
+        "query_global_openwiki": query_openwiki,
         "complete_agent_task": complete_task_tool
     }
     

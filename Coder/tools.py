@@ -1123,7 +1123,53 @@ class WorkspaceTools:
         except Exception as e:
             return f"Lỗi thực thi lệnh terminal: {str(e)}"
         
+# =====================================================================
+# 🌟 CÔNG CỤ TRUY VẤN TRI THỨC TOÀN CỤC QUA OPENWIKI CLI
+# =====================================================================
+class QueryOpenWikiSchema(BaseModel):
+    query: str = Field(
+        description="Mô tả yêu cầu kỹ thuật hoặc lỗi runtime cần tìm kiếm giải pháp tối ưu trong bộ não toàn cục (ví dụ: 'Cách bypass Cloudflare bằng Playwright')."
+    )
+
+class QueryOpenWikiTool(BaseTool):
+    name: str = "query_global_openwiki"
+    description: str = (
+        "Truy vấn trực tiếp bộ não toàn cục của OpenWiki (~/.openwiki/wiki) để tìm kiếm các quy trình, "
+        "mẫu thiết kế, giải pháp tối ưu và cách phòng ngừa lỗi biên dịch đã được đúc kết thành công từ trước."
+    )
+    args_schema: Type[BaseModel] = QueryOpenWikiSchema
+    workspace_path: str
+
+    def _run(self, query: str) -> str:
+        import subprocess
         
+        # Chỉ đạo OpenWiki Agent tìm kiếm và tổng hợp tri thức từ thư mục hệ thống của nó
+        agent_instruction = (
+            f"Hãy lục tìm trong tất cả các tệp quy trình (.md) thuộc thư mục ~/.openwiki/wiki xem có bài học kinh nghiệm, "
+            f"đoạn mã mẫu hoặc hướng dẫn thiết kế nào liên quan đến câu hỏi sau hay không: '{query}'. "
+            f"Nếu có, hãy tổng hợp chúng thành một chỉ dẫn súc tích, dễ hiểu nhất và trả về. "
+            f"Nếu hoàn toàn không có thông tin nào liên quan, hãy trả về: 'Không tìm thấy tri thức tương ứng trong OpenWiki'."
+        )
+        
+        try:
+            # Chạy OpenWiki CLI ở chế độ One-shot (-p) để lấy phản hồi nhanh
+            res = subprocess.run(
+                ["openwiki", "-p", agent_instruction],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=45
+            )
+            
+            if res.returncode == 0:
+                output = res.stdout.strip()
+                return f"🔍 [Kết quả truy xuất bộ não OpenWiki]:\n\n{output}"
+            else:
+                return f"⚠️ OpenWiki CLI không trả về kết quả (Exit Code {res.returncode}): {res.stderr}"
+        except FileNotFoundError:
+            return "❌ Lỗi: Chưa cài đặt OpenWiki CLI toàn cục trên máy tính này."
+        except Exception as e:
+            return f"❌ Lỗi hệ thống khi truy vấn OpenWiki: {str(e)}"        
 class QuestionOption(BaseModel):
     label: str = Field(description="Nhãn mô tả trực quan hiển thị trên giao diện hoặc nút bấm.")
     value: str = Field(description="Giá trị kỹ thuật tương ứng được lưu trữ và trả về.")

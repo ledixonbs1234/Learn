@@ -79,12 +79,24 @@ class GitIgnoreMatcher:
 
 def sanitize_and_resolve_path(workspace: str, raw_target_path: str, create_parent: bool = False) -> Path:
     cleaned = raw_target_path.replace('"', '').replace("'", "").replace("\\", "/").strip()
-    # GIẢI PHÁP: Sử dụng expanduser() để dịch dấu ~ thành thư mục Home [2]
     workspace_path = Path(workspace).expanduser().resolve()
+    
+    # 🌟 GIẢI PHÁP NGOẠI LỆ AN TOÀN: Cho phép truy xuất thư mục OpenWiki toàn cục
+    global_openwiki_path = Path("~/.openwiki").expanduser().resolve()
     
     target_path = Path(cleaned)
     if cleaned.startswith("~"):
         target_path = target_path.expanduser()
+        
+    try:
+        resolved_target = target_path.resolve()
+        # Nếu đường dẫn trỏ thẳng vào ~/.openwiki hoặc các thư mục con của nó
+        if resolved_target == global_openwiki_path or global_openwiki_path in resolved_target.parents:
+            if create_parent:
+                resolved_target.parent.mkdir(parents=True, exist_ok=True)
+            return resolved_target
+    except Exception:
+        pass
     
     if target_path.is_absolute():
         try:

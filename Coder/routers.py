@@ -128,10 +128,10 @@ def replanner_router(state: AgentState) -> Literal["executor", "synthesis"]:
         return "synthesis"
 
 
-def tool_router(state: AgentState) -> Literal["executor", "human_interaction_gate", "context_compressor"]:
+def tool_router(state: AgentState) -> Literal["executor", "human_interaction_gate", "fluxmem_distillation"]:
     """
     Định tuyến sau khi chạy công cụ.
-    - Chuyển hướng sang 'context_compressor' ngay lập tức nếu vừa hoàn thành một Task để dọn dẹp RAM [1].
+    - Chuyển hướng sang 'fluxmem_distillation' ngay lập tức nếu vừa hoàn thành một Task để chưng cất tri thức.
     - Chuyển sang 'human_interaction_gate' nếu cần hỏi ý kiến người dùng.
     - Mặc định quay về 'executor' để tiếp tục xử lý công cụ khác.
     """
@@ -146,8 +146,8 @@ def tool_router(state: AgentState) -> Literal["executor", "human_interaction_gat
             
     if last_ai_message and getattr(last_ai_message, "tool_calls", None):
         if any(tc["name"] == "complete_agent_task" for tc in last_ai_message.tool_calls):
-            # Kích hoạt dọn dẹp và nén ngữ cảnh khẩn cấp trước khi đi tiếp [1]
-            return "context_compressor"
+            # Kích hoạt chưng cất tri thức toàn cục trước khi nén RAM [CẢI TIẾN]
+            return "fluxmem_distillation"
     
     # Kiểm tra yêu cầu tương tác người dùng
     for msg in reversed(messages):

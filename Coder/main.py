@@ -23,6 +23,7 @@ builder.add_node("tester", nodes.tester_node)
 builder.add_node("synthesis", nodes.synthesis_node)
 builder.add_node("commit", nodes.commit_node)
 builder.add_node("context_compressor", nodes.context_compressor_node)
+builder.add_node("fluxmem_distillation", nodes.fluxmem_distillation_node)
 # ĐĂNG KÝ CÁC NÚT THẨM ĐỊNH ĐỐI KHÁNG
 builder.add_node("doubt_reviewer", nodes.doubt_reviewer_node)
 builder.add_node("doubt_gate", nodes.doubt_gate_node)
@@ -50,7 +51,7 @@ builder.add_conditional_edges(
     }
 )
 builder.add_edge("context_compressor", "replanner")
-
+builder.add_edge("fluxmem_distillation", "context_compressor")
 # Định tuyến từ Tool Node
 builder.add_conditional_edges(
     "tool_node", 
@@ -58,7 +59,7 @@ builder.add_conditional_edges(
     {
         "executor": "executor",
         "human_interaction_gate": "human_interaction_gate",
-        "context_compressor": "context_compressor"  # <--- BỔ SUNG ĐƯỜNG NỐI NÀY ĐỂ KÍCH HOẠT LUỒNG NÉN [1]
+        "fluxmem_distillation": "fluxmem_distillation"  # <--- SỬA DÒNG NÀY (thay thế context_compressor bằng fluxmem_distillation)
     }
 )
 builder.add_edge("human_interaction_gate", "executor")

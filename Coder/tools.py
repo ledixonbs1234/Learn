@@ -1273,7 +1273,7 @@ class FlutterE2ETestTool(BaseTool):
         enriched_prompt = (
             f"=== THÔNG TIN BỐI CẢNH ĐƯỢC CHIA SẺ ===\n"
             f"- Workspace Path: `{self.workspace_path}`\n"
-            f"- Ngữ cảnh hệ thống (THONGTIN.md): {self.workspace_context or 'N/A'}\n"
+            f"- Ngữ cảnh hệ thống (CONTEXT.md): {self.workspace_context or 'N/A'}\n"
             f"- Phân tích mục tiêu ban đầu: {self.detailed_analysis or 'N/A'}\n\n"
             f"=== YÊU CẦU KIỂM THỬ E2E TỪ EXECUTOR ===\n"
             f"Hãy thực hiện độc lập kịch bản sau và báo cáo lại kết quả cụ thể: {test_instruction}"

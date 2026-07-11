@@ -780,16 +780,16 @@ def context_loader_node(state: AgentState) -> Dict[str, Any]:
             git_msg = f"⚠️ Có lỗi xảy ra khi nạp Git ({str(e)}). Tự động chuyển sang chế độ Sửa đổi trực tiếp."
             
     workspace_context = ""
-    thongtin_path = Path(ws) / "THONGTIN.md"
-    context_msg = "📋 Không tìm thấy tệp cấu hình `THONGTIN.md`."
+    context_path = Path(ws) / "CONTEXT.md"
+    context_msg = "📋 Không tìm thấy tệp cấu hình `CONTEXT.md`."
     
-    if thongtin_path.exists():
+    if context_path.exists():
         try:
-            workspace_context = thongtin_path.read_text(encoding="utf-8")
-            context_msg = "📋 Đã tải xong ngữ cảnh thông tin dự án từ tệp `THONGTIN.md`."
+            workspace_context = context_path.read_text(encoding="utf-8")
+            context_msg = "📋 Đã tải xong ngữ cảnh thông tin dự án từ tệp `CONTEXT.md`."
         except Exception as e:
-            workspace_context = f"Lỗi khi đọc file THONGTIN.md: {str(e)}"
-            context_msg = f"⚠️ Gặp sự cố khi đọc tệp `THONGTIN.md`: {str(e)}"
+            workspace_context = f"Lỗi khi đọc file CONTEXT.md: {str(e)}"
+            context_msg = f"⚠️ Gặp sự cố khi đọc tệp `CONTEXT.md`: {str(e)}"
             
     ext_dir = find_extension_dir_heuristic(Path(ws))
     ext_msg = ""
@@ -989,19 +989,11 @@ def context_compressor_node(state: AgentState) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # Đọc THONGTIN.md
-    thongtin_path = workspace_root / "THONGTIN.md"
-    if thongtin_path.exists():
-        try:
-            compiled_context_parts.append(f"### [THÔNG TIN DỰ ÁN (THONGTIN.md)]\n{thongtin_path.read_text(encoding='utf-8')}")
-        except Exception:
-            pass
-
-    # Đọc CONTEXT.md (Glossary)
+    # Đọc CONTEXT.md (Ngữ cảnh dự án & Thuật ngữ)
     context_file_path = workspace_root / "CONTEXT.md"
     if context_file_path.exists():
         try:
-            compiled_context_parts.append(f"### [BẢNG THUẬT NGỮ NGHIỆP VỤ (CONTEXT.md)]\n{context_file_path.read_text(encoding='utf-8')}")
+            compiled_context_parts.append(f"### [NGỮ CẢNH DỰ ÁN & THUẬT NGỮ (CONTEXT.md)]\n{context_file_path.read_text(encoding='utf-8')}")
         except Exception:
             pass
 
@@ -1114,14 +1106,14 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         state_updates["git_branch"] = git_branch
 
     if not workspace_context:
-        thongtin_path = Path(ws) / "THONGTIN.md"
-        if thongtin_path.exists():
+        context_path = Path(ws) / "CONTEXT.md"
+        if context_path.exists():
             try:
-                workspace_context = thongtin_path.read_text(encoding="utf-8")
+                workspace_context = context_path.read_text(encoding="utf-8")
             except Exception:
-                workspace_context = "Không thể đọc THONGTIN.md"
+                workspace_context = "Không thể đọc CONTEXT.md"
         else:
-            workspace_context = "📋 Chưa có tệp cấu hình THONGTIN.md."
+            workspace_context = "📋 Chưa có tệp cấu hình CONTEXT.md."
         state_updates["workspace_context"] = workspace_context
 
     if not extension_path:
@@ -1444,7 +1436,7 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
         )
     system_prompt += active_skills_prompt 
     if workspace_context:
-        system_prompt += f"\n\n--- NGỮ CẢNH HỆ THỐNG (THONGTIN.md) ---\n{workspace_context}"
+        system_prompt += f"\n\n--- NGỮ CẢNH HỆ THỐNG (CONTEXT.md) ---\n{workspace_context}"
         
     user_prompt = f"Kế hoạch hiện tại:\n{plan_str}\n\n"
     if error_logs:
@@ -1990,7 +1982,8 @@ def synthesis_node(state: AgentState) -> Dict[str, Any]:
     
     synthesis_prompt = (
         "Bạn là một Kiến trúc sư Hệ thống chuyên nghiệp chuyên biên soạn tài liệu.\n"
-        "Hãy tổng hợp toàn bộ thông tin khảo sát thô được ghi nhận ở các bước trước thành một tài liệu 'THONGTIN.md' duy nhất.\n"
+        "Hãy tổng hợp toàn bộ thông tin khảo sát thô được ghi nhận ở các bước trước thành một tài liệu 'CONTEXT.md' duy nhất "
+        "chứa đầy đủ bối cảnh dự án, sơ đồ kiến trúc và bảng thuật ngữ hệ thống.\n"
         "Yêu cầu: Viết thật cô đọng, súc tích và có cấu trúc rõ ràng. TUYỆT ĐỐI KHÔNG chèn mã nguồn dài dòng."
     )
     
@@ -2013,20 +2006,20 @@ def synthesis_node(state: AgentState) -> Dict[str, Any]:
             
             if git_branch != "no_git":
                 tools_mgr = WorkspaceTools(ws)
-                tools_mgr.write_file("THONGTIN.md", cleaned_md)
+                tools_mgr.write_file("CONTEXT.md", cleaned_md)
                 
                 git_manager = GitManager(ws)
-                git_manager._run_cmd(["git", "add", "THONGTIN.md"], ignore_error=True)
+                git_manager._run_cmd(["git", "add", "CONTEXT.md"], ignore_error=True)
                 
                 message_content = (
                     "**Tổng hợp tài liệu hoàn tất:** Đã biên dịch tri thức khảo sát, "
-                    "lưu vật lý thành tệp `THONGTIN.md` và đưa vào Git staging thành công."
+                    "lưu vật lý thành tệp `CONTEXT.md` và đưa vào Git staging thành công."
                 )
             else:
                 message_content = (
                     "**Tổng hợp tài liệu hoàn tất (Chế độ In-Memory):** Tri thức khảo sát "
                     "đã được tổng hợp và nạp trực tiếp vào ngữ cảnh trạng thái đồ thị (`workspace_context`). "
-                    "Tệp tin `THONGTIN.md` vật lý **không** được tạo trên ổ đĩa do hệ thống phát hiện không sử dụng Git."
+                    "Tệp tin `CONTEXT.md` vật lý **không** được tạo trên ổ đĩa do hệ thống phát hiện không sử dụng Git."
                 )
             
             return {
@@ -2034,7 +2027,7 @@ def synthesis_node(state: AgentState) -> Dict[str, Any]:
                 "messages": [AIMessage(content=message_content)]
             }
     except Exception as e:
-        return {"messages": [AIMessage(content=f"Cảnh báo: Có lỗi xảy ra khi tổng hợp tệp THONGTIN.md: {str(e)}")]}
+        return {"messages": [AIMessage(content=f"Cảnh báo: Có lỗi xảy ra khi tổng hợp tệp CONTEXT.md: {str(e)}")]}
     return {}
 
 

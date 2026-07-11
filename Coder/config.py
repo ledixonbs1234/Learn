@@ -118,7 +118,7 @@ LANGUAGE_MARKERS: Set[str] = {
     "Cargo.toml", "Cargo.lock", "go.mod", "go.sum", "pubspec.yaml",
     "pom.xml", "build.gradle", "settings.gradle", "CMakeLists.txt", "Makefile", "project.godot"
 }
-FALLBACK_MARKERS: Set[str] = {"THONGTIN.md", "README.md", "main.py", "index.js", ".env", "docker-compose.yml"}
+FALLBACK_MARKERS: Set[str] = {"CONTEXT.md", "README.md", "main.py", "index.js", ".env", "docker-compose.yml"}
 SANDBOX_BLACK_LIST: Set[str] = {"node_modules", ".venv", "venv", "env", "build", "dist", ".gradle", ".git", ".idea", ".vscode"}
 SYSTEM_DIR_NAMES: Set[str] = {"usr", "lib", "lib64", "bin", "sbin", "etc", "var", "opt", "sys", "proc", "dev", "System", "Windows", "Program Files", "Program Files (x86)", "Users"}
 

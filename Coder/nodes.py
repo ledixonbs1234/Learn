@@ -17,7 +17,7 @@ from mcp_helper import run_agent_with_devtools_mcp, run_agent_with_flutter_skill
 from skills_engine import AgentSkillsEngine
 from state import AgentState, PlanUpdate, RuntimeVerificationResult, TaskTriage, Task
 from tools import (
-    ActivateSkillTool, AskQuestionsTool, GitManager, ReadFileLinesTool, RunSkillScriptTool, SearchKeywordTool, UniversalSymbolSearchTool, WebInteractAndTestTool, WorkspaceTools, 
+    ActivateSkillTool, AskQuestionsTool, FlutterE2ETestTool, GitManager, ReadFileLinesTool, RunSkillScriptTool, SearchKeywordTool, UniversalSymbolSearchTool, WebInteractAndTestTool, WorkspaceTools, 
     ReadFilesTool, WriteAndRunScriptTool, WriteFileTool, ApplyPatchTool, 
     ListDirectoryTool, RunTerminalTool, get_markdown_language
 )
@@ -146,23 +146,61 @@ def execute_validation_cmd(cmd: List[str], cwd: Path, timeout: int = 30) -> Tupl
         return (-3, f"Lỗi hệ thống khi chạy lệnh kiểm thử: {str(e)}")
 
 def clean_compiler_logs(raw_logs: str) -> str:
+    """
+    Bộ lọc log nâng cao dành riêng cho môi trường Production.
+    Loại bỏ triệt để các log rác từ quá trình biên dịch/kiểm thử của Flutter, 
+    giúp tiết kiệm tới 90% dung lượng Token gửi tới LLM.
+    """
     lines = raw_logs.splitlines()
     filtered_lines = []
-    error_keywords = ["error", "fail", "exception", "cause", "unhandled", "invalid", "undefined"]
+    
+    # Các từ khóa rác cần loại bỏ ngay lập tức
+    noise_keywords = [
+        "artifact instance of",
+        "skipping update",
+        "found plugin",
+        "skipping generating",
+        "generating",
+        "starting test",
+        "stopping scan",
+        "listening to compiler",
+        "compiling",
+        "started flutter_tester process",
+        "connected to test device",
+        "waiting for test harness",
+        "test harness is no longer needed",
+        "ensuring test device is terminated",
+        "terminating flutter_tester",
+        "shutting down devtools",
+        "deleting temporary directory",
+        "runtime for phase",
+        "exiting with code"
+    ]
+    
+    # Từ khóa chỉ định lỗi thực tế cần giữ lại
+    error_keywords = ["error", "fail", "exception", "cause", "unhandled", "invalid", "undefined", "failed assertion"]
     
     for line in lines:
         clean_line = line.strip()
         if not clean_line:
             continue
+            
+        # 1. Bỏ qua nếu dòng chứa các từ khóa rác của Flutter CLI
+        if any(noise in clean_line.lower() for noise in noise_keywords):
+            continue
+            
+        # 2. Nhận diện các dòng chứa thông tin lỗi hữu ích
         has_error_kw = any(kw in clean_line.lower() for kw in error_keywords)
-        has_line_indicator = ":" in clean_line or ".dart" in clean_line or ".py" in clean_line or ".ts" in clean_line
+        has_line_indicator = ":" in clean_line and (".dart" in clean_line or ".py" in clean_line or ".ts" in clean_line)
+        is_test_failure_summary = "✗" in clean_line or "[E]" in clean_line
         
-        if has_error_kw or has_line_indicator:
+        if has_error_kw or has_line_indicator or is_test_failure_summary:
             filtered_lines.append(line)
             
     if not filtered_lines:
-        if len(lines) > 40:
-            return "\n".join(lines[:20] + ["... [Đã lược bớt các dòng ở giữa] ..."] + lines[-20:])
+        # Nếu không lọc được gì nhưng log quá dài, thực hiện cắt khúc đầu và cuối
+        if len(lines) > 20:
+            return "\n".join(lines[:10] + ["... [Đã cắt bớt các log hệ thống không quan trọng] ..."] + lines[-10:])
         return raw_logs
         
     return "\n".join(filtered_lines)
@@ -925,10 +963,13 @@ def chrome_extension_debugger_node(state: AgentState) -> Dict[str, Any]:
 # =====================================================================
 def context_compressor_node(state: AgentState) -> Dict[str, Any]:
     """
-    [NODE THU GỌN CONTEXT CÓ RÀO CHẮN AN TOÀN]
-    Chỉ thực hiện xóa tin nhắn (CGC) khi phiên Grilling thực sự diễn ra và thành công.
-    Nếu chỉ là khảo sát kỹ thuật thông thường (không grilling), nút này sẽ giữ nguyên
-    toàn bộ lịch sử tin nhắn thám thính và chuyển giao nguyên vẹn cho Planner.
+    [NODE THU GỌN CONTEXT CHỌN LỌC - SELECTIVE MEMORY GC]
+    Thực hiện dọn dẹp thông minh:
+    - Bảo vệ toàn bộ ý kiến/nội dung của người dùng (HumanMessage).
+    - Bảo vệ tin nhắn phân loại chiến lược của detect_and_triage_node.
+    - Bảo vệ bản tổng hợp khảo sát cuối cùng của executor_node.
+    - Đồng bộ hóa các tài liệu vật lý (PRD, CONTEXT, ADRs) vào workspace_context.
+    - Xóa bỏ toàn bộ tin nhắn công cụ (ToolMessages) và tin nhắn gọi công cụ trung gian để tiết kiệm token.
     """
     messages = state.get("messages", [])
     ws = state["workspace_path"]
@@ -936,22 +977,20 @@ def context_compressor_node(state: AgentState) -> Dict[str, Any]:
     workspace_root = Path(ws).expanduser().resolve()
     
     # =====================================================================
-    # 1. KIỂM TRA ĐIỀU KIỆN KÍCH HOẠT THỰC TẾ (SAFE-GUARD CHECK)
+    # 1. ĐỒNG BỘ TOÀN BỘ TÀI LIỆU VẬT LÝ VÀO STATE
     # =====================================================================
-    # Kiểm tra xem Agent có thực sự gọi công cụ kích hoạt Grilling/PRD hay không
-    grilling_activated = "grill-with-docs" in active_skills or "write-a-prd" in active_skills
-    
-    # 2. ĐỒNG BỘ TOÀN BỘ TÀI LIỆU VẬT LÝ VÀO STATE
     compiled_context_parts = []
     
-    # Thử đọc PRD.md hoặc THONGTIN.md
+    # Đọc PRD.md
     prd_path = workspace_root / "PRD.md"
-    thongtin_path = workspace_root / "THONGTIN.md"
     if prd_path.exists():
         try:
             compiled_context_parts.append(f"### [PRODUCT REQUIREMENTS DOCUMENT (PRD.md)]\n{prd_path.read_text(encoding='utf-8')}")
         except Exception: pass
-    elif thongtin_path.exists():
+
+    # Đọc THONGTIN.md
+    thongtin_path = workspace_root / "THONGTIN.md"
+    if thongtin_path.exists():
         try:
             compiled_context_parts.append(f"### [THÔNG TIN DỰ ÁN (THONGTIN.md)]\n{thongtin_path.read_text(encoding='utf-8')}")
         except Exception: pass
@@ -979,42 +1018,63 @@ def context_compressor_node(state: AgentState) -> Dict[str, Any]:
         super_context = state.get("workspace_context", "")
 
     # =====================================================================
-    # 3. ĐIỀU HƯỚNG BẢO VỆ CONTEXT (SAFE-GUARD RULE)
+    # 2. XÁC ĐỊNH DANH SÁCH TIN NHẮN CẦN GIỮ LẠI (SELECTIVE KEEP LIST)
     # =====================================================================
-    # Nếu không có grilling thực sự, HOẶC không có file PRD/Glossary vật lý nào được tạo ra:
-    # -> BỎ QUA VIỆC XÓA TIN NHẮN để tránh mất dữ liệu khảo sát thô.
-    if not grilling_activated or not (prd_path.exists() or context_file_path.exists()):
-        return {
-            "workspace_context": super_context
-            # Không trả về deletion_list, toàn bộ lịch sử tin nhắn được bảo toàn nguyên vẹn
-        }
+    
+    # A. Nhận diện tin nhắn của detect_and_triage_node bằng cách quét từ khóa đặc trưng
+    triage_msg_id = None
+    for msg in messages:
+        if msg.type == "ai" or isinstance(msg, AIMessage):
+            content_str = str(msg.content)
+            if "Phân phối thông minh" in content_str or "Phân loại tác vụ" in content_str:
+                triage_msg_id = msg.id
+                break
+                
+    # B. Nhận diện tin nhắn tổng hợp cuối cùng từ executor node pha khảo sát.
+    # Do Node Compressor chạy ngay sau khi Executor kết thúc pha khảo sát mà không gọi thêm công cụ,
+    # nên tin nhắn cuối cùng trong danh sách (messages[-1]) chính là bản báo cáo tổng hợp này.
+    final_summary_id = None
+    if messages:
+        last_msg = messages[-1]
+        # Đảm bảo đây là tin nhắn AI và không phải là một lượt gọi công cụ đang dở dang
+        if (last_msg.type == "ai" or isinstance(last_msg, AIMessage)) and not getattr(last_msg, "tool_calls", None):
+            final_summary_id = last_msg.id
+
+    # C. Lập danh sách xóa chọn lọc (Chỉ xóa Scaffolding, bảo tồn Milestones)
+    deletion_list = []
+    for msg in messages:
+        # Bỏ qua nếu tin nhắn không có ID (không thể gửi RemoveMessage)
+        if not msg.id:
+            continue
+            
+        is_human = (msg.type == "human" or isinstance(msg, HumanMessage))
+        is_triage = (msg.id == triage_msg_id)
+        is_final_summary = (msg.id == final_summary_id)
+        
+        # Nếu không thuộc diện cần giữ lại -> Đưa vào danh sách dọn dẹp
+        if not (is_human or is_triage or is_final_summary):
+            deletion_list.append(RemoveMessage(id=msg.id))
 
     # =====================================================================
-    # 4. THỰC HIỆN DỌN DẸP KHI ĐỦ ĐIỀU KIỆN (CHỈ KHI CÓ GRILLING THÀNH CÔNG)
+    # 3. THU GOM RÁC CÁC KỸ NĂNG VÀ THIẾT LẬP CHECKPOINT
     # =====================================================================
-    if len(messages) <= 2:
-        return {"workspace_context": super_context}
-        
-    deletion_list = []
-    for msg in messages[1:]:
-        if msg.id:
-            deletion_list.append(RemoveMessage(id=msg.id)) # Đánh dấu xóa tin nhắn [2]
-            
-    clean_checkpoint_msg = AIMessage(
-        content=(
-            "🔄 **[Hệ thống dọn dẹp Ngữ cảnh & Đồng bộ Domain Model]**:\n"
-            "Phát hiện phiên đối thoại chất vấn nghiệp vụ (Grilling) đã diễn ra thành công.\n"
-            "Hệ thống đã dọn dẹp lịch sử tin nhắn thô để tiết kiệm token, giải phóng các kỹ năng "
-            "khảo sát (Garbage Collection) và đồng bộ hóa tài liệu "
-            "(PRD, CONTEXT.md, ADRs) vào bộ nhớ ngữ cảnh của Graph."
-        )
-    )
-    
-    # Thực hiện thu gom rác ngữ cảnh cho các kỹ năng đã hoàn thành nhiệm vụ
     cleaned_active_skills = dict(active_skills)
     discovery_triad = ["grill-with-docs", "write-a-prd", "domain-modeling"]
     for skill_name in discovery_triad:
         cleaned_active_skills.pop(skill_name, None)
+    
+    clean_checkpoint_msg = AIMessage(
+        content=(
+            "🔄 **[Hệ thống dọn dẹp Ngữ cảnh & Đồng bộ Domain Model]**:\n"
+            "Phát hiện kết thúc pha khảo sát chủ động thành công.\n"
+            "Hệ thống đã dọn dẹp chọn lọc toàn bộ nhật ký gọi công cụ (Tool Logs GC) "
+            "nhưng vẫn bảo vệ nguyên vẹn các mốc tri thức quan trọng gồm:\n"
+            "- Toàn bộ ý kiến thảo luận của bạn.\n"
+            "- Bản phân tích phân phối thông minh từ triage node.\n"
+            "- Văn bản tổng hợp kết quả điều tra cuối cùng của Executor.\n"
+            "Bộ nhớ ngữ cảnh đã được tối ưu hóa thành công để bàn giao cho pha lập kế hoạch."
+        )
+    )
     
     return {
         "workspace_context": super_context,
@@ -1152,7 +1212,16 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         # Cấp thêm quyền ghi tệp tin tài liệu nghiệp vụ
         write_file = WriteFileTool(workspace_path=ws)
         apply_patch = ApplyPatchTool(workspace_path=ws)
+        # Lấy thông tin bối cảnh cập nhật từ state
+        current_workspace_context = state.get("workspace_context", "") or workspace_context
+        current_detailed_analysis = state.get("detailed_analysis", "")
         
+        # Khởi tạo Tool với đầy đủ tri thức được chia sẻ từ detect_and_triage_node
+        flutter_e2e_test = FlutterE2ETestTool(
+            workspace_path=ws,
+            workspace_context=current_workspace_context,
+            detailed_analysis=current_detailed_analysis
+        )
         tools = [
             activate_skill_tool, 
             run_skill_script_tool, 
@@ -1163,7 +1232,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             ask_questions_tool, 
             search_keyword_tool,
             write_file,
-            apply_patch
+            apply_patch,flutter_e2e_test
         ]
         
         system_prompt = (
@@ -1189,10 +1258,23 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         read_file_lines = ReadFileLinesTool(workspace_path=ws)
         write_and_run_script = WriteAndRunScriptTool(workspace_path=ws)
         ask_questions_tool = AskQuestionsTool(workspace_path=ws)
+        
+        # Lấy thông tin bối cảnh cập nhật từ state
+        current_workspace_context = state.get("workspace_context", "") or workspace_context
+        current_detailed_analysis = state.get("detailed_analysis", "")
+        
+        # Khởi tạo Tool với đầy đủ tri thức được chia sẻ từ detect_and_triage_node
+        flutter_e2e_test = FlutterE2ETestTool(
+            workspace_path=ws,
+            workspace_context=current_workspace_context,
+            detailed_analysis=current_detailed_analysis
+        )
+        
         tools = [
             activate_skill_tool, run_skill_script_tool, read_files, write_file, 
             apply_patch, list_directory, run_terminal_command, search_symbols, 
-            read_file_lines, ask_questions_tool, write_and_run_script, search_keyword_tool
+            read_file_lines, ask_questions_tool, write_and_run_script, search_keyword_tool,
+            flutter_e2e_test
         ]
         
         system_prompt = (
@@ -1653,9 +1735,6 @@ def replanner_interrupt_node(state: AgentState) -> Dict[str, Any]:
 
 
 def tool_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Nút thực thi công cụ. Đã nâng cấp cơ chế nén Token trực tiếp cho tệp tin khi ghi nhận vào lịch sử tin nhắn.
-    """
     ws = state["workspace_path"]
     read_files = ReadFilesTool(workspace_path=ws)
     write_file = WriteFileTool(workspace_path=ws)
@@ -1668,7 +1747,17 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
     ask_questions_tool = AskQuestionsTool(workspace_path=ws)
     write_and_run_script = WriteAndRunScriptTool(workspace_path=ws)
     search_keyword_tool = SearchKeywordTool(workspace_path=ws)
-    # 🌟 VÁ LỖI: Khởi tạo ProposePlanTool cho Node thực thi
+    
+    # Lấy thông tin bối cảnh cập nhật từ state của đồ thị
+    current_workspace_context = state.get("workspace_context", "")
+    current_detailed_analysis = state.get("detailed_analysis", "")
+    
+    # Khởi tạo Tool E2E với bối cảnh chia sẻ
+    flutter_e2e_test = FlutterE2ETestTool(
+        workspace_path=ws,
+        workspace_context=current_workspace_context,
+        detailed_analysis=current_detailed_analysis
+    )
     
     tools_map = {
         "read_files": read_files,
@@ -1684,6 +1773,7 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         "run_skill_script": RunSkillScriptTool(workspace_path=ws),
         "write_and_run_script": write_and_run_script,
         "search_keyword": search_keyword_tool,
+        "run_flutter_e2e_test": flutter_e2e_test, # <-- Đăng ký chạy thực tế
     }
     
     last_message = state["messages"][-1]

@@ -1,4 +1,4 @@
-# main.py (Tệp tin cấu hình hoàn chỉnh đồ thị tích hợp luồng Doubt-Driven)
+# main.py (Tệp tin cấu hình đồ thị đã loại bỏ node flutter_testing độc lập)
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -23,9 +23,10 @@ builder.add_node("tester", nodes.tester_node)
 builder.add_node("synthesis", nodes.synthesis_node)
 builder.add_node("commit", nodes.commit_node)
 builder.add_node("context_compressor", nodes.context_compressor_node)
-# 🌟 ĐĂNG KÝ CÁC NÚT THẨM ĐỊNH ĐỐI KHÁNG MỚI (DOUBT-DRIVEN WORKFLOW)
+# ĐĂNG KÝ CÁC NÚT THẨM ĐỊNH ĐỐI KHÁNG
 builder.add_node("doubt_reviewer", nodes.doubt_reviewer_node)
 builder.add_node("doubt_gate", nodes.doubt_gate_node)
+# 🌟 Đã gỡ bỏ: builder.add_node("flutter_testing", nodes.flutter_testing_node)
 
 # =====================================================================
 # 2. THIẾT LẬP CÁC CẠNH NỐI CHÍNH (EDGES & ROUTERS)
@@ -33,7 +34,9 @@ builder.add_node("doubt_gate", nodes.doubt_gate_node)
 builder.add_edge(START, "detect_and_triage")
 builder.add_edge("detect_and_triage", "executor")
 
-# Định tuyến từ Executor (Kiểm tra xem cần gọi Tool, Test tĩnh hay Lập kế hoạch)
+# 🌟 Đã gỡ bỏ hoàn toàn cấu hình conditional_edges của "flutter_testing"
+
+# Định tuyến từ Executor
 builder.add_conditional_edges(
     "executor",
     routers.executor_router,
@@ -47,7 +50,8 @@ builder.add_conditional_edges(
     }
 )
 builder.add_edge("context_compressor", "replanner")
-# Cập nhật định tuyến từ Tool Node qua Gate tương tác trung gian
+
+# Định tuyến từ Tool Node
 builder.add_conditional_edges(
     "tool_node", 
     routers.tool_router, 
@@ -58,52 +62,50 @@ builder.add_conditional_edges(
 )
 builder.add_edge("human_interaction_gate", "executor")
 
-# Định tuyến từ Tester (Kiểm tra tĩnh thành công sẽ rẽ hướng sang Doubt Reviewer)
+# Định tuyến từ Tester (đã cập nhật tester_router để bỏ chuyển hướng qua node flutter_testing)
 builder.add_conditional_edges(
     "tester", 
     routers.tester_router, 
     {
         "executor": "executor",
         "chrome_extension_debugger": "chrome_extension_debugger",
-        "doubt_reviewer": "doubt_reviewer",     # 🌟 Rẽ hướng sang đối kháng
+        "doubt_reviewer": "doubt_reviewer",
         "replanner": "replanner",   
         "commit": "commit"                              
     }
 )
 
-# Định tuyến từ Chrome Extension Debugger (Kiểm tra động thành công rẽ sang Doubt Reviewer)
+# Định tuyến từ Chrome Extension Debugger
 builder.add_conditional_edges(
     "chrome_extension_debugger", 
     routers.debugger_router, 
     {
         "executor": "executor",
-        "doubt_reviewer": "doubt_reviewer",     # 🌟 Rẽ hướng sang đối kháng
+        "doubt_reviewer": "doubt_reviewer",
         "replanner": "replanner",
         "synthesis": "synthesis"
     }
 )
 
-# 🌟 ĐỊNH TUYẾN SAU KHI PHÂN TÍCH ĐỐI KHÁNG XONG (DOUBT REVIEWER)
+# ĐỊNH TUYẾN SAU KHI PHÂN TÍCH ĐỐI KHÁNG XONG (DOUBT REVIEWER)
 builder.add_conditional_edges(
     "doubt_reviewer",
     routers.doubt_router,
     {
-        "doubt_gate": "doubt_gate",             # Đi tới Nút Ngắt tương tác nếu có nghi ngờ
-        "synthesis": "synthesis",               # Đi tiếp tới đóng gói nếu sạch lỗi logic
-        "commit": "commit"                      # Đi thẳng tới commit (với tác vụ đơn giản)
+        "doubt_gate": "doubt_gate",
+        "synthesis": "synthesis",
+        "commit": "commit"
     }
 )
 
-# 🌟 ĐỊNH HƯỚNG TỪ NÚT NGẮT ĐỐI KHÁNG (DOUBT GATE)
-# Sử dụng một hàm lambda để xác định: Nếu tồn tại error_logs (do người dùng yêu cầu sửa lỗi),
-# đồ thị sẽ quay ngược về 'executor'. Ngược lại, đi tiếp tới khâu đóng gói hoặc commit.
+# ĐỊNH HƯỚNG TỪ NÚT NGẮT ĐỐI KHÁNG (DOUBT GATE)
 builder.add_conditional_edges(
     "doubt_gate",
     lambda state: "executor" if state.get("error_logs") else ("synthesis" if state.get("plan") else "commit"),
     {
-        "executor": "executor",                 # Quay lại sửa code dựa trên phản hồi nghi ngờ
-        "synthesis": "synthesis",               # Tiến tới đóng gói tài liệu tổng hợp
-        "commit": "commit"                      # Commit trực tiếp (với tác vụ đơn giản)
+        "executor": "executor",
+        "synthesis": "synthesis",
+        "commit": "commit"
     }
 )
 
@@ -117,6 +119,5 @@ builder.add_conditional_edges("replanner_interrupt", routers.replanner_router, {
 builder.add_edge("synthesis", "commit")
 builder.add_edge("commit", END)
 
-# Sử dụng Memory để lưu lại checkpoint, phục vụ việc hồi phục sau khi interrupt()
 memory = MemorySaver()
 app = builder.compile(checkpointer=memory)

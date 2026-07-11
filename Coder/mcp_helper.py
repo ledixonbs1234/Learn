@@ -1,4 +1,5 @@
 # mcp_helper.py
+import json
 import os
 import sys
 import platform
@@ -26,12 +27,21 @@ def get_default_browser_profile_dir() -> str:
         return os.path.join(home, ".config", "google-chrome")
 async def run_agent_with_flutter_skill_mcp(model, prompt_message: str, chat_history: List[BaseMessage] = None, workspace_path: str = "."):
     """
-    Khởi chạy flutter-skill dưới dạng MCP Server và nạp các công cụ E2E 
+    Khởi chạy flutter_skill dưới dạng MCP Server và nạp các công cụ E2E 
     vào ngữ cảnh của AI Agent để tương tác trực tiếp với ứng dụng.
     """
-    # Khởi chạy flutter-skill thông qua CLI đã được cài đặt trên máy Host
+    # Các công cụ có khả năng kích hoạt kết nối mới để mở khóa các công cụ tương tác sâu
+    CONNECTION_TOOLS = {
+        "connect_app", 
+        "launch_app", 
+        "scan_and_connect", 
+        "connect_cdp", 
+        "connect_openclaw_browser", 
+        "connect_webmcp"
+    }
+
     server_params = StdioServerParameters(
-        command="flutter-skill",
+        command="flutter_skill",
         args=["server"]
     )
     
@@ -48,20 +58,70 @@ async def run_agent_with_flutter_skill_mcp(model, prompt_message: str, chat_hist
     messages = [SystemMessage(content=system_prompt)] + chat_history
     messages.append(HumanMessage(content=prompt_message))
     
+    # Hàm hỗ trợ phân tích đệ quy kết quả trả về để xác định kết nối thành công
+    def is_connection_successful(result) -> bool:
+        if not result:
+            return False
+        
+        # Nếu là danh sách (đầu ra của LangChain/MCP thường là list của các đối tượng nội dung)
+        if isinstance(result, list):
+            return any(is_connection_successful(item) for item in result)
+        
+        # Nếu là đối tượng có thuộc tính 'text' hoặc 'content'
+        if hasattr(result, 'text'):
+            return is_connection_successful(getattr(result, 'text'))
+        if hasattr(result, 'content'):
+            return is_connection_successful(getattr(result, 'content'))
+            
+        # Nếu là dictionary
+        if isinstance(result, dict):
+            # Xử lý trường hợp dạng {'type': 'text', 'text': '...'} như kết quả của bạn
+            if 'text' in result:
+                return is_connection_successful(result['text'])
+            
+            # Kiểm tra trực tiếp các cờ trạng thái thành công
+            if result.get("success") is True or result.get("connected") is True:
+                return True
+            
+            # Đề phòng trường hợp giá trị của success là chuỗi "true" thay vì boolean
+            if str(result.get("success")).lower() == "true" or str(result.get("connected")).lower() == "true":
+                return True
+                
+            return False
+            
+        # Nếu là chuỗi JSON hoặc chuỗi thường
+        if isinstance(result, str):
+            trimmed = result.strip()
+            if trimmed.startswith('{') and trimmed.endswith('}'):
+                try:
+                    parsed = json.loads(trimmed)
+                    return is_connection_successful(parsed)
+                except Exception:
+                    pass
+            # Kiểm tra fallback bằng từ khóa trong chuỗi
+            lower_str = trimmed.lower()
+            return ("success" in lower_str and "true" in lower_str) or "connected to" in lower_str
+            
+        return False
+
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
+            
+            # Nạp danh sách tool ban đầu (13 tools)
             mcp_tools = await load_mcp_tools(session)
             tools_map = {tool.name: tool for tool in mcp_tools}
             model_with_tools = model.bind_tools(mcp_tools)
             
             # Giới hạn tối đa 10 lượt suy luận/hành động tương tác cho một phiên kiểm thử
-            for _ in range(10):
+            for i in range(20):
                 response = await model_with_tools.ainvoke(messages)
                 messages.append(response)
                 
                 if not response.tool_calls:
                     break
+                
+                connection_established = False
                     
                 for tool_call in response.tool_calls:
                     tool_name = tool_call["name"]
@@ -70,7 +130,14 @@ async def run_agent_with_flutter_skill_mcp(model, prompt_message: str, chat_hist
                     
                     if tool_name in tools_map:
                         try:
+                            # Thực thi công cụ
                             tool_result = await tools_map[tool_name].ainvoke(tool_args)
+                            print(f"🛠️ Công cụ '{tool_name}' đã được thực thi với kết quả:\n {tool_result}")
+                            
+                            # Kiểm tra xem công cụ kết nối có chạy thành công không
+                            if tool_name in CONNECTION_TOOLS and is_connection_successful(tool_result):
+                                connection_established = True
+
                             messages.append(ToolMessage(
                                 content=str(tool_result),
                                 name=tool_name,
@@ -88,6 +155,17 @@ async def run_agent_with_flutter_skill_mcp(model, prompt_message: str, chat_hist
                             name=tool_name,
                             tool_call_id=tool_id
                         ))
+                
+                # Nếu phát hiện kết nối thành công, tiến hành nạp lại toàn bộ công cụ mới (Dynamic Re-binding)
+                if connection_established:
+                    print("🔄 Đã phát hiện kết nối thành công. Tiến hành nạp lại danh sách công cụ từ MCP...")
+                    await asyncio.sleep(1.0)  # Chờ 1 giây để server đồng bộ trạng thái kết nối và phản hồi cổng
+                    
+                    mcp_tools = await load_mcp_tools(session)
+                    tools_map = {tool.name: tool for tool in mcp_tools}
+                    model_with_tools = model.bind_tools(mcp_tools)
+                    
+                    print(f"✅ Đã cập nhật thành công! Tổng số công cụ khả dụng hiện tại: {len(mcp_tools)}")
             
             return messages[-1].content
 async def run_agent_with_devtools_mcp(model, prompt_message: str, chat_history: List[BaseMessage] = None):

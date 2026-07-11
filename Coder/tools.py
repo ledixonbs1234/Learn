@@ -1220,7 +1220,60 @@ class ActivateSkillTool(BaseTool):
             return f"Lỗi: Không tìm thấy Skill nào có tên là '{skill_name}' trong thư mục .skills/"
         return body
 
+class FlutterE2ETestSchema(BaseModel):
+    test_instruction: str = Field(
+        description="Mô tả kịch bản kiểm thử E2E cần thực thi bằng ngôn ngữ tự nhiên (ví dụ: 'Hãy mở app, click vào nút Login và kiểm tra xem có thông báo lỗi xuất hiện không')."
+    )
 
+class FlutterE2ETestTool(BaseTool):
+    name: str = "run_flutter_e2e_test"
+    description: str = (
+        "Ủy quyền cho một Sub-Agent kiểm thử chuyên biệt chạy độc lập để thực thi E2E tự động trên ứng dụng Flutter. "
+        "Giúp cô lập hoàn toàn token lịch sử tương tác UI và chỉ trả về báo cáo kết quả cuối cùng."
+    )
+    args_schema: Type[BaseModel] = FlutterE2ETestSchema
+    workspace_path: str
+    workspace_context: str = ""  # Nhận thông tin bối cảnh dự án được chia sẻ từ triage node
+    detailed_analysis: str = ""  # Nhận phân tích mục tiêu ban đầu từ triage node
+
+    def _run(self, test_instruction: str) -> str:
+        import asyncio
+        from mcp_helper import run_agent_with_flutter_skill_mcp
+        from config import model
+        
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        if loop.is_running():
+            import nest_asyncio
+            nest_asyncio.apply()
+            
+        # Đóng gói thông tin bối cảnh chia sẻ để Sub-Agent có cùng xuất phát điểm tri thức
+        enriched_prompt = (
+            f"=== THÔNG TIN BỐI CẢNH ĐƯỢC CHIA SẺ ===\n"
+            f"- Workspace Path: `{self.workspace_path}`\n"
+            f"- Ngữ cảnh hệ thống (THONGTIN.md): {self.workspace_context or 'N/A'}\n"
+            f"- Phân tích mục tiêu ban đầu: {self.detailed_analysis or 'N/A'}\n\n"
+            f"=== YÊU CẦU KIỂM THỬ E2E TỪ EXECUTOR ===\n"
+            f"Hãy thực hiện độc lập kịch bản sau và báo cáo lại kết quả cụ thể: {test_instruction}"
+        )
+        
+        try:
+            # Khởi chạy Sub-Agent với chat_history rỗng để cô lập hoàn toàn Token tương tác thô!
+            test_output = loop.run_until_complete(
+                run_agent_with_flutter_skill_mcp(
+                    model=model,
+                    prompt_message=enriched_prompt,
+                    chat_history=[], # Đảm bảo cô lập tuyệt đối lịch sử chat thô của sub-agent
+                    workspace_path=self.workspace_path
+                )
+            )
+            return test_output
+        except Exception as e:
+            return f"❌ Lỗi hệ thống khi Sub-Agent thực thi kiểm thử: {str(e)}"
 class RunSkillScriptSchema(BaseModel):
     skill_name: str = Field(description="Tên của Skill (ví dụ: 'excel-handler').")
     script_name: str = Field(description="Tên file script nằm trong thư mục scripts/ của Skill đó (ví dụ: 'read_excel.py').")

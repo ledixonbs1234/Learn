@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "flutter-add-integration-test": {
+      "source": "flutter/skills",
+      "sourceType": "github",
+      "skillPath": "skills/flutter-add-integration-test/SKILL.md",
+      "computedHash": "4246d3ef5f21bdb7945899056b99cf3863e2bff645a132b41634caaded68da6d"
+    }
+  }
+}

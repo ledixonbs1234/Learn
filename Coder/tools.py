@@ -110,7 +110,25 @@ class ApplyPatchSchema(BaseModel):
                     "[Mã mới cần đổi]\n"
                     ">>>>>>> REPLACE"
     )
+class CompleteTaskSchema(BaseModel):
+    task_id: str = Field(description="Mã định danh duy nhất của nhiệm vụ hiện hành đã hoàn tất (ví dụ: 'T1', 'T2', 'T_SURVEY').")
+    summary: str = Field(description="Bản tóm tắt cô đọng về các kết quả đạt được, các tệp tin đã xử lý trong nhiệm vụ này.")
 
+class CompleteTaskTool(BaseTool):
+    name: str = "complete_agent_task"
+    description: str = (
+        "BẮT BUỘC gọi công cụ này khi bạn đã thực thi và hoàn tất thành công mọi yêu cầu của nhiệm vụ hiện hành. "
+        "Hệ thống sẽ dựa vào cuộc gọi này để ghi nhận trạng thái và chuyển sang pha tiếp theo tự động."
+    )
+    args_schema: Type[BaseModel] = CompleteTaskSchema
+    workspace_path: str
+
+    def _run(self, task_id: str, summary: str) -> str:
+        return json.dumps({
+            "status": "task_completed",
+            "task_id": task_id,
+            "summary": summary
+        }, ensure_ascii=False)
 class ListDirSchema(BaseModel):
     sub_dir: str = Field(default=".", description="Đường dẫn tương đối của thư mục cần xem.")
 

@@ -13,11 +13,11 @@ from venv import logger
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langgraph.types import interrupt
 from config import find_project_root_heuristic, model, sanitize_and_resolve_path, fast_model
-from mcp_helper import run_agent_with_devtools_mcp, run_agent_with_flutter_skill_mcp
+from mcp_helper import run_agent_with_devtools_mcp
 from skills_engine import AgentSkillsEngine
 from state import AgentState, PlanUpdate, RuntimeVerificationResult, TaskTriage, Task
 from tools import (
-    ActivateSkillTool, AskQuestionsTool, FlutterE2ETestTool, GitManager, ReadFileLinesTool, RunSkillScriptTool, SearchKeywordTool, UniversalSymbolSearchTool, WebInteractAndTestTool, WorkspaceTools, 
+    ActivateSkillTool, AskQuestionsTool, CompleteTaskTool, GitManager, ReadFileLinesTool, RunSkillScriptTool, SearchKeywordTool, UniversalSymbolSearchTool, WebInteractAndTestTool, WorkspaceTools, 
     ReadFilesTool, WriteAndRunScriptTool, WriteFileTool, ApplyPatchTool, 
     ListDirectoryTool, RunTerminalTool, get_markdown_language
 )
@@ -407,7 +407,8 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
                 provisional_workspace = str(find_project_root_heuristic(resolved_path))
                 if provisional_workspace != existing_workspace and existing_workspace:
                     pivoted_msg = f"🔄 **[Chuyển đổi Workspace]**: Phát hiện yêu cầu chuyển đổi thư mục làm việc sang: `{provisional_workspace}`\n"
-        except Exception: pass
+        except Exception:
+            pass
     else:
         if existing_workspace:
             pivoted_msg = f"🔄 **[Kế thừa Workspace]**: Sử dụng lại thư mục làm việc hiện hành: `{existing_workspace}`\n"
@@ -795,7 +796,7 @@ def context_loader_node(state: AgentState) -> Dict[str, Any]:
     if ext_dir:
         ext_msg = f"\n📦 **[Tự động nhận diện Extension]**: Đã định vị thư mục Chrome Extension tại: `{ext_dir}`"
     else:
-        ext_msg = f"\n📦 **[Tự động nhận diện Extension]**: Không tìm thấy manifest.json trực tiếp trong thư mục workspace."
+        ext_msg = "\n📦 **[Tự động nhận diện Extension]**: Không tìm thấy manifest.json trực tiếp trong thư mục workspace."
         
     return {
         "workspace_context": workspace_context,
@@ -897,7 +898,6 @@ def chrome_extension_debugger_node(state: AgentState) -> Dict[str, Any]:
     Nút xử lý gỡ lỗi chuyên sâu sử dụng Chrome DevTools MCP.
     Đánh giá xem Extension có chạy mượt mà ở runtime hay không.
     """
-    ws = state["workspace_path"]
     ext_path = state.get("extension_path")
     
     if not ext_path:
@@ -986,21 +986,24 @@ def context_compressor_node(state: AgentState) -> Dict[str, Any]:
     if prd_path.exists():
         try:
             compiled_context_parts.append(f"### [PRODUCT REQUIREMENTS DOCUMENT (PRD.md)]\n{prd_path.read_text(encoding='utf-8')}")
-        except Exception: pass
+        except Exception:
+            pass
 
     # Đọc THONGTIN.md
     thongtin_path = workspace_root / "THONGTIN.md"
     if thongtin_path.exists():
         try:
             compiled_context_parts.append(f"### [THÔNG TIN DỰ ÁN (THONGTIN.md)]\n{thongtin_path.read_text(encoding='utf-8')}")
-        except Exception: pass
+        except Exception:
+            pass
 
     # Đọc CONTEXT.md (Glossary)
     context_file_path = workspace_root / "CONTEXT.md"
     if context_file_path.exists():
         try:
             compiled_context_parts.append(f"### [BẢNG THUẬT NGỮ NGHIỆP VỤ (CONTEXT.md)]\n{context_file_path.read_text(encoding='utf-8')}")
-        except Exception: pass
+        except Exception:
+            pass
 
     # Đọc danh sách các quyết định kiến trúc (ADRs)
     adr_dir = workspace_root / "docs" / "adr"
@@ -1011,7 +1014,8 @@ def context_compressor_node(state: AgentState) -> Dict[str, Any]:
                 adr_texts.append(f"#### Tệp {adr_file.name}:\n{adr_file.read_text(encoding='utf-8')}")
             if adr_texts:
                 compiled_context_parts.append("### [QUYẾT ĐỊNH KIẾN TRÚC (ARCHITECTURAL DECISIONS - ADRs)]\n" + "\n\n".join(adr_texts))
-        except Exception: pass
+        except Exception:
+            pass
 
     super_context = "\n\n---\n\n".join(compiled_context_parts)
     if not super_context:
@@ -1200,7 +1204,20 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
     activate_skill_tool = ActivateSkillTool(workspace_path=ws)
     run_skill_script_tool = RunSkillScriptTool(workspace_path=ws)
     search_keyword_tool = SearchKeywordTool(workspace_path=ws)
+    complete_task_tool = CompleteTaskTool(workspace_path=ws)
+    parsed_plan = []
+    for t in plan:
+        if isinstance(t, dict):
+            parsed_plan.append(Task(**t))
+        else:
+            parsed_plan.append(t)
 
+    has_pending_tasks = any(t.status == "pending" for t in parsed_plan)
+    if not has_pending_tasks:
+        return {
+            "plan": parsed_plan,
+            "messages": [AIMessage(content="🎉 **[Hệ thống tự động duyệt hoàn thành]**: Toàn bộ nhiệm vụ trong lộ trình đã hoàn thành thành công.")]
+        }
     if task_type == "analysis":
         # PHA KHẢO SÁT: Đọc hiểu mã nguồn, phỏng vấn nghiệp vụ và thiết lập tài liệu đặc tả (PRD, CONTEXT, ADRs)
         read_files = ReadFilesTool(workspace_path=ws)
@@ -1212,16 +1229,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         # Cấp thêm quyền ghi tệp tin tài liệu nghiệp vụ
         write_file = WriteFileTool(workspace_path=ws)
         apply_patch = ApplyPatchTool(workspace_path=ws)
-        # Lấy thông tin bối cảnh cập nhật từ state
-        current_workspace_context = state.get("workspace_context", "") or workspace_context
-        current_detailed_analysis = state.get("detailed_analysis", "")
         
-        # Khởi tạo Tool với đầy đủ tri thức được chia sẻ từ detect_and_triage_node
-        flutter_e2e_test = FlutterE2ETestTool(
-            workspace_path=ws,
-            workspace_context=current_workspace_context,
-            detailed_analysis=current_detailed_analysis
-        )
         tools = [
             activate_skill_tool, 
             run_skill_script_tool, 
@@ -1232,7 +1240,8 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             ask_questions_tool, 
             search_keyword_tool,
             write_file,
-            apply_patch,flutter_e2e_test
+            apply_patch,
+            complete_task_tool
         ]
         
         system_prompt = (
@@ -1258,23 +1267,12 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         read_file_lines = ReadFileLinesTool(workspace_path=ws)
         write_and_run_script = WriteAndRunScriptTool(workspace_path=ws)
         ask_questions_tool = AskQuestionsTool(workspace_path=ws)
-        
-        # Lấy thông tin bối cảnh cập nhật từ state
-        current_workspace_context = state.get("workspace_context", "") or workspace_context
-        current_detailed_analysis = state.get("detailed_analysis", "")
-        
-        # Khởi tạo Tool với đầy đủ tri thức được chia sẻ từ detect_and_triage_node
-        flutter_e2e_test = FlutterE2ETestTool(
-            workspace_path=ws,
-            workspace_context=current_workspace_context,
-            detailed_analysis=current_detailed_analysis
-        )
+       
         
         tools = [
             activate_skill_tool, run_skill_script_tool, read_files, write_file, 
             apply_patch, list_directory, run_terminal_command, search_symbols, 
-            read_file_lines, ask_questions_tool, write_and_run_script, search_keyword_tool,
-            flutter_e2e_test
+            read_file_lines, ask_questions_tool, write_and_run_script, search_keyword_tool,complete_task_tool
         ]
         
         system_prompt = (
@@ -1328,12 +1326,15 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
                 state_updates["step_findings"] = findings
             return state_updates
         else:
+            # 🌟 PHƯƠNG ÁN DỰ PHÒNG AN TOÀN (FALLBACK DECK):
+            # Nếu Agent không gọi công cụ complete_agent_task mà chỉ viết văn bản thông báo kết quả, 
+            # chúng ta vẫn tiến hành kiểm tra bổ trợ để tránh việc Agent bị treo không lý do.
             has_executed_action = any(
-                getattr(msg, "type", None) == "tool" and msg.name in ["write_file", "apply_search_replace_patch", "run_terminal_command", "run_skill_script"]
+                getattr(msg, "type", None) == "tool" and msg.name in ["write_file", "apply_search_replace_patch", "run_terminal_command", "run_skill_script", "complete_agent_task"]
                 for msg in reversed(messages)
             )
             content_lower = response.content.lower() if response.content else ""
-            explicitly_finished = any(kw in content_lower for kw in ["hoàn thành", "hoàn tất", "done", "finished"])
+            explicitly_finished = any(kw in content_lower for kw in ["hoàn thành", "hoàn tất", "done", "finished", "đã hoàn thành"])
 
             if has_executed_action or explicitly_finished:
                 updated_plan = []
@@ -1353,7 +1354,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
                 return state_updates
             else:
                 warning_feedback = HumanMessage(
-                    content="⚠️ Cảnh báo: Bạn chưa thực hiện chỉnh sửa nào lên file hoặc kích hoạt script. Hãy ghi file hoặc vá code trước khi hoàn tất."
+                    content="⚠️ Cảnh báo: Bạn chưa gọi công cụ 'complete_agent_task' để hoàn thành nhiệm vụ này. Hãy gọi công cụ đó để kết thúc công việc."
                 )
                 state_updates.update({
                     "messages": [response, warning_feedback],
@@ -1509,54 +1510,7 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
         "messages": [proposal_message],
         "active_skills": active_skills 
     }
-def flutter_testing_node(state: AgentState) -> Dict[str, Any]:
-    """
-    [NODE MỚI] Thực hiện kiểm thử E2E tự động bằng AI thông qua flutter-skill MCP.
-    """
-    ws = state["workspace_path"]
-    pubspec_path = Path(ws) / "pubspec.yaml"
-    
-    # Rào chắn kiểm tra: Nếu không phải dự án Flutter hoặc Mobile liên quan, bỏ qua
-    if not pubspec_path.exists():
-        return {"messages": [AIMessage(content="Bỏ qua kiểm thử Flutter: Không tìm thấy pubspec.yaml trong thư mục gốc.")]}
 
-    user_query = (
-        "Hãy thực hiện kiểm tra giao diện ứng dụng. "
-        "Kết nối vào ứng dụng đang chạy, kiểm tra xem màn hình chính có hiển thị đầy đủ các thành phần "
-        "và thử thực hiện một kịch bản nhấn thử vào các nút chức năng chính để đảm bảo không bị lỗi."
-    )
-    
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-    if loop.is_running():
-        import nest_asyncio
-        nest_asyncio.apply()
-        
-    # Gọi MCP Server để tương tác trực tiếp với ứng dụng Flutter
-    test_output = loop.run_until_complete(
-        run_agent_with_flutter_skill_mcp(
-            model=model,
-            prompt_message=user_query,
-            chat_history=list(state.get("messages", [])),
-            workspace_path=ws
-        )
-    )
-    
-    # Phân tích kết quả chạy test
-    has_error = "lỗi" in test_output.lower() or "failed" in test_output.lower()
-    
-    ret_state = {
-        "messages": [AIMessage(content=f"📋 **[Kết quả kiểm thử tự động với Flutter-Skill]**:\n\n{test_output}")]
-    }
-    
-    if has_error:
-        ret_state["error_logs"] = f"❌ [Lỗi E2E Flutter UI]: Phát hiện bất thường trong quá trình tương tác ứng dụng.\nChi tiết: {test_output}"
-        
-    return ret_state
 
 def replanner_interrupt_node(state: AgentState) -> Dict[str, Any]:
     """
@@ -1748,16 +1702,7 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
     write_and_run_script = WriteAndRunScriptTool(workspace_path=ws)
     search_keyword_tool = SearchKeywordTool(workspace_path=ws)
     
-    # Lấy thông tin bối cảnh cập nhật từ state của đồ thị
-    current_workspace_context = state.get("workspace_context", "")
-    current_detailed_analysis = state.get("detailed_analysis", "")
-    
-    # Khởi tạo Tool E2E với bối cảnh chia sẻ
-    flutter_e2e_test = FlutterE2ETestTool(
-        workspace_path=ws,
-        workspace_context=current_workspace_context,
-        detailed_analysis=current_detailed_analysis
-    )
+    complete_task_tool = CompleteTaskTool(workspace_path=ws) 
     
     tools_map = {
         "read_files": read_files,
@@ -1773,7 +1718,7 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         "run_skill_script": RunSkillScriptTool(workspace_path=ws),
         "write_and_run_script": write_and_run_script,
         "search_keyword": search_keyword_tool,
-        "run_flutter_e2e_test": flutter_e2e_test, # <-- Đăng ký chạy thực tế
+        "complete_agent_task": complete_task_tool
     }
     
     last_message = state["messages"][-1]
@@ -1784,7 +1729,7 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
     modified_files = list(state.get("modified_files", []))
     file_registry = dict(state.get("file_registry", {}))
     impacted_files = set()
-    
+    completed_task_ids = []
     for tool_call in last_message.tool_calls:
         tool_name = tool_call["name"]
         tool_args = tool_call["args"] or {}
@@ -1843,10 +1788,25 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         except Exception:
             pass
             
+    updated_plan = list(state.get("plan", []))
+    if completed_task_ids:
+        parsed_plan = []
+        for t in updated_plan:
+            if isinstance(t, dict):
+                parsed_plan.append(Task(**t))
+            else:
+                parsed_plan.append(t)
+                
+        for t in parsed_plan:
+            if t.id in completed_task_ids:
+                t.status = "completed"
+        updated_plan = parsed_plan
+
     return {
         "messages": tool_messages,
         "modified_files": modified_files,
-        "file_registry": file_registry
+        "file_registry": file_registry,
+        "plan": updated_plan # Đồng bộ kế hoạch mới cập nhật vào state
     }
 
 

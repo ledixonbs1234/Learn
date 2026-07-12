@@ -12,7 +12,7 @@ from typing import Dict, Any, Optional,  Tuple, List
 from venv import logger
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langgraph.types import interrupt
-from config import find_project_root_heuristic, model, sanitize_and_resolve_path, fast_model
+from config import find_project_root_heuristic, model, sanitize_and_resolve_path, fast_model, sanitize_tool_result_content
 from mcp_helper import run_agent_with_devtools_mcp
 from skills_engine import AgentSkillsEngine
 from state import AgentState, PlanUpdate, RuntimeVerificationResult, TaskTriage, Task
@@ -1398,6 +1398,10 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             "2. Khi kỹ năng đã được kích hoạt (hiển thị tại '=== ⚡ CÁC KỸ NĂNG ĐANG HOẠT ĐỘNG (TIER 2) ==='), bạn BẮT BUỘC phải tuân thủ tuyệt đối "
             "tất cả cấu trúc, quy trình làm việc và định dạng tệp tin được ghi rõ trong chỉ dẫn của kỹ năng đó. Tuyệt đối không tự suy diễn cấu trúc.\n"
             "3. Nếu kỹ năng chứa các kịch bản chạy bổ trợ (scripts), hãy sử dụng công cụ `run_skill_script` để chạy thay vì viết lại mã thô.\n\n"
+            "⚠️ QUY TẮC CÔ LẬP NHIỆM VỤ ĐƠN (SINGLE TASK ISOLATION - BẮT BUỘC):\n"
+            "1. Bạn CHỈ ĐƯỢC PHÉP tập trung thực hiện duy nhất (1) nhiệm vụ đang được liệt kê tại phần 'Nhiệm vụ hiện tại' ở trên (ví dụ: chỉ giải quyết T1).\n"
+            "2. TUYỆT ĐỐI KHÔNG tự ý thực hiện tiếp các nhiệm vụ tiếp theo trong lộ trình (T2, T3...) mặc dù bạn có thể nhìn thấy chúng trong lịch sử trò chuyện. Việc tự ý gom nhiều nhiệm vụ để thực hiện liên tiếp trong một lượt sẽ bỏ qua bước nén RAM/dọn dẹp tin nhắn rác, dẫn đến sập hệ thống do tràn bộ nhớ token.\n"
+            "3. Ngay sau khi hoàn thành xong nhiệm vụ được chỉ định, bạn BẮT BUỘC phải gọi công cụ 'complete_agent_task' để bàn giao kết quả và chuyển quyền điều phối về cho đồ thị Orchestrator dọn dẹp bộ nhớ trước khi tiếp nhận nhiệm vụ tiếp theo.\n\n"
             "⚠️ QUY TẮC THIẾT LẬP TÀI LIỆU & KHẢO SÁT (BẮT BUỘC):\n"
             "1. Bạn có quyền đọc mã nguồn và viết/cập nhật các tệp tài liệu đặc tả quan trọng như `CONTEXT.md`, các quyết định kiến trúc (ADRs) trong `docs/adr/`, và `PRD.md`.\n"
             "   TUYỆT ĐỐI KHÔNG sửa đổi các tệp tin mã nguồn chạy thật (code) của ứng dụng trong pha khảo sát này.\n"
@@ -1437,19 +1441,17 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             f"Thư mục làm việc: {ws}\n\n"
             
             # 🌟 CHỈ DẪN TRUY XUẤT OPENWIKI TOÀN CỤC CHO PHA PHÁT TRIỂN
-            "⚠️ HƯỚNG DẪN TRUY XUẤT TRI THỨC TOÀN CỤC (JUST-IN-TIME RETRIEVAL):\n"
-            "1. Hệ thống của bạn tích hợp bộ nhớ tri thức toàn cục (Global Brain) lưu tại thư mục hệ thống: `~/.openwiki/wiki/`.\n"
-            "2. Trước khi sửa đổi mã nguồn hoặc viết code phức tạp, bạn BẮT BUỘC phải gọi công cụ `query_global_openwiki` "
-            "để tra cứu xem các dự án trước đã đúc kết được quy trình tối ưu hay cách sửa lỗi tương ứng chưa.\n"
-            "3. Nếu tìm thấy file kỹ năng phù hợp, hãy áp dụng chính xác quy trình và các lưu ý phòng ngừa lỗi biên dịch từ tài liệu đó.\n\n"
-            "⚠️ QUY TẮC KÍCH HOẠT & TUÂN THỦ KỸ NĂNG (BẮT BUỘC):\n"
-            "1. Trước khi thực hiện viết code, sửa lỗi, hoặc viết test, hãy rà soát danh sách '=== THƯ VIỆN KỸ NĂNG KHẢ DỤNG (TIER 1) ==='. "
-            "Nếu có kỹ năng hỗ trợ phù hợp (ví dụ: 'test-driven-development'), bạn BẮT BUỘC phải gọi công cụ `activate_agent_skill` để tải chỉ dẫn sâu.\n"
-            "2. Khi thực thi các tác vụ thuộc kỹ năng đã kích hoạt (hiển thị tại '=== ⚡ CÁC KỸ NĂNG ĐANG HOẠT ĐỘNG (TIER 2) ==='), bạn "
-            "phải tuân thủ 100% các tiêu chuẩn kỹ thuật đề ra trong tài liệu của kỹ năng đó.\n"
-            "3. Ưu tiên chạy các script chuyên dụng của kỹ năng bằng `run_skill_script` thay vì tự gõ lệnh terminal thủ công nếu hệ thống có sẵn.\n\n"
             "⚠️ HƯỚNG DẪN TIẾT KIỆM TOKEN:\n"
             "Ưu tiên sử dụng `apply_search_replace_patch` thay vì ghi đè lại toàn bộ tệp tin lớn bằng `write_file`.\n\n"
+            "⚠️ QUY TẮC BẮT BUỘC KHI THỰC HIỆN KIỂM THỬ THỦ CÔNG (MANUAL TESTING & QA VERIFICATION):\n"
+            "1. TUYỆT ĐỐI KHÔNG chạy các lệnh terminal duy trì liên tục (persistent/blocking process) như `flutter run` hoặc `npm start` một cách đồng bộ vì sẽ làm nghẽn toàn bộ luồng suy nghĩ của hệ thống. "
+            "Hãy chạy ở chế độ nền (ví dụ: `start /B flutter run` trên Windows, hoặc `flutter run &` trên macOS/Linux) hoặc hướng dẫn rõ ràng để người dùng tự khởi động ứng dụng trên thiết bị/emulator của họ.\n"
+            "2. TUYỆT ĐỐI KHÔNG chỉ viết checklist ra file `.md` tĩnh rồi kết thúc tác vụ mà không đợi phản hồi. "
+            "Bạn BẮT BUỘC phải gọi công cụ `ask_questions_if_underspecified` để gửi một biểu mẫu (Form) câu hỏi động đến người dùng. "
+            "Cấu trúc biểu mẫu phải chuyển hóa các hạng mục kiểm thử (như Khởi động App, Trang Settings, Chức năng Tìm kiếm, Đọc truyện) thành các câu hỏi dạng 'select' (Lựa chọn) với hai giá trị phản hồi: 'pass' (Thành công) và 'fail' (Thất bại) để người dùng tích chọn trực tiếp trên giao diện.\n"
+            "3. Phân tích kết quả phản hồi của người dùng trong lượt tin nhắn (HumanMessage) tiếp theo để xử lý thông minh:\n"
+            "   - Nếu tất cả các hạng mục đều đạt trạng thái 'pass', hãy gọi công cụ `complete_agent_task` để chính thức đóng nhiệm vụ.\n"
+            "   - Nếu có bất kỳ hạng mục nào bị người dùng đánh giá 'fail' hoặc báo lỗi, hãy đọc kỹ ghi chú phản hồi, tự động định vị các file mã nguồn liên quan để sửa lỗi, sau đó thiết lập và kích hoạt lại biểu mẫu kiểm thử động này để xác thực lại.\n\n"
             "⚠️ QUY TẮC BẮT BUỘC KHI GỌI CÔNG CỤ complete_agent_task (BẢO VỆ NGỮ CẢNH):\n"
             "Do toàn bộ lịch sử tin nhắn thô, logs chạy terminal, và mã nguồn cũ sẽ bị dọn dẹp sạch khỏi RAM ngay sau bước này để tiết kiệm token [1], "
             "bản tóm tắt (summary) của bạn trong công cụ complete_agent_task bắt buộc phải đóng vai trò là CẦU NỐI TRI THỨC không hao hụt (Lossless Bridge). "
@@ -1951,6 +1953,8 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
             except Exception as e:
                 result = f"Lỗi thực thi công cụ '{tool_name}': {str(e)}"
                 
+        sanitized_result = sanitize_tool_result_content(tool_name, result, ws)
+
         if tool_name == "read_files" and "Lỗi" not in str(result):
             found_files = []
             raw_paths = tool_args.get("file_paths")
@@ -1963,7 +1967,7 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
             compacted_result = f"[Đã nạp thành công dữ liệu vật lý{file_info} vào File Registry. Hãy sử dụng cấu trúc mã nguồn cập nhật mới nhất trong System Prompt để làm việc]"
             tool_messages.append(ToolMessage(content=compacted_result, name=tool_name, tool_call_id=tool_id))
         else:
-            tool_messages.append(ToolMessage(content=str(result), name=tool_name, tool_call_id=tool_id))
+            tool_messages.append(ToolMessage(content=str(sanitized_result), name=tool_name, tool_call_id=tool_id))
         
     BINARY_EXTENSIONS = {".xlsx", ".xls", ".png", ".jpg", ".jpeg", ".zip", ".pdf", ".exe"}
     

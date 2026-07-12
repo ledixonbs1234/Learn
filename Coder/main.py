@@ -1,13 +1,18 @@
-# main.py (Tệp tin cấu hình đồ thị đã loại bỏ node flutter_testing độc lập)
-
+# oder/main.py
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 
-from state import AgentState
+# Nhập đầy đủ 3 Schema từ state.py
+from state import AgentState, AgentInputState, AgentOutputState
 import nodes
 import routers
 
-builder = StateGraph(AgentState)
+# Áp dụng cấu hình phân tách Input và Output cho StateGraph
+builder = StateGraph(
+    state_schema=AgentState,
+    input=AgentInputState,
+    output=AgentOutputState
+)
 
 # =====================================================================
 # 1. ĐĂNG KÝ CÁC NÚT HOẠT ĐỘNG (NODES)
@@ -24,18 +29,16 @@ builder.add_node("synthesis", nodes.synthesis_node)
 builder.add_node("commit", nodes.commit_node)
 builder.add_node("context_compressor", nodes.context_compressor_node)
 builder.add_node("fluxmem_distillation", nodes.fluxmem_distillation_node)
+
 # ĐĂNG KÝ CÁC NÚT THẨM ĐỊNH ĐỐI KHÁNG
 builder.add_node("doubt_reviewer", nodes.doubt_reviewer_node)
 builder.add_node("doubt_gate", nodes.doubt_gate_node)
-# 🌟 Đã gỡ bỏ: builder.add_node("flutter_testing", nodes.flutter_testing_node)
 
 # =====================================================================
 # 2. THIẾT LẬP CÁC CẠNH NỐI CHÍNH (EDGES & ROUTERS)
 # =====================================================================
 builder.add_edge(START, "detect_and_triage")
 builder.add_edge("detect_and_triage", "executor")
-
-# 🌟 Đã gỡ bỏ hoàn toàn cấu hình conditional_edges của "flutter_testing"
 
 # Định tuyến từ Executor
 builder.add_conditional_edges(
@@ -52,6 +55,7 @@ builder.add_conditional_edges(
 )
 builder.add_edge("context_compressor", "replanner")
 builder.add_edge("fluxmem_distillation", "context_compressor")
+
 # Định tuyến từ Tool Node
 builder.add_conditional_edges(
     "tool_node", 
@@ -59,12 +63,12 @@ builder.add_conditional_edges(
     {
         "executor": "executor",
         "human_interaction_gate": "human_interaction_gate",
-        "fluxmem_distillation": "fluxmem_distillation"  # <--- SỬA DÒNG NÀY (thay thế context_compressor bằng fluxmem_distillation)
+        "fluxmem_distillation": "fluxmem_distillation"
     }
 )
 builder.add_edge("human_interaction_gate", "executor")
 
-# Định tuyến từ Tester (đã cập nhật tester_router để bỏ chuyển hướng qua node flutter_testing)
+# Định tuyến từ Tester
 builder.add_conditional_edges(
     "tester", 
     routers.tester_router, 

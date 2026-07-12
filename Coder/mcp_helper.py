@@ -10,6 +10,8 @@ from mcp.client.stdio import stdio_client
 from langchain_mcp_adapters.tools import load_mcp_tools
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage, AIMessage
 
+from config import sanitize_tool_result_content
+
 def get_default_browser_profile_dir() -> str:
     """Tự động phát hiện đường dẫn User Data an toàn dựa trên Hệ điều hành."""
     system = platform.system()
@@ -138,8 +140,11 @@ async def run_agent_with_flutter_skill_mcp(model, prompt_message: str, chat_hist
                             if tool_name in CONNECTION_TOOLS and is_connection_successful(tool_result):
                                 connection_established = True
 
+                            # Áp dụng bộ lọc dọn dẹp ảnh chụp thô Base64
+                            clean_result = sanitize_tool_result_content(tool_name, tool_result, workspace_path)
+
                             messages.append(ToolMessage(
-                                content=str(tool_result),
+                                content=str(clean_result),
                                 name=tool_name,
                                 tool_call_id=tool_id
                             ))
@@ -221,8 +226,12 @@ async def run_agent_with_devtools_mcp(model, prompt_message: str, chat_history: 
                     if tool_name in tools_map:
                         try:
                             tool_result = await tools_map[tool_name].ainvoke(tool_args)
+                            
+                            # Áp dụng bộ lọc dọn dẹp ảnh chụp thô Base64
+                            clean_result = sanitize_tool_result_content(tool_name, tool_result, ".")
+
                             messages.append(ToolMessage(
-                                content=str(tool_result),
+                                content=str(clean_result),
                                 name=tool_name,
                                 tool_call_id=tool_id
                             ))

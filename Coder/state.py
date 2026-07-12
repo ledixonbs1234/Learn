@@ -1,4 +1,4 @@
-# Coder/state.py
+# oder/state.py
 from typing import List, Dict, Any, Literal, Optional, Sequence, TypedDict, Annotated, Union
 from pydantic import BaseModel, Field
 from langchain_core.messages import BaseMessage
@@ -97,7 +97,7 @@ class SkillDefinition(BaseModel):
 # =====================================================================
 
 def ensure_task_objects(plan: List[Union[Task, dict]]) -> List[Task]:
-    """Chuyển đổi đồng bộ các dict thô thu được từ checkpoint trở lại thành đối tượng Task Pydantic [1]."""
+    """Chuyển đổi đồng bộ các dict thô thu được từ checkpoint trở lại thành đối tượng Task Pydantic."""
     if not plan:
         return []
     return [t if isinstance(t, Task) else Task(**t) for t in plan]
@@ -121,13 +121,28 @@ def reduce_file_registry(left: Dict[str, str], right: Dict[str, str]) -> Dict[st
         merged.update(right)
     return merged
 
-# BỔ SUNG: Bộ rút gọn tích lũy lịch sử tóm tắt trong RAM [1]
 def reduce_summaries(left: List[str], right: List[str]) -> List[str]:
     left_list = left or []
     right_list = right or []
     return left_list + right_list
 
+# =====================================================================
+# PHÂN TÁCH BA SƠ ĐỒ TRẠNG THÁI (PRODUCTION BEST PRACTICE)
+# =====================================================================
+
+class AgentInputState(TypedDict):
+    """Sơ đồ tối giản dành riêng cho phía máy khách (Client) khi gửi yêu cầu."""
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+    workspace_path: str
+
+class AgentOutputState(TypedDict):
+    """Sơ đồ đầu ra sau khi đã được tinh lọc thông tin trung gian."""
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+    workspace_context: str
+    modified_files: List[str]
+
 class AgentState(TypedDict):
+    """Sơ đồ trạng thái tính toán toàn vẹn dùng nội bộ trong đồ thị."""
     messages: Annotated[Sequence[BaseMessage], add_messages]
     workspace_path: str
     workspace_context: str  

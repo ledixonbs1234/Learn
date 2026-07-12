@@ -1,8 +1,11 @@
 # config.py
+import base64
 import os
 import fnmatch
 from pathlib import Path
+import re
 from typing import Dict, List, Set
+import uuid
 
 # ==========================================
 # CẤU HÌNH TRACING LANGSMITH
@@ -210,3 +213,56 @@ def find_project_root_heuristic(start_path: Path) -> Path:
             return start_path.parent if start_path.is_file() else start_path
         except Exception:
             return Path(".").resolve()
+        
+        
+def sanitize_tool_result_content(tool_name: str, result: any, workspace_path: str = ".") -> str:
+    """
+    Phát hiện và xử lý các kết quả công cụ có chứa chuỗi Base64 ảnh hoặc dữ liệu quá dài.
+    Ghi nhận ảnh xuống ổ đĩa và thay thế bằng đường dẫn để tránh làm nghẽn bộ nhớ Token (CONTENT_LENGTH_EXCEEDS_THRESHOLD).
+    """
+    result_str = str(result)
+    
+    # 1. Phát hiện chuỗi Base64 của ảnh (hoặc từ các tool screenshot)
+    is_screenshot_tool = "screenshot" in tool_name.lower() or "take_screenshot" in tool_name.lower()
+    has_image_header = "data:image" in result_str or "iVBORw0KG" in result_str
+    
+    if (is_screenshot_tool or has_image_header) and len(result_str) > 5000:
+        try:
+            base64_data = result_str
+            header_match = re.search(r"data:image/[^;]+;base64,", result_str)
+            if header_match:
+                base64_data = result_str[header_match.end():]
+            
+            base64_data = re.sub(r"\s+", "", base64_data)
+            
+            sc_dir = Path(workspace_path).expanduser().resolve() / "screenshots"
+            sc_dir.mkdir(parents=True, exist_ok=True)
+            
+            file_name = f"screenshot_{tool_name}_{uuid.uuid4().hex[:8]}.png"
+            file_path = sc_dir / file_name
+            
+            img_data = base64.b64decode(base64_data)
+            file_path.write_bytes(img_data)
+            
+            try:
+                rel_path = file_path.relative_to(Path(workspace_path).expanduser().resolve())
+            except ValueError:
+                rel_path = file_path
+                
+            return (
+                f"[Hệ thống tối ưu hóa]: Đã lưu ảnh chụp màn hình vật lý thành công tại `{rel_path}`.\n"
+                f"Nội dung văn bản thô Base64 đã được lược bỏ để ngăn lỗi quá tải dung lượng token "
+                f"(CONTENT_LENGTH_EXCEEDS_THRESHOLD). Bạn có thể xem ảnh trực tiếp từ đường dẫn trên."
+            )
+        except Exception as e:
+            return f"[Cảnh báo]: Công cụ chụp ảnh trả về dữ liệu quá dài nhưng gặp lỗi khi lưu file ({str(e)}). Dữ liệu đã bị cắt ngắn để bảo vệ ngữ cảnh: {result_str[:500]}... [Đã cắt bớt]"
+            
+    # 2. Cắt ngắn nếu nội dung text thô của bất cứ tool nào vượt quá giới hạn an toàn (ví dụ: > 100KB)
+    if len(result_str) > 100000:
+        return (
+            f"{result_str[:100000]}\n\n"
+            f"... [Hệ thống tự động cắt bớt {len(result_str) - 100000} ký tự dư thừa "
+            f"để tránh lỗi CONTENT_LENGTH_EXCEEDS_THRESHOLD của API Kiro] ..."
+        )
+        
+    return result_str

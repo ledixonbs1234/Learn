@@ -1170,6 +1170,95 @@ class QueryOpenWikiTool(BaseTool):
             return "❌ Lỗi: Chưa cài đặt OpenWiki CLI toàn cục trên máy tính này."
         except Exception as e:
             return f"❌ Lỗi hệ thống khi truy vấn OpenWiki: {str(e)}"        
+        
+        
+# =====================================================================
+# CẤU TRÚC MỚI: BỘ ĐIỀU PHỐI TRÌNH DUYỆT TỰ TRỊ (WEB AUTONOMOUS EXECUTOR)
+# =====================================================================
+class WebExecutorSchema(BaseModel):
+    url: str = Field(description="Đường dẫn URL của trang web cần truy cập ban đầu.")
+    goal_instruction: str = Field(
+        description="Mục tiêu hoặc kịch bản hành động cần thực hiện bằng ngôn ngữ tự nhiên (ví dụ: 'Nhấn vào nút Login, nhập tài khoản admin, kiểm tra xem có thông báo lỗi hay không và chụp ảnh màn hình')."
+    )
+    extension_path: Optional[str] = Field(
+        default=None,
+        description="Đường dẫn tương đối tới thư mục chứa manifest.json của Chrome Extension trong workspace nếu cần kiểm thử nạp extension."
+    )
+
+
+class WebAutonomousExecutorTool(BaseTool):
+    name: str = "web_autonomous_executor"
+    description: str = (
+        "Công cụ trình duyệt tự trị chuyên sâu. Cho phép khởi chạy trình duyệt thật (có hỗ trợ nạp extension), "
+        "tự động phân tích cấu trúc trang web, thực thi tuần tự các chuỗi hành động phức tạp "
+        "(click, nhập văn bản, kiểm tra trạng thái phần tử) dựa trên một chỉ thị mục tiêu (goal_instruction) "
+        "bằng ngôn ngữ tự nhiên, trả về kết quả tổng hợp và ảnh chụp màn hình."
+    )
+    args_schema: Type[BaseModel] = WebExecutorSchema
+    workspace_path: str
+
+    def _run(
+        self, 
+        url: str, 
+        goal_instruction: str, 
+        extension_path: Optional[str] = None, 
+        run_manager: Optional[CallbackManagerForToolRun] = None
+    ) -> str:
+        
+        # Đồng bộ hóa và kiểm tra đường dẫn an toàn của Extension
+        resolved_ext_path = None
+        if extension_path:
+            try:
+                resolved_ext_path = str(sanitize_and_resolve_path(self.workspace_path, extension_path, create_parent=False))
+            except Exception:
+                resolved_ext_path = extension_path
+
+        # Đóng gói và chuyển giao toàn bộ chỉ dẫn nghiệp vụ xuống cho Subgraph tự giải quyết
+        sub_input = {
+            "workspace_path": self.workspace_path,
+            "url": url,
+            # Ánh xạ chỉ thị tự nhiên vào cấu trúc thực thi của subgraph
+            "action_type": "explore",  # Thích ứng tương thích ngược với subgraph nền
+            "target_description": goal_instruction,
+            "js_code_to_test": None,
+            "extension_path": resolved_ext_path,
+            "attempts": 0
+        }
+        
+        try:
+            run_config = {}
+            if run_manager:
+                run_config["callbacks"] = run_manager.get_child()
+            
+            # Kích hoạt đồ thị con để tự động vận hành vòng lặp phản hồi
+            output = web_subgraph.invoke(sub_input, config=run_config)
+            
+            if output.get("error"):
+                return f"❌ [Thất bại] Gặp sự cố trong quá trình tự động thực thi trên trình duyệt: {output['error']}"
+                
+            console_logs_str = ""
+            if output.get("browser_console_logs"):
+                console_logs_str = f"\n\n📋 **Nhật ký bảng điều khiển trình duyệt (Browser Console Logs):**\n```text\n{output['browser_console_logs']}\n```"
+
+            screenshot_path = output.get("screenshot_path")
+            dom_state = output.get("dom_state_after", {}) or output.get("detected_selectors", {})
+
+            text_content = (
+                f"✅ [Tự trị hoàn tất] Đã thực thi xong mục tiêu trình duyệt:\n"
+                f"- **Mục tiêu yêu cầu:** '{goal_instruction}'\n"
+                f"- **Trạng thái URL đích cuối cùng:** `{dom_state.get('url_after', url)}`\n"
+            )
+            
+            if screenshot_path and Path(screenshot_path).exists():
+                text_content += f"- **Ảnh chụp màn hình ghi nhận kết quả tại:** `{screenshot_path}`\n"
+                
+            text_content += console_logs_str
+            return text_content
+                
+        except Exception as e:
+            return f"❌ Lỗi hệ thống khi khởi động bộ điều phối trình duyệt tự trị: {str(e)}"
+        
+        
 class QuestionOption(BaseModel):
     label: str = Field(description="Nhãn mô tả trực quan hiển thị trên giao diện hoặc nút bấm.")
     value: str = Field(description="Giá trị kỹ thuật tương ứng được lưu trữ và trả về.")
@@ -1227,16 +1316,24 @@ class AskQuestionsTool(BaseTool):
 # CÔNG CỤ GỠ LỖI CHROME DEVTOOLS ĐỘNG (CDP MCP TOOL)
 # =====================================================================
 class ChromeDebuggerSchema(BaseModel):
-    url: str = Field(description="URL của trang web hoặc extension cần kết nối lấy nhật ký.")
-    action_prompt: str = Field(description="Mô tả hành động cần gỡ lỗi để MCP Client thực thi phân tích.")
+    action_prompt: str = Field(
+        description="Mô tả chi tiết hành động hoặc truy vấn cần thực hiện trên trình duyệt (ví dụ: 'Hãy liệt kê danh sách các tab đang mở và URL của chúng')."
+    )
+    url: Optional[str] = Field(
+        default=None, 
+        description="URL của trang web cụ thể nếu cần điều hướng trực tiếp. Để trống nếu chỉ muốn kiểm tra/liệt kê các tab đang dùng."
+    )
 
 class ChromeDebuggerTool(BaseTool):
     name: str = "chrome_devtools_debugger"
-    description: str = "Kết nối trực tiếp vào Chrome DevTools (CDP) thông qua MCP để đọc log console, network requests và phân tích lỗi runtime."
+    description: str = (
+        "Kết nối trực tiếp vào trình duyệt qua cổng DevTools (CDP) đang hoạt động. "
+        "Hỗ trợ lấy thông tin tab, URL đang dùng, đọc console logs, network requests và phân tích lỗi runtime."
+    )
     args_schema: Type[BaseModel] = ChromeDebuggerSchema
     workspace_path: str
 
-    def _run(self, url: str, action_prompt: str) -> str:
+    def _run(self, action_prompt: str, url: Optional[str] = None) -> str:
         import asyncio
         from mcp_helper import run_agent_with_devtools_mcp
         from config import model
@@ -1251,7 +1348,15 @@ class ChromeDebuggerTool(BaseTool):
             import nest_asyncio
             nest_asyncio.apply()
 
-        full_prompt = f"URL đích: {url}\nYêu cầu gỡ lỗi: {action_prompt}"
+        # Tạo prompt định hướng thông minh cho MCP Sub-Agent
+        if url:
+            full_prompt = f"URL đích: {url}\nYêu cầu hoạt động: {action_prompt}"
+        else:
+            full_prompt = (
+                f"Yêu cầu hệ thống: {action_prompt}.\n"
+                "Nhiệm vụ: Hãy sử dụng công cụ tương thích của Chrome DevTools MCP (ví dụ: liệt kê các targets/pages đang hoạt động) "
+                "để truy xuất chính xác tiêu đề và địa chỉ URL của tất cả các tab đang mở trong phiên trình duyệt này, sau đó báo cáo lại đầy đủ."
+            )
         
         try:
             debug_output = loop.run_until_complete(

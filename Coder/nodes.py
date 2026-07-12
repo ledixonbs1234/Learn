@@ -17,7 +17,7 @@ from mcp_helper import run_agent_with_devtools_mcp
 from skills_engine import AgentSkillsEngine
 from state import AgentState, PlanUpdate, RuntimeVerificationResult, TaskTriage, Task
 from tools import (
-    ActivateSkillTool, AskQuestionsTool, CompleteTaskTool, GitManager, QueryOpenWikiTool, ReadFileLinesTool, RunSkillScriptTool, SearchKeywordTool, UniversalSymbolSearchTool, WebInteractAndTestTool, WorkspaceTools, 
+    ActivateSkillTool, AskQuestionsTool, ChromeDebuggerTool, CompleteTaskTool, GitManager, QueryOpenWikiTool, ReadFileLinesTool, RunSkillScriptTool, SearchKeywordTool, UniversalSymbolSearchTool, WebAutonomousExecutorTool, WebInteractAndTestTool, WorkspaceTools, 
     ReadFilesTool, WriteAndRunScriptTool, WriteFileTool, ApplyPatchTool, 
     ListDirectoryTool, RunTerminalTool, get_markdown_language
 )
@@ -379,11 +379,21 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
     CẢI TIẾN: Tự động nạp trước các kỹ năng Grilling & PRD ngay tại đầu nguồn (Triage)
     và cấu hình động nhiệm vụ T_SURVEY để thực thi phỏng vấn trước khi lập kế hoạch.
     """
+    import tempfile # Nạp thư viện hệ thống xử lý thư mục tạm
+    
     messages = state["messages"]
     user_msg = messages[-1]
     user_query_text = get_text_content_safely(user_msg.content)
     
-    existing_workspace = state.get("workspace_path", ".")
+    # 🌟 CẢI TIẾN: Tạo đường dẫn thư mục tạm cô lập an toàn để tránh ghi rác vào thư mục Agent
+    temp_workspace_path = Path(tempfile.gettempdir()) / "agent_temp_workspace"
+    temp_workspace_path.mkdir(parents=True, exist_ok=True)
+    safe_temp_dir = str(temp_workspace_path.resolve())
+    
+    # Nếu chưa có workspace_path hoặc workspace_path trỏ vào ".", tự động chuyển về thư mục tạm an toàn
+    existing_workspace = state.get("workspace_path", "")
+    if not existing_workspace or existing_workspace == ".":
+        existing_workspace = safe_temp_dir
 
     # =====================================================================
     # BƯỚC 1: TRÍCH XUẤT ĐƯỜNG DẪN CO ĐỘ ƯU TIÊN (PRECEDENCE)
@@ -474,10 +484,17 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
             final_workspace = "."
 
     is_user_explicit = (detected_path_str is not None)
-    if not verify_workspace_safety(final_workspace, allow_explicit=is_user_explicit):
+    
+    # 🌟 CẢI TIẾN: Chỉ kích hoạt cảnh báo bảo mật nghiêm ngặt đối với tác vụ phức tạp (is_simple = False)
+    # Tác vụ đơn giản (như quét web, hỏi đáp) được phép chạy bình thường để tránh trải nghiệm người dùng bị gián đoạn.
+    if not is_simple and not verify_workspace_safety(final_workspace, allow_explicit=is_user_explicit):
         return {
-            "plan": [], "task_type": "analysis", "is_simple": True,
-            "messages": [AIMessage(content="🚨 **[CẢNH BÁO BẢO MẬT]**: Workspace nằm trong thư mục Agent.")]
+            "workspace_path": final_workspace,  # Trả về để bảo toàn tính toàn vẹn State, tránh KeyError downstream
+            "plan": [], 
+            "task_type": "analysis", 
+            "is_simple": True,
+            "detailed_analysis": "Ngắt hoạt động do vi phạm rào chắn bảo mật Workspace dành cho tác vụ phức tạp.",
+            "messages": [AIMessage(content="🚨 **[CẢNH BÁO BẢO MẬT]**: Tác vụ phát triển phức tạp yêu cầu một Workspace an toàn bên ngoài thư mục Agent. Vui lòng chỉ định một thư mục làm việc hợp lệ.")]
         }
 
     # =====================================================================
@@ -958,7 +975,7 @@ def context_compressor_node(state: AgentState) -> Dict[str, Any]:
     - Trộn động tài liệu vật lý thuần khiết và nhật ký lịch sử tạm thời thành workspace_context.
     """
     messages = state.get("messages", [])
-    ws = state["workspace_path"]
+    ws = state.get("workspace_path", ".")
     active_skills = state.get("active_skills", {}) or {}
     workspace_root = Path(ws).expanduser().resolve()
     
@@ -1201,7 +1218,7 @@ def fluxmem_distillation_node(state: AgentState) -> Dict[str, Any]:
 
 
 def executor_node(state: AgentState) -> Dict[str, Any]:
-    ws = state["workspace_path"]
+    ws = state.get("workspace_path", ".")
     plan = state.get("plan", [])
     error_logs = state.get("error_logs", "")
     file_registry = state.get("file_registry", {})
@@ -1319,6 +1336,8 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
     search_keyword_tool = SearchKeywordTool(workspace_path=ws)
     complete_task_tool = CompleteTaskTool(workspace_path=ws)
     query_openwiki = QueryOpenWikiTool(workspace_path=ws)
+    web_autonomous_executor = WebAutonomousExecutorTool(workspace_path=ws)
+    chrome_debugger_tool = ChromeDebuggerTool(workspace_path=ws)
     parsed_plan = []
     for t in plan:
         if isinstance(t, dict):
@@ -1340,6 +1359,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         read_file_lines = ReadFileLinesTool(workspace_path=ws)
         ask_questions_tool = AskQuestionsTool(workspace_path=ws)
         
+        
         # Cấp thêm quyền ghi tệp tin tài liệu nghiệp vụ
         write_file = WriteFileTool(workspace_path=ws)
         apply_patch = ApplyPatchTool(workspace_path=ws)
@@ -1347,6 +1367,8 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         tools = [
             activate_skill_tool, 
             run_skill_script_tool, 
+            web_autonomous_executor,
+            chrome_debugger_tool,
             read_files, 
             list_directory, 
             search_symbols, 
@@ -1404,8 +1426,8 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
        
         
         tools = [
-            activate_skill_tool, run_skill_script_tool, read_files, write_file, 
-            apply_patch, list_directory, run_terminal_command, search_symbols, 
+            activate_skill_tool, run_skill_script_tool, read_files, write_file, web_autonomous_executor,
+            apply_patch, list_directory, run_terminal_command, search_symbols, chrome_debugger_tool,
             read_file_lines, ask_questions_tool, write_and_run_script, search_keyword_tool,complete_task_tool,query_openwiki
         ]
         
@@ -1582,8 +1604,8 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
             "1. Đặt `should_modify_plan` là True để áp dụng kế hoạch mới.\n"
             "2. Giữ nguyên nhiệm vụ 'T_SURVEY' với trạng thái là 'completed'.\n"
             "3. Bổ sung các nhiệm vụ mới (ví dụ: T1, T2...) mô tả chính xác các file cần xem, các file cần sửa dựa trên dữ liệu thật thu được từ pha khảo sát.\n"
-            "4. TUYỆT ĐỐI BẮT BUỘC phải lập kế hoạch cho nhiệm vụ 'Kiểm thử tích hợp động trên trình duyệt thật' sử dụng công cụ `web_interact_and_test` "
-            "để trực tiếp nạp Extension, truy cập trang web đích và xác thực hành vi của Extension làm bước cuối cùng trong kế hoạch!\n"
+            "4. TUYỆT ĐỐI BẮT BUỘC phải lập kế hoạch cho nhiệm vụ 'Kiểm thử tích hợp động trên trình duyệt thật' sử dụng công cụ `web_autonomous_executor` "
+            "để ủy quyền cho bộ điều phối tự động nạp Extension, thực hiện chuỗi hành động và xác thực kết quả nghiệp vụ cuối cùng!\n"
             "5. Đặt `task_type` là 'development' (vì chúng ta sẽ sửa code và chạy trình duyệt kiểm thử)."
         )
     else:
@@ -1861,7 +1883,8 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
     search_keyword_tool = SearchKeywordTool(workspace_path=ws)
     complete_task_tool = CompleteTaskTool(workspace_path=ws) 
     query_openwiki = QueryOpenWikiTool(workspace_path=ws)
-    
+    web_autonomous_executor = WebAutonomousExecutorTool(workspace_path=ws) 
+    chrome_debugger_tool = ChromeDebuggerTool(workspace_path=ws)
     tools_map = {
         "read_files": read_files,
         "write_file": write_file,
@@ -1877,7 +1900,9 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         "write_and_run_script": write_and_run_script,
         "search_keyword": search_keyword_tool,
         "query_global_openwiki": query_openwiki,
-        "complete_agent_task": complete_task_tool
+        "complete_agent_task": complete_task_tool,
+        "web_autonomous_executor": web_autonomous_executor,
+        "chrome_devtools_debugger": chrome_debugger_tool,
     }
     
     last_message = state["messages"][-1]
@@ -2020,7 +2045,7 @@ def tester_node(state: AgentState) -> Dict[str, Any]:
     modified_files = state.get("modified_files", [])
     attempts = state.get("attempts", 0)
     plan = state["plan"]
-    ws = state["workspace_path"]
+    ws = state.get("workspace_path", ".")
     last_executed_ids = state.get("last_executed_task_ids", [])
     
     # 🌟 VÁ LỖI: Ép kiểu phòng thủ để tránh lỗi AttributeError từ checkpointer thô

@@ -51,7 +51,54 @@ def sanitize_llm_response_content(response: AIMessage) -> AIMessage:
         response.content = cleaned_content.strip()
         
     return response
-
+def compact_historical_file_messages(messages: List[BaseMessage]) -> List[BaseMessage]:
+    """
+    Duyệt qua lịch sử hội thoại, giữ nguyên nội dung chi tiết của các ToolMessage 
+    ở lượt chạy GẦN NHẤT (ở cuối danh sách tin nhắn), còn toàn bộ các ToolMessage 
+    đọc/sửa file ở các lượt chạy trước đó sẽ bị làm gọn (compact) nội dung thành 
+    mã tóm tắt gọn nhẹ để giải phóng token và tránh gây nhiễu loạn ngữ cảnh.
+    """
+    compacted_messages = []
+    
+    # Bước 1: Xác định vị trí của tin nhắn AI cuối cùng có chứa cuộc gọi công cụ (tool_calls)
+    last_ai_with_tools_idx = -1
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if msg.type == "ai" and getattr(msg, "tool_calls", None):
+            last_ai_with_tools_idx = i
+            break
+            
+    # Bước 2: Tiến hành thu hoạch và rút gọn các tin nhắn cũ
+    for idx, msg in enumerate(messages):
+        # Chỉ can thiệp vào các ToolMessage liên quan đến việc đọc/ghi file
+        if msg.type == "tool" and msg.name in ["read_files", "read_file_lines", "write_file", "apply_search_replace_patch", "write_and_run_script"]:
+            # Nếu ToolMessage này KHÔNG thuộc về lượt phản hồi cuối cùng (xuất hiện trước tin nhắn AI cuối cùng gọi công cụ)
+            if idx < last_ai_with_tools_idx:
+                original_content = str(msg.content)
+                file_info = "tệp tin cũ"
+                
+                # Trích xuất thông tin tên tệp từ tiêu đề nếu có
+                matches = re.findall(r"=== TỆP TIN:\s*[`']?([^`'\n]+)[`']?\s*===", original_content)
+                if not matches:
+                    matches = re.findall(r"tệp(?: tương đối)?:?\s*['`]?([^'`\n]+)['`]?", original_content)
+                if matches:
+                    file_info = f"tệp `{matches[0]}`"
+                
+                # Tạo tin nhắn stub gọn nhẹ thay thế cho nội dung khổng lồ trước đó
+                compacted_msg = ToolMessage(
+                    content=f"[Đã tự động thu gọn dữ liệu cũ của {file_info} để tối ưu hóa bộ nhớ token. Nội dung mới nhất đã được cập nhật ở các bước sau nếu có chỉnh sửa]",
+                    name=msg.name,
+                    tool_call_id=msg.tool_call_id,
+                    id=msg.id
+                )
+                compacted_messages.append(compacted_msg)
+            else:
+                # Giữ nguyên vẹn đối với lượt chạy hoạt động gần nhất ở cuối đồ thị
+                compacted_messages.append(msg)
+        else:
+            compacted_messages.append(msg)
+            
+    return compacted_messages
 def compact_reading_tool_messages(messages: List[BaseMessage]) -> List[BaseMessage]:
     compacted_messages = []
     for msg in messages:
@@ -1081,11 +1128,32 @@ def fluxmem_distillation_node(state: AgentState) -> Dict[str, Any]:
                 "Chỉ trả về chuỗi định danh duy nhất (ví dụ: 'setup_playwright_scraper', 'write_prd_specification'):"
             )
             slug_response = fast_model.invoke([SystemMessage(content=slug_prompt)])
-            safe_task_name = slug_response.content.strip().lower()
             
-            safe_task_name = re.sub(r'[^a-z0-9_]', '', safe_task_name)
-            if not safe_task_name:
+            # 🌟 CẢI TIẾN 1: Khử hoàn toàn các thẻ <thinking> và <thought> rò rỉ từ mô hình lý luận (Reasoning Model)
+            slug_response = sanitize_llm_response_content(slug_response)
+            raw_slug_content = slug_response.content.strip().lower()
+            
+            # 🌟 CẢI TIẾN 2: Trích xuất các từ hợp lệ dạng slug (chữ cái và gạch dưới, độ dài từ 3 đến 40 ký tự)
+            # Thay vì dính chuỗi thô, ta bóc tách riêng lẻ các từ khóa tiềm năng
+            slug_candidates = re.findall(r'\b[a-z0-9_]{3,40}\b', raw_slug_content)
+            
+            # Danh sách từ dừng (stopwords) hệ thống để tránh trích xuất nhầm các câu giải thích của AI
+            system_stopwords = {
+                "thinking", "the", "user", "is", "asking", "me", "to", "create", "a", "slug", 
+                "identifier", "based", "on", "task", "description", "markdown", "python", 
+                "task_id", "procedural", "skill", "would", "be", "something", "like"
+            }
+            safe_candidates = [c for c in slug_candidates if c not in system_stopwords]
+            
+            if safe_candidates:
+                # Ưu tiên chọn từ khóa cuối cùng (thường là kết luận lựa chọn slug của mô hình)
+                safe_task_name = safe_candidates[-1]
+            else:
                 safe_task_name = f"procedural_task_{latest_task_id.lower()}"
+                
+            # 🌟 CẢI TIẾN 3: Ép giới hạn độ dài ký tự tối đa (Strict Bound) để tuyệt đối không vi phạm giới hạn MAX_PATH của OS
+            safe_task_name = safe_task_name[:45]
+            
         except Exception as slug_err:
             print(f"[Cảnh báo] Lỗi sinh slug bằng AI: {str(slug_err)}. Chuyển sang fallback phòng ngự.")
             safe_task_name = f"procedural_task_{latest_task_id.lower()}"
@@ -1120,6 +1188,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
     git_branch = state.get("git_branch", "")
     workspace_context = state.get("workspace_context", "")
     
+    # Đồng bộ hóa cấu hình Git/Context nếu thiếu
     if not git_branch:
         git_dir = Path(ws) / ".git"
         if git_dir.exists():
@@ -1149,6 +1218,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             extension_path = ext_dir
             state_updates["extension_path"] = extension_path
 
+    # Quản lý danh sách nhiệm vụ hợp lệ
     parsed_plan = []
     for t in plan:
         if isinstance(t, dict):
@@ -1168,18 +1238,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
     else:
         tasks_str = "- [Khảo sát tổng thể]: Tìm hiểu cấu trúc và giải quyết yêu cầu người dùng."
 
-    registry_context_str = ""
-    if file_registry:
-        registry_context_str = "\n=== 📦 CÁC FILE ĐÃ NẠP VÀO BỘ NHỚ ===\n"
-        for file_path, content in file_registry.items():
-            lang = get_markdown_language(file_path)
-            lines = content.splitlines()
-            formatted_lines = [f"{idx+1:04d} | {line}" for idx, line in enumerate(lines)]
-            registry_context_str += (
-                f"\n--- TỆP TIN: `{file_path}` ---\n"
-                f"```{lang}\n" + "\n".join(formatted_lines) + "\n```\n"
-            )
-
+    # Quản lý thư viện kỹ năng
     skills_engine = AgentSkillsEngine(ws)
     catalog = skills_engine.scan_catalog()
     
@@ -1189,6 +1248,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         for item in catalog:
             catalog_prompt += f"- **{item['name']}**: {item['description']}\n"
 
+    # Đồng bộ hóa kích hoạt kỹ năng
     current_turn_tool_messages = []
     for msg in reversed(messages):
         if getattr(msg, "type", None) == "tool":
@@ -1216,8 +1276,6 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
     active_skills_prompt = ""
     if active_skills:
         active_skills_prompt = "\n=== ⚡ CÁC KỸ NĂNG ĐANG HOẠT ĐỘNG (TIER 2: ACTIVE STATUS) ===\n"
-        active_skills_prompt += "Các kỹ năng dưới đây đã được kích hoạt trong phiên làm việc của bạn. Để tối ưu hóa token, hệ thống chỉ hiển thị tóm tắt ngắn.\n"
-        active_skills_prompt += "Bạn BẮT BUỘC phải chủ động gọi công cụ `activate_agent_skill` để đọc hướng dẫn CHI TIẾT (Full Instructions) của kỹ năng trước khi thực hiện các hành động phức tạp liên quan.\n"
         for s_name in active_skills.keys():
             desc = ""
             if catalog:
@@ -1227,6 +1285,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
                         break
             active_skills_prompt += f"- **{s_name}** (Trạng thái: Đã kích hoạt): {desc or 'Kích hoạt thành công. Hãy gọi activate_agent_skill để lấy tài liệu chi tiết.'}\n"
 
+    # Định nghĩa các công cụ chạy
     activate_skill_tool = ActivateSkillTool(workspace_path=ws)
     run_skill_script_tool = RunSkillScriptTool(workspace_path=ws)
     search_keyword_tool = SearchKeywordTool(workspace_path=ws)
@@ -1241,8 +1300,6 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         from mcp_helper import MCPRegistryManager
         mcp_manager = MCPRegistryManager(ws)
         mcp_tools = mcp_manager.get_tools_sync(active_servers=active_mcp_servers)
-        if mcp_tools:
-            print(f"🔌 [AI-Gated MCP] Chỉ nạp {len(mcp_tools)} công cụ thuộc máy chủ {active_mcp_servers} để tối ưu hóa.")
     except Exception as e:
         print(f"[Dynamic MCP Warning] Không thể nạp công cụ MCP: {str(e)}")
 
@@ -1261,7 +1318,6 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         }
 
     if task_type == "analysis":
-        # PHA KHẢO SÁT CHỦ ĐỘNG
         read_files = ReadFilesTool(workspace_path=ws)
         list_directory = ListDirectoryTool(workspace_path=ws)
         search_symbols = UniversalSymbolSearchTool(workspace_path=ws)
@@ -1271,23 +1327,11 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         apply_patch = ApplyPatchTool(workspace_path=ws)
         
         tools = [
-            activate_skill_tool, 
-            run_skill_script_tool, 
-            web_autonomous_executor,
-            chrome_debugger_tool,
-            read_files, 
-            list_directory, 
-            search_symbols, 
-            read_file_lines, 
-            ask_questions_tool, 
-            search_keyword_tool,
-            write_file,
-            apply_patch,
-            complete_task_tool,
-            query_openwiki
+            activate_skill_tool, run_skill_script_tool, web_autonomous_executor, chrome_debugger_tool,
+            read_files, list_directory, search_symbols, read_file_lines, ask_questions_tool, 
+            search_keyword_tool, write_file, apply_patch, complete_task_tool, query_openwiki
         ] + mcp_tools
         
-        # 🌟 CẢI TIẾN THAY ĐỔI: Sử dụng Prompt Thích ứng Đàn hồi (Elastic Surveying) để ngăn cản việc viết tài liệu rác và khảo sát bừa bãi.
         system_prompt = (
             "=== ĐỊNH VỊ VAI TRÒ & PHÂN LOẠI TÁC VỤ KHẢO SÁT (ACTIVE DISCOVERY) ===\n"
             "Bạn là Agent Khảo Sát Thích Ứng (Adaptive Discovery Agent).\n"
@@ -1437,17 +1481,16 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         system_instructions += f"\n- Nhánh Git đang hoạt động: `{git_branch}`"
 
     model_with_tools = model.bind_tools(tools)
-    optimized_history = messages 
 
+    # 🌟 CẢI TIẾN QUAN TRỌNG: Gọi hàm thu gọn tin nhắn file cũ để làm sạch lịch sử trượt
+    optimized_history = compact_historical_file_messages(messages)
+
+    # 🌟 CẢI TIẾN QUAN TRỌNG: Không còn registry_context_str nhồi nhét vào System Message nữa!
     input_messages = [SystemMessage(content=system_instructions)]
 
-    if workspace_context or registry_context_str:
+    if workspace_context:
         context_body = "=== NGỮ CẢNH DỰ ÁN HIỆN HÀNH (WORKSPACE STATE) ===\n"
-        if workspace_context:
-            context_body += f"\n--- THÔNG TIN NỀN TẢNG (CONTEXT.md) ---\n{workspace_context}\n"
-        if registry_context_str:
-            context_body += registry_context_str
-            
+        context_body += f"\n--- THÔNG TIN NỀN TẢNG (CONTEXT.md) ---\n{workspace_context}\n"
         input_messages.append(SystemMessage(content=context_body))
 
     if task_type == "development" and error_logs:
@@ -1456,6 +1499,9 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
     response = model_with_tools.invoke(input_messages + optimized_history)
     response = sanitize_llm_response_content(response)
     
+    # Phần quản lý trạng thái trả về giữ nguyên
+    # ...
+    # (Giữ nguyên phần logic xử lý response.tool_calls và return state_updates ở cuối hàm)
     if not response.tool_calls:
         if task_type == "analysis":
             findings = []
@@ -1863,8 +1909,8 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
             if t_id:
                 completed_task_ids.append(t_id)
         
-        if tool_name in ["write_file", "apply_search_replace_patch", "read_files"]:
-            raw_path = tool_args.get("file_path") or tool_args.get("file_paths")
+        raw_path = tool_args.get("file_path") or tool_args.get("file_paths")
+        if tool_name in ["write_file", "apply_search_replace_patch", "read_files", "read_file_lines"]:
             if raw_path:
                 if isinstance(raw_path, list):
                     impacted_files.update(raw_path)
@@ -1890,35 +1936,40 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
                 else:
                     result = tool_instance.invoke(tool_args)
                     
+                # 🌟 CẢI TIẾN QUAN TRỌNG: Làm giàu phản hồi của write_file và apply_patch bằng nội dung file thực tế kèm dòng
                 if tool_name in ["write_file", "apply_search_replace_patch"] and "Lỗi" not in str(result):
                     if raw_path and not isinstance(raw_path, list):
                         try:
                             safe_path = sanitize_and_resolve_path(ws, raw_path, create_parent=True)
                             if str(safe_path) not in modified_files:
                                 modified_files.append(str(safe_path))
-                        except Exception:
-                            pass
+                                
+                            # Đọc ngược dữ liệu vừa ghi từ đĩa để hiển thị chi tiết trong ToolMessage
+                            if safe_path.exists() and safe_path.is_file():
+                                updated_content = safe_path.read_text(encoding="utf-8")
+                                lang = get_markdown_language(str(raw_path))
+                                lines = updated_content.splitlines()
+                                formatted_lines = [f"{idx+1:04d} | {line}" for idx, line in enumerate(lines)]
+                                
+                                # Đè nội dung thô vào biến kết quả
+                                result = (
+                                    f"✅ [Ghi nhận chỉnh sửa thành công] {result}\n\n"
+                                    f"=== TỆP TIN: `{raw_path}` (Nội dung mới nhất sau khi chỉnh sửa) ===\n"
+                                    f"```{lang}\n" + "\n".join(formatted_lines) + "\n```"
+                                )
+                        except Exception as write_err:
+                            result = f"{result} (Cảnh báo: không thể lấy mã nguồn sau chỉnh sửa: {str(write_err)})"
             except Exception as e:
                 result = f"Lỗi thực thi công cụ '{tool_name}': {str(e)}"
                 
         sanitized_result = sanitize_tool_result_content(tool_name, result, ws)
 
-        if tool_name == "read_files" and "Lỗi" not in str(result):
-            found_files = []
-            raw_paths = tool_args.get("file_paths")
-            if isinstance(raw_paths, list):
-                found_files = raw_paths
-            elif isinstance(raw_paths, str):
-                found_files = [raw_paths]
-                
-            file_info = f" của tệp {', '.join([f'`{f}`' for f in found_files])}" if found_files else ""
-            compacted_result = f"[Đã nạp thành công dữ liệu vật lý{file_info} vào File Registry. Hãy sử dụng cấu trúc mã nguồn cập nhật mới nhất trong System Prompt để làm việc]"
-            tool_messages.append(ToolMessage(content=compacted_result, name=tool_name, tool_call_id=tool_id))
-        else:
-            tool_messages.append(ToolMessage(content=str(sanitized_result), name=tool_name, tool_call_id=tool_id))
+        # 🌟 CẢI TIẾN QUAN TRỌNG: Loại bỏ việc nén stubs rác tại read_files!
+        # Cho phép kết quả thô của read_files và read_file_lines đi thẳng vào ToolMessage
+        tool_messages.append(ToolMessage(content=str(sanitized_result), name=tool_name, tool_call_id=tool_id))
         
+    # Đồng bộ hóa bộ đệm file registry trên đĩa
     BINARY_EXTENSIONS = {".xlsx", ".xls", ".png", ".jpg", ".jpeg", ".zip", ".pdf", ".exe"}
-    
     for file_path in impacted_files:
         try:
             safe_path = sanitize_and_resolve_path(ws, file_path, create_parent=False)
@@ -1926,10 +1977,8 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
                 if safe_path.suffix.lower() in BINARY_EXTENSIONS:
                     continue
                 current_content = safe_path.read_text(encoding="utf-8")
-                
                 workspace_root = Path(ws).expanduser().resolve()
                 rel_path = str(safe_path.relative_to(workspace_root))
-                
                 file_registry[rel_path] = current_content
         except Exception:
             pass

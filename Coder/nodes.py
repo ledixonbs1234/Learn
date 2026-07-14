@@ -1,4 +1,3 @@
-# oder/nodes.py
 import asyncio
 import json
 import os
@@ -56,7 +55,6 @@ def sanitize_llm_response_content(response: AIMessage) -> AIMessage:
 def compact_reading_tool_messages(messages: List[BaseMessage]) -> List[BaseMessage]:
     compacted_messages = []
     for msg in messages:
-        # 🛡️ CHỈ nén 'read_files' (đọc toàn bộ file), KHÔNG nén 'read_file_lines' và 'search_symbols_universal'
         if msg.type == "tool" and msg.name in ["read_files"]:
             content_str = str(msg.content)
             found_files = []
@@ -147,38 +145,17 @@ def execute_validation_cmd(cmd: List[str], cwd: Path, timeout: int = 30) -> Tupl
         return (-3, f"Lỗi hệ thống khi chạy lệnh kiểm thử: {str(e)}")
 
 def clean_compiler_logs(raw_logs: str) -> str:
-    """
-    Bộ lọc log nâng cao dành riêng cho môi trường Production.
-    Loại bỏ triệt để các log rác từ quá trình biên dịch/kiểm thử của Flutter, 
-    giúp tiết kiệm tới 90% dung lượng Token gửi tới LLM.
-    """
     lines = raw_logs.splitlines()
     filtered_lines = []
     
-    # Các từ khóa rác cần loại bỏ ngay lập tức
     noise_keywords = [
-        "artifact instance of",
-        "skipping update",
-        "found plugin",
-        "skipping generating",
-        "generating",
-        "starting test",
-        "stopping scan",
-        "listening to compiler",
-        "compiling",
-        "started flutter_tester process",
-        "connected to test device",
-        "waiting for test harness",
-        "test harness is no longer needed",
-        "ensuring test device is terminated",
-        "terminating flutter_tester",
-        "shutting down devtools",
-        "deleting temporary directory",
-        "runtime for phase",
-        "exiting with code"
+        "artifact instance of", "skipping update", "found plugin", "skipping generating",
+        "generating", "starting test", "stopping scan", "listening to compiler", "compiling",
+        "started flutter_tester process", "connected to test device", "waiting for test harness",
+        "test harness is no longer needed", "ensuring test device is terminated", "terminating flutter_tester",
+        "shutting down devtools", "deleting temporary directory", "runtime for phase", "exiting with code"
     ]
     
-    # Từ khóa chỉ định lỗi thực tế cần giữ lại
     error_keywords = ["error", "fail", "exception", "cause", "unhandled", "invalid", "undefined", "failed assertion"]
     
     for line in lines:
@@ -186,11 +163,9 @@ def clean_compiler_logs(raw_logs: str) -> str:
         if not clean_line:
             continue
             
-        # 1. Bỏ qua nếu dòng chứa các từ khóa rác của Flutter CLI
         if any(noise in clean_line.lower() for noise in noise_keywords):
             continue
             
-        # 2. Nhận diện các dòng chứa thông tin lỗi hữu ích
         has_error_kw = any(kw in clean_line.lower() for kw in error_keywords)
         has_line_indicator = ":" in clean_line and (".dart" in clean_line or ".py" in clean_line or ".ts" in clean_line)
         is_test_failure_summary = "✗" in clean_line or "[E]" in clean_line
@@ -199,7 +174,6 @@ def clean_compiler_logs(raw_logs: str) -> str:
             filtered_lines.append(line)
             
     if not filtered_lines:
-        # Nếu không lọc được gì nhưng log quá dài, thực hiện cắt khúc đầu và cuối
         if len(lines) > 20:
             return "\n".join(lines[:10] + ["... [Đã cắt bớt các log hệ thống không quan trọng] ..."] + lines[-10:])
         return raw_logs
@@ -256,7 +230,6 @@ def extract_path_from_text(text: str) -> Optional[str]:
                 
     return None
 
-
 def find_extension_dir_heuristic(workspace_path: Path) -> Optional[str]:
     try:
         for path in workspace_path.rglob("manifest.json"):
@@ -266,15 +239,11 @@ def find_extension_dir_heuristic(workspace_path: Path) -> Optional[str]:
     except Exception:
         pass
     return None
+
 def resolve_special_system_paths(text: str) -> Optional[str]:
-    """
-    Bộ tiền xử lý tĩnh (Deterministic Resolver) nhận diện các thư mục đặc biệt 
-    của hệ điều hành để định vị chính xác yêu cầu của người dùng mà không cần LLM đoán mò.
-    """
     text_lower = text.lower()
     home = Path.home()
     
-    # Bản đồ ánh xạ các từ khóa chỉ định thư mục hệ thống
     system_paths_map = {
         "desktop": home / "Desktop",
         "desktop có gì": home / "Desktop",
@@ -290,24 +259,16 @@ def resolve_special_system_paths(text: str) -> Optional[str]:
                 return str(path.resolve())
     return None
 
-
 def verify_workspace_safety(workspace_path: str, allow_explicit: bool = False) -> bool:
-    """
-    Hệ thống phòng thủ an toàn (Security Guardrail):
-    Ngăn chặn việc Agent trỏ Workspace vào thư mục nguồn của chính nó,
-    trừ khi người dùng chủ động yêu cầu phân tích mã nguồn của chính Agent.
-    """
     if allow_explicit:
         return True
     try:
         resolved_workspace = Path(workspace_path).expanduser().resolve()
-        current_agent_dir = Path(__file__).parent.parent.resolve() # Thư mục Coder/
+        current_agent_dir = Path(__file__).parent.parent.resolve()
         
-        # Nếu trùng khít hoặc workspace chứa thư mục Agent -> Không an toàn
         if resolved_workspace == current_agent_dir or resolved_workspace in current_agent_dir.parents:
             return False
             
-        # Kiểm tra xem có chứa các file điều khiển quan trọng của Agent không
         control_files = ["browser_subgraph.py", "mcp_helper.py", "routers.py"]
         if any((resolved_workspace / f).exists() for f in control_files):
             return False
@@ -317,11 +278,7 @@ def verify_workspace_safety(workspace_path: str, allow_explicit: bool = False) -
         return False
 
 def triage_node_stateful(state: AgentState, catalog_summary: str, mcp_summary: str) -> TaskTriage:
-    """
-    LLM Triage thông minh có trạng thái và có tri thức về cả thư viện Kỹ năng lẫn danh sách Máy chủ MCP ngoài.
-    """
     messages = state.get("messages", [])
-    
     current_workspace = state.get("workspace_path", "")
     
     active_session_context = (
@@ -377,43 +334,26 @@ def triage_node_stateful(state: AgentState, catalog_summary: str, mcp_summary: s
     
     return triage_output
 
-# oder/nodes.py
-
 def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Nút phân loại và thiết lập môi trường hoạt động thông minh có kế thừa trạng thái.
-    CẢI TIẾN: Tự động nạp trước các kỹ năng Grilling & PRD ngay tại đầu nguồn (Triage)
-    và cấu hình động nhiệm vụ T_SURVEY để thực thi phỏng vấn trước khi lập kế hoạch.
-    """
-    import tempfile # Nạp thư viện hệ thống xử lý thư mục tạm
-    
     messages = state["messages"]
     user_msg = messages[-1]
     user_query_text = get_text_content_safely(user_msg.content)
     
-    # Thiết lập thư mục tạm an toàn cho Agent, tránh trỏ vào thư mục nguồn của chính Agent
     random_hex = uuid.uuid4().hex[:8]
     temp_workspace_path = Path(tempfile.gettempdir()) / f"agent_{os.getpid()}_{random_hex}"
     temp_workspace_path.mkdir(parents=True, exist_ok=True)
     safe_temp_dir = str(temp_workspace_path.resolve())
     
-    # Nếu chưa có workspace_path hoặc workspace_path trỏ vào ".", tự động chuyển về thư mục tạm an toàn
     existing_workspace = state.get("workspace_path", "")
     if not existing_workspace or existing_workspace == ".":
         existing_workspace = safe_temp_dir
 
-    # =====================================================================
-    # BƯỚC 1: TRÍCH XUẤT ĐƯỜNG DẪN CO ĐỘ ƯU TIÊN (PRECEDENCE)
-    # =====================================================================
     detected_path_str = extract_path_from_text(user_query_text)
     if not detected_path_str:
         path_keywords = ["thư mục", "folder", "dự án", "project", "mở", "quét", "ls", "dir", "làm việc tại", "tại", "cd"]
         if any(kw in user_query_text.lower() for kw in path_keywords) or not existing_workspace:
             detected_path_str = resolve_special_system_paths(user_query_text)
 
-    # =====================================================================
-    # BƯỚC 2: XÁC ĐỊNH NGỮ CẢNH WORKSPACE TẠM THỜI
-    # =====================================================================
     provisional_workspace = existing_workspace
     pivoted_msg = ""
 
@@ -430,9 +370,6 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         if existing_workspace:
             pivoted_msg = f"🔄 **[Kế thừa Workspace]**: Sử dụng lại thư mục làm việc hiện hành: `{existing_workspace}`\n"
 
-    # =====================================================================
-    # BƯỚC 3: ĐỒNG BỘ TRẠNG THÁI & QUÉT THƯ VIỆN KỸ NĂNG VÀ CẤU HÌNH MCP
-    # =====================================================================
     temp_state = state.copy()
     temp_state["workspace_path"] = provisional_workspace
     
@@ -445,7 +382,6 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         for item in catalog:
             catalog_summary += f"- Kỹ năng: `{item['name']}`\n  Điều kiện kích hoạt: {item['description']}\n"
 
-    # Trích xuất nhanh siêu dữ liệu danh sách máy chủ MCP có sẵn
     mcp_summary = ""
     try:
         from mcp_helper import MCPRegistryManager
@@ -462,7 +398,6 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         temp_ext = find_extension_dir_heuristic(Path(provisional_workspace))
         temp_state["extension_path"] = temp_ext or ""
 
-    # Gọi Triage Supervisor với đầy đủ thông tin Kỹ năng và MCP
     try:
         triage_output = triage_node_stateful(temp_state, catalog_summary, mcp_summary)
         task_type = triage_output.task_type
@@ -477,7 +412,6 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         recommended_skills = []
         recommended_mcp_servers = []
 
-    # Rào chắn an toàn
     final_workspace = provisional_workspace
     if task_type == "clarify" or not final_workspace:
         interrupt_payload = {
@@ -507,11 +441,9 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
 
     is_user_explicit = (detected_path_str is not None)
     
-    # 🌟 CẢI TIẾN: Chỉ kích hoạt cảnh báo bảo mật nghiêm ngặt đối với tác vụ phức tạp (is_simple = False)
-    # Tác vụ đơn giản (như quét web, hỏi đáp) được phép chạy bình thường để tránh trải nghiệm người dùng bị gián đoạn.
     if not is_simple and not verify_workspace_safety(final_workspace, allow_explicit=is_user_explicit):
         return {
-            "workspace_path": final_workspace,  # Trả về để bảo toàn tính toàn vẹn State, tránh KeyError downstream
+            "workspace_path": final_workspace,
             "plan": [], 
             "task_type": "analysis", 
             "is_simple": True,
@@ -519,30 +451,16 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
             "messages": [AIMessage(content="🚨 **[CẢNH BÁO BẢO MẬT]**: Tác vụ phát triển phức tạp yêu cầu một Workspace an toàn bên ngoài thư mục Agent. Vui lòng chỉ định một thư mục làm việc hợp lệ.")]
         }
 
-    # =====================================================================
-    # CẢI TIẾN 1: TỰ ĐỘNG NẠP TRƯỚC CÁC KỸ NĂNG PHỤC VỤ PHA KHẢO SÁT (BOOTSTRAPPING)
-    # =====================================================================
-# BƯỚC 4: TỰ ĐỘNG KHỞI TẠO VÀ NẠP ĐÓNG GÓI BỘ BA KỸ NĂNG (TRIAD BUNDLING)
-    # =====================================================================
     active_skills = {} 
-    # Không tự động nạp trước (Bootstrapping) bất kỳ kỹ năng nào ở đầu nguồn.
-    # Hệ thống tuân thủ mô hình nạp khi cần (On-Demand) - Kỹ năng chỉ được nạp 
-    # khi Agent chủ động phát ra hành động Tool Call 'activate_agent_skill'.
-
-    # Kiểm tra xem yêu cầu nạp bộ ba kỹ năng phân tích nghiệp vụ có được khuyến nghị không
     analysis_triad = ["grill-with-docs", "write-a-prd", "domain-modeling"]
     requires_triad = any(skill in recommended_skills for skill in analysis_triad)
 
-    # =====================================================================
-    # BƯỚC 5: THIẾT LẬP KẾ HOẠCH DỰA TRÊN KỸ NĂNG ĐỀ XUẤT (DYNAMIC TASK SPEC)
-    # =====================================================================
     plan = []
     if is_simple:
         plan = [
             Task(id="T1", description=f"Thực hiện trực tiếp tác vụ tại `{final_workspace}`: {user_query_text}", dependencies=[], status="pending")
         ]
     else:
-        # Nếu bộ ba khảo sát được đề xuất, ép buộc Agent phải chạy quy trình JIT để kích hoạt các kỹ năng này trong lộ trình
         if requires_triad:
             survey_desc = (
                 f"Bắt đầu pha khảo sát. Bạn hãy gọi công cụ `activate_agent_skill` để kích hoạt tuần tự và "
@@ -592,8 +510,9 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         "step_findings": ["__RESET__"],
         "active_skills": active_skills, 
         "recommended_skills": recommended_skills,
-        "active_mcp_servers": recommended_mcp_servers # Lưu mảng máy chủ hoạt động vào State
+        "active_mcp_servers": recommended_mcp_servers
     }
+
 def get_eligible_tasks(plan: List[Any]) -> List[Any]:
     completed_ids = set()
     for t in plan:
@@ -613,10 +532,6 @@ def get_eligible_tasks(plan: List[Any]) -> List[Any]:
     return eligible
 
 def doubt_reviewer_node(state: AgentState) -> Dict[str, Any]:
-    """
-    [NODE MỚI] Thực hiện rà soát đơn mô hình đối kháng (Step 3: DOUBT trong SKILL.md).
-    Chỉ chạy khi mã nguồn đã được sửa đổi và vượt qua các kiểm tra cú pháp tĩnh thành công.
-    """
     modified_files = state.get("modified_files", [])
     file_registry = state.get("file_registry", {})
     doubt_attempts = state.get("doubt_attempts", 0)
@@ -628,7 +543,6 @@ def doubt_reviewer_node(state: AgentState) -> Dict[str, Any]:
     artifact_code = file_registry.get(latest_file, "")
     
     if not artifact_code:
-        # Nếu chưa nạp code vào registry, thử đọc từ đĩa vật lý
         try:
             safe_path = sanitize_and_resolve_path(state["workspace_path"], latest_file)
             if safe_path.exists():
@@ -663,13 +577,7 @@ def doubt_reviewer_node(state: AgentState) -> Dict[str, Any]:
         "doubt_attempts": doubt_attempts + 1
     }
 
-
 def doubt_gate_node(state: AgentState) -> Dict[str, Any]:
-    """
-    [NODE MỚI] Nút ngắt tương tác (Human-in-the-Loop) của Doubt-Driven Development.
-    Hiển thị các phát hiện lỗi cho người dùng, cho phép kích hoạt thẩm định chéo qua mô hình phụ (Gemini/Codex)
-    hoặc phê duyệt/yêu cầu sửa code trực tiếp.
-    """
     doubt_findings = state.get("doubt_findings", "")
     modified_files = state.get("modified_files", [])
     
@@ -678,7 +586,6 @@ def doubt_gate_node(state: AgentState) -> Dict[str, Any]:
 
     latest_file = modified_files[-1]
 
-    # Thiết lập payload giao diện cho interrupt
     interrupt_payload = {
         "title": "🔍 THẨM ĐỊNH ĐỐI KHÁNG (DOUBT-DRIVEN DEVELOPMENT)",
         "file_under_review": latest_file,
@@ -691,25 +598,20 @@ def doubt_gate_node(state: AgentState) -> Dict[str, Any]:
         )
     }
 
-    # KÍCH HOẠT NGẮT ĐỒ THỊ ĐỂ ĐỢI PHẢN HỒI TỪ NGƯỜI DÙNG
     user_input = interrupt(interrupt_payload)
-    
     user_action = str(user_input).strip().lower() if user_input else ""
 
-    # Kịch bản 1: Người dùng phê duyệt/Bỏ qua (Bypass)
     if user_action in ["", "yes", "approve", "ok", "skip"]:
         return {
             "error_logs": "",
-            "doubt_findings": "", # Xóa log nghi ngờ để đi tiếp
+            "doubt_findings": "",
             "messages": [AIMessage(content="✅ **[Doubt Bypassed]** Người dùng đã phê duyệt mã nguồn. Tiến hành hoàn tất tác vụ.")]
         }
 
-    # Kịch bản 2: Yêu cầu thẩm định chéo qua CLI ngoại vi (Cross-Model Escalation)
     if user_action in ["gemini", "codex"]:
         cli_tool = user_action
         cli_executable = "gemini" if cli_tool == "gemini" else "codex"
         
-        # Kiểm tra sự tồn tại vật lý của CLI trong môi trường hệ thống
         if not shutil.which(cli_executable):
             feedback_msg = HumanMessage(
                 content=f"⚠️ Lỗi: Không tìm thấy thực thi CLI `{cli_executable}` trong biến môi trường PATH của bạn."
@@ -719,7 +621,6 @@ def doubt_gate_node(state: AgentState) -> Dict[str, Any]:
                 "messages": [feedback_msg]
             }
 
-        # Chuẩn bị Prompt Thẩm định đối kháng chéo
         file_registry = state.get("file_registry", {})
         artifact_code = file_registry.get(latest_file, "")
         
@@ -736,7 +637,6 @@ def doubt_gate_node(state: AgentState) -> Dict[str, Any]:
                 temp_prompt_file.write(cross_prompt)
                 temp_prompt_file_path = temp_prompt_file.name
 
-            # Thực thi tiến trình con an toàn
             with open(temp_prompt_file_path, "r", encoding="utf-8") as stdin_file:
                 env_copy = os.environ.copy()
                 env_copy["PYTHONIOENCODING"] = "utf-8"
@@ -773,14 +673,12 @@ def doubt_gate_node(state: AgentState) -> Dict[str, Any]:
                 "messages": [AIMessage(content=f"❌ Thao tác gọi mô hình chéo thất bại: {str(err)}")]
             }
         finally:
-            # Khối finally đảm bảo file tạm luôn được giải phóng khỏi hệ thống
             if temp_prompt_file_path and Path(temp_prompt_file_path).exists():
                 try:
                     Path(temp_prompt_file_path).unlink(missing_ok=True)
                 except Exception:
                     pass
 
-    # Kịch bản 3: Phản hồi tự do yêu cầu sửa lỗi (Reconcile Path)
     feedback_message = HumanMessage(
         content=(
             "⚠️ Yêu cầu sửa đổi mã nguồn dựa trên kết quả thẩm định đối kháng:\n"
@@ -791,9 +689,10 @@ def doubt_gate_node(state: AgentState) -> Dict[str, Any]:
     
     return {
         "error_logs": f"Cần khắc phục lỗi logic thẩm định: {user_input}",
-        "doubt_findings": "", # Xóa log để chuẩn bị lượt kiểm tra mới sau khi sửa xong
+        "doubt_findings": "",
         "messages": [feedback_message]
     }
+
 def context_loader_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
     
@@ -836,7 +735,6 @@ def context_loader_node(state: AgentState) -> Dict[str, Any]:
         "browser_console_logs": "",
         "messages": [AIMessage(content=f"{git_msg}\n{context_msg}{ext_msg}")]
     }
-
 
 def triage_node(state: AgentState) -> Dict[str, Any]:
     messages = state["messages"]
@@ -924,11 +822,8 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
             )
         ]
     }
+
 def chrome_extension_debugger_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Nút xử lý gỡ lỗi chuyên sâu sử dụng Chrome DevTools MCP.
-    Đánh giá xem Extension có chạy mượt mà ở runtime hay không.
-    """
     ext_path = state.get("extension_path")
     
     if not ext_path:
@@ -940,7 +835,6 @@ def chrome_extension_debugger_node(state: AgentState) -> Dict[str, Any]:
         f"liên quan đến Extension hoạt động không."
     )
     
-    # Kích hoạt MCP Client chạy bất đồng bộ một cách an toàn
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError:
@@ -959,7 +853,6 @@ def chrome_extension_debugger_node(state: AgentState) -> Dict[str, Any]:
         )
     )
     
-    # Sử dụng fast_model để phân tích nhanh kết quả thô xem có thực sự bị lỗi hay không
     structured_evaluator = model.with_structured_output(RuntimeVerificationResult, method="function_calling")
     
     system_prompt = (
@@ -989,26 +882,12 @@ def chrome_extension_debugger_node(state: AgentState) -> Dict[str, Any]:
         
     return ret_state
 
-# =====================================================================
-# THÊM NÚT DỌN DẸP NGỮ CẢNH (CONTEXT COMPRESSOR NODE) VÀO CUỐI FILE
-# =====================================================================
 def context_compressor_node(state: AgentState) -> Dict[str, Any]:
-    """
-    [NODE THU GỌN CONTEXT CHỌN LỌC - SELECTIVE MEMORY GC]
-    Thực hiện dọn dẹp thông minh:
-    - Trích xuất tóm tắt tiến trình vận hành để lưu tạm thời vào AgentState (RAM).
-    - Bảo vệ toàn bộ ý kiến thảo luận gốc của người dùng (HumanMessage).
-    - Xóa bỏ toàn bộ tin nhắn công cụ (ToolMessages) thô để tối ưu hóa bộ nhớ token.
-    - Trộn động tài liệu vật lý thuần khiết và nhật ký lịch sử tạm thời thành workspace_context.
-    """
     messages = state.get("messages", [])
     ws = state.get("workspace_path", ".")
     active_skills = state.get("active_skills", {}) or {}
     workspace_root = Path(ws).expanduser().resolve()
     
-    # =====================================================================
-    # 1. TRÍCH XUẤT TÓM TẮT TỪ CUỘC GỌI HOÀN THÀNH TASK GẦN NHẤT
-    # =====================================================================
     latest_task_summary = ""
     task_id = ""
     for msg in reversed(messages):
@@ -1025,9 +904,6 @@ def context_compressor_node(state: AgentState) -> Dict[str, Any]:
     if latest_task_summary:
         new_summaries.append(f"Task {task_id}: {latest_task_summary}")
 
-    # =====================================================================
-    # 2. LẬP DANH SÁCH DỌN DẸP TIN NHẮN RÁC (SELECTIVE MEMORY GC)
-    # =====================================================================
     triage_msg_id = None
     for msg in messages:
         if msg.type == "ai" or isinstance(msg, AIMessage):
@@ -1051,7 +927,6 @@ def context_compressor_node(state: AgentState) -> Dict[str, Any]:
             
         is_human = (msg.type == "human" or isinstance(msg, HumanMessage))
         
-        # Luôn bảo vệ tin nhắn yêu cầu gốc của người dùng
         if is_human and not has_kept_root_user_msg:
             has_kept_root_user_msg = True
             continue
@@ -1059,16 +934,11 @@ def context_compressor_node(state: AgentState) -> Dict[str, Any]:
         is_triage = (msg.id == triage_msg_id)
         is_final_summary = (msg.id == final_summary_id)
         
-        # Xóa toàn bộ tin nhắn gọi công cụ trung gian và ToolMessage rác
         if not (is_human or is_triage or is_final_summary):
             deletion_list.append(RemoveMessage(id=msg.id))
 
-    # =====================================================================
-    # 3. TRỘN ĐỘNG CONTEXT VẬT LÝ VÀ NHẬT KÝ TẠM THỜI (DYNAMIC MERGING)
-    # =====================================================================
     compiled_context_parts = []
     
-    # A. Nạp tài liệu PRD.md thuần khiết từ đĩa
     prd_path = workspace_root / "PRD.md"
     if prd_path.exists():
         try:
@@ -1076,7 +946,6 @@ def context_compressor_node(state: AgentState) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # B. Nạp tài liệu kiến trúc CONTEXT.md thuần khiết từ đĩa (KHÔNG bị ô nhiễm lịch sử)
     context_file_path = workspace_root / "CONTEXT.md"
     if context_file_path.exists():
         try:
@@ -1084,7 +953,6 @@ def context_compressor_node(state: AgentState) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # C. Trộn lịch sử các task đã hoàn thành từ bộ đệm của State Graph [1]
     historical_summaries = state.get("completed_task_summaries", []) + new_summaries
     if historical_summaries:
         history_block = "### [LỊCH SỬ THỰC THI PHIÊN CHẠY (BỘ NHỚ TẠM THỜI IN-MEMORY)]\n"
@@ -1093,9 +961,6 @@ def context_compressor_node(state: AgentState) -> Dict[str, Any]:
 
     super_context = "\n\n---\n\n".join(compiled_context_parts)
 
-    # =====================================================================
-    # 4. THU GỌN KỸ NĂNG VÀ TRẢ VỀ TRẠNG THÁI
-    # =====================================================================
     normalized_modified_set = set()
     for f in state.get("modified_files", []) or []:
         try:
@@ -1105,7 +970,6 @@ def context_compressor_node(state: AgentState) -> Dict[str, Any]:
                     rel = str(f_path.relative_to(workspace_root))
                     normalized_modified_set.add(rel)
                 except ValueError:
-                    # Rào chắn bảo vệ: Tránh lỗi sập đồ thị khi tệp nằm ngoài Workspace (ví dụ: OpenWiki)
                     normalized_modified_set.add(str(f_path))
         except Exception:
             pass
@@ -1114,7 +978,7 @@ def context_compressor_node(state: AgentState) -> Dict[str, Any]:
     registry_eviction_updates = {}
     for cached_file in current_registry.keys():
         if cached_file not in normalized_modified_set:
-            registry_eviction_updates[cached_file] = None  # Phát tín hiệu Trục xuất lên State Graph
+            registry_eviction_updates[cached_file] = None
 
     cleaned_active_skills = dict(active_skills)
     discovery_triad = ["grill-with-docs", "write-a-prd", "domain-modeling"]
@@ -1134,24 +998,15 @@ def context_compressor_node(state: AgentState) -> Dict[str, Any]:
         "workspace_context": super_context,
         "messages": deletion_list + [clean_checkpoint_msg],
         "active_skills": cleaned_active_skills,
-        "completed_task_summaries": new_summaries,  # Bộ rút gọn (Reducer) tự động cộng dồn
-        "file_registry": registry_eviction_updates   # Trục xuất thông qua Reducer mới
+        "completed_task_summaries": new_summaries,
+        "file_registry": registry_eviction_updates
     }
     
-    
-# =====================================================================
-# 🌟 NÚT CHƯNG CẤT TRI THỨC TOÀN CỤC (GLOBAL FLUXMEM DISTILLATION)
-# =====================================================================
 def fluxmem_distillation_node(state: AgentState) -> Dict[str, Any]:
-    """
-    [CẬP NHẬT CHỮA LỖI] Phân tích vết lịch sử chạy thực tế của tác vụ vừa hoàn thành,
-    chưng cất thành kỹ năng quy trình (Procedural Skill) và lưu trực tiếp vào thư mục OpenWiki toàn cục.
-    """
     messages = state.get("messages", [])
     ws = state["workspace_path"]
     plan = state.get("plan", [])
     
-    # 1. Định vị Task hoàn thành gần nhất
     latest_task_id = ""
     latest_task_desc = "Tác vụ thực thi hệ thống"
     
@@ -1173,7 +1028,6 @@ def fluxmem_distillation_node(state: AgentState) -> Dict[str, Any]:
             latest_task_desc = t.description if isinstance(t, Task) else t.get("description")
             break
 
-    # 2. Xây dựng stepsPrompt từ vết lịch sử gọi công cụ thực tế
     current_task_messages = []
     for msg in reversed(messages):
         if isinstance(msg, AIMessage) and "📊 [Hệ thống Phân phối thông minh]" in str(msg.content):
@@ -1195,7 +1049,6 @@ def fluxmem_distillation_node(state: AgentState) -> Dict[str, Any]:
 
     steps_prompt = "\n".join(steps_prompt_parts) if steps_prompt_parts else "Không ghi nhận lượt gọi công cụ trực tiếp."
 
-    # 3. Chuẩn bị Prompt Chưng cất
     system_prompt = (
         "Bạn là Chuyên gia chưng cất kỹ năng (FluxMem Distillation Agent).\n"
         "Dưới đây là vết lịch sử chạy thực tế thành công của Agent:\n\n"
@@ -1207,20 +1060,14 @@ def fluxmem_distillation_node(state: AgentState) -> Dict[str, Any]:
     )
 
     try:
-        # Gọi mô hình để chưng cất tri thức thành định dạng MD tinh khiết
         distilled_response = fast_model.invoke([
             SystemMessage(content=system_prompt)
         ])
         
         procedural_skill_md = distilled_response.content
-        
-        # 4. Lưu vật lý vào thư mục OpenWiki toàn cục (~/.openwiki/wiki)
         wiki_dir = Path("~/.openwiki/wiki").expanduser().resolve()
         wiki_dir.mkdir(parents=True, exist_ok=True)
         
-        # =====================================================================
-        # 🌟 GIẢI PHÁP SỬA LỖI ĐẶT TÊN FILE (LLM-BASED SLUG GENERATOR)
-        # =====================================================================
         try:
             slug_prompt = (
                 "Dựa vào mô tả nhiệm vụ sau, hãy tạo ra một định danh (slug) ngắn gọn từ 2-4 từ, "
@@ -1236,7 +1083,6 @@ def fluxmem_distillation_node(state: AgentState) -> Dict[str, Any]:
             slug_response = fast_model.invoke([SystemMessage(content=slug_prompt)])
             safe_task_name = slug_response.content.strip().lower()
             
-            # Bộ lọc bảo vệ: Loại bỏ tất cả ký tự không phải chữ cái thường, số và dấu gạch dưới
             safe_task_name = re.sub(r'[^a-z0-9_]', '', safe_task_name)
             if not safe_task_name:
                 safe_task_name = f"procedural_task_{latest_task_id.lower()}"
@@ -1246,7 +1092,6 @@ def fluxmem_distillation_node(state: AgentState) -> Dict[str, Any]:
             
         file_name = f"skill_{safe_task_name}.md"
         dest_file = wiki_dir / file_name
-        # =====================================================================
         
         dest_file.write_text(procedural_skill_md, encoding="utf-8")
         
@@ -1260,10 +1105,6 @@ def fluxmem_distillation_node(state: AgentState) -> Dict[str, Any]:
     except Exception as e:
         print(f"[Cảnh báo] Lỗi trong quá trình chưng cất quy trình toàn cục: {str(e)}")
         return {}
-
-
-
-
 
 def executor_node(state: AgentState) -> Dict[str, Any]:
     ws = state.get("workspace_path", ".")
@@ -1308,7 +1149,6 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             extension_path = ext_dir
             state_updates["extension_path"] = extension_path
 
-    # Ép kiểu phòng thủ từ dict thô về Task object
     parsed_plan = []
     for t in plan:
         if isinstance(t, dict):
@@ -1379,7 +1219,6 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         active_skills_prompt += "Các kỹ năng dưới đây đã được kích hoạt trong phiên làm việc của bạn. Để tối ưu hóa token, hệ thống chỉ hiển thị tóm tắt ngắn.\n"
         active_skills_prompt += "Bạn BẮT BUỘC phải chủ động gọi công cụ `activate_agent_skill` để đọc hướng dẫn CHI TIẾT (Full Instructions) của kỹ năng trước khi thực hiện các hành động phức tạp liên quan.\n"
         for s_name in active_skills.keys():
-            # Tìm mô tả ngắn từ catalog để hiển thị tóm tắt gọn gàng
             desc = ""
             if catalog:
                 for item in catalog:
@@ -1396,7 +1235,6 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
     web_autonomous_executor = WebAutonomousExecutorTool(workspace_path=ws)
     chrome_debugger_tool = ChromeDebuggerTool(workspace_path=ws)
 
-    # 🌟 TỐI ƯU HÓA: Chỉ nạp các công cụ từ các MCP Server được Triage Node cho phép
     mcp_tools = []
     active_mcp_servers = state.get("active_mcp_servers", [])
     try:
@@ -1423,18 +1261,15 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         }
 
     if task_type == "analysis":
-        # PHA KHẢO SÁT: Đọc hiểu mã nguồn, phỏng vấn nghiệp vụ và thiết lập tài liệu đặc tả (PRD, CONTEXT, ADRs)
+        # PHA KHẢO SÁT CHỦ ĐỘNG
         read_files = ReadFilesTool(workspace_path=ws)
         list_directory = ListDirectoryTool(workspace_path=ws)
         search_symbols = UniversalSymbolSearchTool(workspace_path=ws)
         read_file_lines = ReadFileLinesTool(workspace_path=ws)
         ask_questions_tool = AskQuestionsTool(workspace_path=ws)
-        
-        # Cấp thêm quyền ghi tệp tin tài liệu nghiệp vụ
         write_file = WriteFileTool(workspace_path=ws)
         apply_patch = ApplyPatchTool(workspace_path=ws)
         
-        # 🌟 Nhúng danh sách mcp_tools vào tập công cụ khả dụng
         tools = [
             activate_skill_tool, 
             run_skill_script_tool, 
@@ -1452,48 +1287,58 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             query_openwiki
         ] + mcp_tools
         
+        # 🌟 CẢI TIẾN THAY ĐỔI: Sử dụng Prompt Thích ứng Đàn hồi (Elastic Surveying) để ngăn cản việc viết tài liệu rác và khảo sát bừa bãi.
         system_prompt = (
-            "Bạn là một chuyên gia khảo sát mã nguồn, phỏng vấn nghiệp vụ và thiết lập mô hình miền (Active Discovery & Glossary Engine).\n"
-            f"Nhiệm vụ hiện tại:\n{tasks_str}\n"
+            "=== ĐỊNH VỊ VAI TRÒ & PHÂN LOẠI TÁC VỤ KHẢO SÁT (ACTIVE DISCOVERY) ===\n"
+            "Bạn là Agent Khảo Sát Thích Ứng (Adaptive Discovery Agent).\n"
+            "Nhiệm vụ hiện tại:\n{tasks_str}\n"
             f"Thư mục làm việc: {ws}\n\n"
             
-            # 🌟 CHỈ DẪN TRUY XUẤT OPENWIKI TOÀN CỤC CHO PHA KHẢO SÁT
+            "⚠️ BƯỚC 1: XÁC ĐỊNH PHẠM VI KHẢO SÁT VÀ BIÊN GIỚI TÀI LIỆU (BẮT BUỘC):\n"
+            "Hãy phân tích yêu cầu hiện tại để tự động cấu hình phạm vi hoạt động của bạn:\n"
+            "- [NHÓM A] CHỈNH SỬA FILE CỤC BỘ / SỬA LỖI (Localized Code Edit):\n"
+            "  * Chỉ được phép quét, đọc đúng file cần sửa và các file import liên quan trực tiếp. Tuyệt đối KHÔNG đọc toàn bộ dự án.\n"
+            "  * TUYỆT ĐỐI KHÔNG viết PRD.md hay tạo ADRs mới. Chỉ cập nhật thông tin cực kỳ ngắn gọn vào CONTEXT.md nếu file này đã tồn tại sẵn.\n"
+            "- [NHÓM B] XÂY DỰNG TÍNH NĂNG MỚI / THAY ĐỔI LỚN (Macro Feature):\n"
+            "  * Được phép khảo sát diện rộng và viết/cập nhật `PRD.md`, `CONTEXT.md`, và các quyết định kiến trúc trong `docs/adr/`.\n"
+            "- [NHÓM C] TÁC VỤ PHI LẬP TRÌNH / VẬN HÀNH (Non-coding Ops - ví dụ: Tối ưu Notion, setup công cụ):\n"
+            "  * Tuyệt đối KHÔNG đọc mã nguồn, KHÔNG tạo các file code rác, và TUYỆT ĐỐI KHÔNG tạo `PRD.md`, `CONTEXT.md` hay `ADRs`.\n"
+            "  * Chỉ được phép khảo sát cấu trúc logic của ứng dụng mục tiêu (ví dụ: các trang, cơ sở dữ liệu Notion) và lưu thông tin dạng text hoặc sơ đồ vận hành gọn nhẹ (ví dụ: `NOTION_STRUCTURE.md`) nếu thực sự cần thiết.\n\n"
+
+            "⚠️ BIÊN GIỚI NGHIÊM NGẶT - CHỐNG TỰ Ý LẬP KẾ HOẠCH & SỬA CODE CHẠY THẬT (BẮT BUỘC):\n"
+            "1. Bạn ĐANG Ở PHA KHẢO SÁT. Nhiệm vụ của bạn chỉ là tìm hiểu hiện trạng, thu thập sự thật (facts) và viết tài liệu mô tả (nếu thuộc Nhóm B).\n"
+            "2. TUYỆT ĐỐI KHÔNG tự ý viết kế hoạch triển khai (ví dụ: các bước sửa code tiếp theo), không đưa ra danh sách task cho pha sau, không viết code mẫu hoặc sửa file chạy thật của ứng dụng.\n"
+            "3. Nếu bạn bắt đầu đưa ra kế hoạch thực thi hoặc sửa code, bạn đã vi phạm biên giới pha và sẽ làm sập hệ thống.\n\n"
+
             "⚠️ HƯỚNG DẪN TRUY XUẤT TRI THỨC TOÀN CỤC (JUST-IN-TIME RETRIEVAL):\n"
-            "1. Hệ thống của bạn tích hợp bộ nhớ tri thức toàn cục (Global Brain) lưu tại thư mục hệ thống: `~/.openwiki/wiki/`.\n"
-            "2. Trước khi khảo sát hay thiết kế, bạn BẮT BUỘC phải gọi công cụ `query_global_openwiki` để kiểm tra "
-            "xem có quy trình, mẫu thiết kế hoặc lưu ý tránh lỗi biên dịch nào đã được đúc kết từ trước liên quan đến nhiệm vụ này hay không.\n"
-            "3. Nếu tìm thấy file kỹ năng phù hợp, hãy áp dụng chính xác quy trình và các lưu ý phòng ngừa lỗi biên dịch vào dự án hiện tại.\n\n"
-            
-            # 🌟 CHỈ DẪN SONG SONG HÓA CÔNG CỤ ĐỂ TIẾT KIỆM TOKEN VÀ SỐ VÒNG LẶP
+            "1. Hệ thống tích hợp bộ nhớ tri thức toàn cục (Global Brain) lưu tại thư mục hệ thống: `~/.openwiki/wiki/`.\n"
+            "2. Trước khi tiến hành khảo sát, bạn BẮT BUỘC phải gọi công cụ `query_global_openwiki` để kiểm tra xem có quy trình hoặc lưu ý phòng ngừa lỗi liên quan đến nhiệm vụ này hay không.\n"
+            "3. Áp dụng chính xác các lưu ý này vào tài liệu khảo sát.\n\n"
+
             "⚠️ QUY TẮC TỐI ƯU HÓA TOKEN BẰNG GỌI CÔNG CỤ SONG SONG (PARALLEL TOOL CALLING):\n"
             "1. Bạn được KHUYẾN KHÍCH MẠNH MẼ gọi NHIỀU CÔNG CỤ CÙNG LÚC (Parallel Tool Calling) trong một lượt phản hồi nếu các công cụ đó độc lập hoặc phục vụ chung một nhiệm vụ hiện hành.\n"
-            "2. Ví dụ: Hãy gọi đồng thời nhiều cuộc gọi `read_file_lines` cho các tệp tin khác nhau, hoặc kết hợp `search_keyword` và `list_directory` trong cùng một turn.\n"
-            "3. Cách tiếp cận song song này giúp giảm đáng kể số chu kỳ hội thoại (turns) trung gian, từ đó tiết kiệm tới 70% chi phí token ngữ cảnh lũy kế.\n\n"
+            "2. Ví dụ: Hãy gọi đồng thời nhiều cuộc gọi `read_file_lines` cho các tệp tin khác nhau, hoặc kết hợp `search_keyword` và `list_directory` trong cùng một turn để tiết kiệm token.\n\n"
 
-            "⚠️ QUY TẮC KÍCH HOẠT & TUÂN THỦ KỸ NĂNG (BẮT BUỘC):\n"
-            "1. Trước khi thực hiện một hành động chuyên biệt có kỹ năng tương ứng trong danh sách '=== THƯ VIỆN KỸ NĂNG KHẢ DỤNG (TIER 1) ===' "
-            "mà chưa được kích hoạt, bạn BẮT BUỘC phải gọi công cụ `activate_agent_skill` để nạp hướng dẫn kỹ năng đó.\n"
-            "2. Khi kỹ năng đã được kích hoạt (hiển thị tại '=== ⚡ CÁC KỸ NĂNG ĐANG HOẠT ĐỘNG (TIER 2) ==='), bạn BẮT BUỘC phải tuân thủ tuyệt đối "
-            "tất cả cấu trúc, quy trình làm việc và định dạng tệp tin được ghi rõ trong chỉ dẫn của kỹ năng đó. Tuyệt đối không tự suy diễn cấu trúc.\n"
-            "3. Nếu kỹ năng chứa các kịch bản chạy bổ trợ (scripts), hãy sử dụng công cụ `run_skill_script` để chạy thay vì viết lại mã thô.\n\n"
+            "⚠️ QUY TẮC KÍCH HOẠT KỸ NĂNG (BẮT BUỘC):\n"
+            "1. Trước khi thực hiện hành động chuyên biệt có kỹ năng tương ứng trong danh sách '=== THƯ VIỆN KỸ NĂNG KHẢ DỤNG ===' mà chưa được kích hoạt, bạn BẮT BUỘC phải gọi công cụ `activate_agent_skill` để nạp hướng dẫn kỹ năng đó.\n"
+            "2. Khi kỹ năng đã hoạt động, tuân thủ tuyệt đối cấu trúc và quy trình được ghi rõ trong hướng dẫn kỹ năng đó. Tuyệt đối không tự suy diễn cấu trúc.\n\n"
+
             "⚠️ QUY TẮC CÔ LẬP NHIỆM VỤ ĐƠN (SINGLE TASK ISOLATION - BẮT BUỘC):\n"
-            "1. Bạn CHỈ ĐƯỢC PHÉP tập trung thực hiện duy nhất (1) nhiệm vụ đang được liệt kê tại phần 'Nhiệm vụ hiện tại' ở trên (ví dụ: chỉ giải quyết T1).\n"
-            "2. TUYỆT ĐỐI KHÔNG tự ý thực hiện tiếp các nhiệm vụ tiếp theo trong lộ trình (T2, T3...) mặc dù bạn có thể nhìn thấy chúng trong lịch sử trò chuyện. Việc tự ý gom nhiều nhiệm vụ để thực hiện liên tiếp trong một lượt sẽ bỏ qua bước nén RAM/dọn dẹp tin nhắn rác, dẫn đến sập hệ thống do tràn bộ nhớ token.\n"
-            "3. Ngay sau khi hoàn thành xong nhiệm vụ được chỉ định, bạn BẮT BUỘC phải gọi công cụ 'complete_agent_task' để bàn giao kết quả và chuyển quyền điều phối về cho đồ thị Orchestrator dọn dẹp bộ nhớ trước khi tiếp nhận nhiệm vụ tiếp theo.\n\n"
+            "1. Bạn CHỈ ĐƯỢC PHÉP tập trung thực hiện duy nhất (1) nhiệm vụ đang được liệt kê tại phần 'Nhiệm vụ hiện tại' ở trên (ví dụ: chỉ giải quyết T_SURVEY).\n"
+            "2. TUYỆT ĐỐI KHÔNG tự ý thực hiện tiếp các nhiệm vụ tiếp theo trong lộ trình (T1, T2...) mặc dù bạn có thể nhìn thấy chúng trong lịch sử trò chuyện.\n"
+            "3. Ngay sau khi hoàn thành xong nhiệm vụ được chỉ định, bạn BẮT BUỘC phải gọi công cụ 'complete_agent_task' để bàn giao kết quả và chuyển quyền điều phối về cho đồ thị Orchestrator dọn dẹp bộ nhớ.\n\n"
+
             "⚠️ QUY TẮC THIẾT LẬP TÀI LIỆU & KHẢO SÁT (BẮT BUỘC):\n"
-            "1. Bạn có quyền đọc mã nguồn và viết/cập nhật các tệp tài liệu đặc tả quan trọng như `CONTEXT.md`, các quyết định kiến trúc (ADRs) trong `docs/adr/`, và `PRD.md` nếu như đó là project lập trình, còn lại thì không \n"
-            "   TUYỆT ĐỐI KHÔNG sửa đổi các tệp tin mã nguồn chạy thật (code) của ứng dụng trong pha khảo sát này.\n"
-            "2. Nếu bạn cần tìm kiếm vị trí của một biến hoặc hàm, hãy ưu tiên dùng `search_keyword`.\n"
-            "3. Khi đã xác định được tệp tin cần quan tâm, hãy dùng `read_file_lines` để đọc phân đoạn thay vì đọc cả file lớn.\n"
-            "4. Thúc đẩy tiến trình phỏng vấn không khoan nhượng (Grilling): hãy tiếp tục gọi `ask_questions_if_underspecified` nếu các "
-            "phương án kỹ thuật chưa được làm rõ tuyệt đối. Chỉ hoàn tất nhiệm vụ khảo sát khi đã ghi đầy đủ tài liệu đặc tả vật lý xuống đĩa.\n\n"
-            "⚠️ QUY TẮC BẮT BUỘC KHI HOÀN TẤT NHIỆM VỤ KHẢO SÁT:\n"
-            "Do toàn bộ nhật ký gọi công cụ thô sẽ bị dọn dẹp khỏi RAM ngay sau khi nhiệm vụ kết thúc để tiết kiệm token [1], "
-            "bản tóm tắt (summary) của bạn khi gọi công cụ `complete_agent_task` BẮT BUỘC phải chứa đầy đủ thông tin khảo sát súc tích theo cấu trúc:\n"
-            "- [Cấu trúc thư mục mới]: Liệt kê các thư mục, tệp tin cấu hình quan trọng đã phát hiện.\n"
-            "- [Phát hiện Kỹ thuật chính]: Chỉ rõ file, class, hàm nào đóng vai trò cốt lõi cho tính năng cần xây dựng.\n"
+            "1. Thúc đẩy tiến trình phỏng vấn không khoan nhượng (Grilling): hãy tiếp tục gọi `ask_questions_if_underspecified` nếu các yêu cầu nghiệp vụ chưa được làm rõ tuyệt đối.\n"
+            "2. Khi khảo sát mã nguồn, hãy ưu tiên dùng `search_keyword` để định vị trước, sau đó dùng `read_file_lines` để đọc phân đoạn thay vì đọc cả file lớn.\n\n"
+
+            "⚠️ QUY TẮC BẮT BUỘC KHI GỌI CÔNG CỤ complete_agent_task:\n"
+            "Do toàn bộ nhật ký gọi công cụ thô sẽ bị dọn dẹp khỏi RAM ngay sau khi nhiệm vụ kết thúc để tiết kiệm token, "
+            "bản tóm tắt (summary) của bạn khi gọi công cụ `complete_agent_task` BẮT BUỘC phải chứa đầy đủ thông tin khảo sát súc tích và THÍCH ỨNG THEO NHÓM NHIỆM VỤ đã phân loại:\n"
+            "- [Nhóm nhiệm vụ đã xác định]: Ghi rõ Nhóm A, Nhóm B, hay Nhóm C.\n"
+            "- [Cấu trúc và Phát hiện chính]: Liệt kê các thư mục, tệp tin quan trọng đã phát hiện (nếu là Nhóm A, B) hoặc mô tả sơ đồ logic workspace (nếu là Nhóm C).\n"
             "- [Kết quả Phỏng vấn & Đặc tả]: Tóm tắt các quyết định nghiệp vụ then chốt đã đồng thuận với người dùng.\n"
-            "- [Đường dẫn Tài liệu]: Xác nhận các tệp PRD.md, CONTEXT.md đã được tạo/cập nhật đầy đủ thông tin tương ứng ở đâu."
+            "- [Đường dẫn Tài liệu]: Xác nhận các tệp tài liệu thực tế được cập nhật/tạo mới (nếu là Nhóm B). Với Nhóm A và Nhóm C, ghi rõ 'Bỏ qua tạo tài liệu PRD/ADR/CONTEXT theo rào cản pha'."
         )
     else:
         read_files = ReadFilesTool(workspace_path=ws)
@@ -1506,7 +1351,6 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         write_and_run_script = WriteAndRunScriptTool(workspace_path=ws)
         ask_questions_tool = AskQuestionsTool(workspace_path=ws)
        
-        # 🌟 Nhúng danh sách mcp_tools vào tập công cụ khả dụng
         tools = [
             activate_skill_tool, run_skill_script_tool, read_files, write_file, web_autonomous_executor,
             apply_patch, list_directory, run_terminal_command, search_symbols, chrome_debugger_tool,
@@ -1518,13 +1362,11 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             f"Nhiệm vụ phát triển:\n{tasks_str}\n"
             f"Thư mục làm việc: {ws}\n\n"
             
-            # 🌟 CHỈ DẪN SONG SONG HÓA CÔNG CỤ CHO LUỒNG PHÁT TRIỂN
             "⚠️ QUY TẮC TỐI ƯU HÓA TOKEN BẰNG GỌI CÔNG CỤ SONG SONG (PARALLEL TOOL CALLING):\n"
             "1. Hãy tận dụng tối đa cơ chế GỌI CÔNG CỤ SONG SONG (Parallel Tool Calling) của mô hình để thực thi nhiều hành động độc lập trong cùng một lượt phản hồi.\n"
             "2. Ví dụ: Bạn có thể sửa đổi nhiều file thông qua việc gọi đồng thời nhiều công cụ `apply_search_replace_patch` cho các tệp khác nhau, hoặc kết hợp việc đọc file và tìm kiếm ký hiệu cùng lúc.\n"
             "3. Tuyệt đối không chia nhỏ các hành động độc lập thành nhiều chu kỳ suy nghĩ tuần tự nếu có thể gộp chung vào một lượt gọi song song để tránh lãng phí và tích lũy token ngữ cảnh không đáng có.\n\n"
 
-            # 🌟 CHỈ DẪN TRUY XUẤT OPENWIKI TOÀN CỤC CHO PHA PHÁT TRIỂN
             "⚠️ QUY TẮC KÍCH HOẠT & TUÂN THỦ KỸ NĂNG (BẮT BUỘC):\n"
             "1. Trước khi thực hiện viết code, sửa lỗi, hoặc viết test, hãy rà soát danh sách '=== THƯ VIỆN KỸ NĂNG KHẢ DỤNG (TIER 1) ==='. "
             "Nếu có kỹ năng hỗ trợ phù hợp (ví dụ: 'test-driven-development'), bạn BẮT BUỘC phải gọi công cụ `activate_agent_skill` để tải chỉ dẫn sâu.\n"
@@ -1590,10 +1432,6 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
                 f"```{lang}\n" + "\n".join(formatted_lines) + "\n```\n"
             )
 
-    # =====================================================================
-    # THIẾT LẬP PHÂN CẤP TIN NHẮN CHUẨN (CONTEXT SEPARATION PATTERN)
-    # Tách biệt hoàn toàn System Instruction tĩnh khỏi dữ liệu file động
-    # =====================================================================
     system_instructions = system_prompt + catalog_prompt + active_skills_prompt
     if git_branch and git_branch != "no_git":
         system_instructions += f"\n- Nhánh Git đang hoạt động: `{git_branch}`"
@@ -1601,10 +1439,8 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
     model_with_tools = model.bind_tools(tools)
     optimized_history = messages 
 
-    # 1. Đưa Chỉ thị hệ thống tĩnh (The Constitution) lên vị trí tối cao đầu tiên
     input_messages = [SystemMessage(content=system_instructions)]
 
-    # 2. Đưa Ngữ cảnh động (The Context Block) thành một thông điệp riêng biệt
     if workspace_context or registry_context_str:
         context_body = "=== NGỮ CẢNH DỰ ÁN HIỆN HÀNH (WORKSPACE STATE) ===\n"
         if workspace_context:
@@ -1614,7 +1450,6 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             
         input_messages.append(SystemMessage(content=context_body))
 
-    # Bổ sung chỉ dẫn sửa lỗi nếu có
     if task_type == "development" and error_logs:
         input_messages.append(HumanMessage(content=f"LƯU Ý SỬA LỖI TỪ VÒNG KIỂM THỬ:\n{error_logs}\nHãy sửa triệt để."))
         
@@ -1683,6 +1518,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
         "active_skills": active_skills
     })
     return state_updates
+
 def replanner_node(state: AgentState) -> Dict[str, Any]:
     replanning_count = state.get("replanning_count", 0)
     ws = state["workspace_path"]
@@ -1693,22 +1529,18 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
     error_logs = state.get("error_logs", "")
     active_skills = dict(state.get("active_skills", {}))
     
-    # Tuân thủ mô hình Just-In-Time (JIT) - Replanner không tự động tải body của kỹ năng vào active_skills.
-    # Trạng thái active_skills chỉ phản ánh các kỹ năng đã được nạp qua công cụ thực thi của Executor.
-    # Replanner chỉ đọc danh mục kỹ năng (Tier 1 Catalog) để đưa ra đề xuất điều phối lộ trình.
     active_skills_prompt = ""
     if active_skills:
         active_skills_prompt = "\n=== ⚡ CÁC KỸ NĂNG ĐANG HOẠT ĐỘNG (INSTRUCTIONS) ===\n"
         for s_name, s_instructions in active_skills.items():
-            active_skills_prompt += f"\n--- CHỈ DẪN KỸ NĂNG `{s_name}` ---\n{s_instructions}\n"
-    # Xác định trạng thái chuyển tiếp từ khảo sát sang phát triển
+            active_skills_prompt += f"\n--- CHỒNG CHỈ DẪN KỸ NĂNG `{s_name}` ---\n{s_instructions}\n"
+
     is_survey_transition = (
         len(plan) == 1 and 
         (plan[0].id if isinstance(plan[0], Task) else plan[0].get("id")) == "T_SURVEY" and
         (plan[0].status if isinstance(plan[0], Task) else plan[0].get("status")) == "completed"
     )
     
-    # Kiểm tra nếu không có lỗi phát sinh và không phải là pha chuyển đổi khảo sát
     if replanning_count >= 5 or (not error_logs and not is_survey_transition):
         action_msg = "bypass_limit" if replanning_count >= 5 else "bypass_no_error"
         proposal_message = AIMessage(
@@ -1731,6 +1563,16 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
             "Bạn là một Kiến trúc sư kiêm Điều phối viên dự án phần mềm cấp cao.\n"
             f"Nhiệm vụ: Dựa trên dữ liệu khảo sát và thám thính dự án vừa qua tại '{ws}' (ở các tin nhắn trước), "
             "hãy thiết kế một lộ trình hành động (DAG updated_tasks) hoàn chỉnh để giải quyết trọn vẹn yêu cầu của người dùng.\n\n"
+            "⚠️ QUY TẮC ĐÁNH GIÁ TRẠNG THÁI HOÀN THÀNH SỚM (OPPORTUNISTIC COMPLETION CHECK - BẮT BUỘC):\n"
+            "1. Hãy phân tích kỹ lịch sử gọi công cụ và nội dung trao đổi gần nhất.\n"
+            "2. Nếu bạn phát hiện ra rằng Agent trong pha Khảo sát (T_SURVEY) bằng cách nào đó ĐÃ HOÀN THÀNH TRỌN VẸN yêu cầu cốt lõi "
+            "   cuối cùng của người dùng (ví dụ: đã thực thi xong toàn bộ việc tái cấu trúc các trang Notion, tạo các Hubs thành công...) "
+            "   và không cần thực hiện thêm bất kỳ hành động phát triển hoặc viết mã nào nữa:\n"
+            "   - Hãy đặt `should_modify_plan` là True để cập nhật lại danh sách lộ trình.\n"
+            "   - Đặt `task_type` là 'analysis'.\n"
+            "   - Trong danh sách `updated_tasks`, CHỈ giữ lại duy nhất nhiệm vụ 'T_SURVEY' với trạng thái là 'completed'. TUYỆT ĐỐI KHÔNG thêm bất kỳ nhiệm vụ mới nào ở trạng thái 'pending'.\n"
+            "   - Giải thích thật rõ ràng trong `explanation` lý do tại sao hệ thống đã giải quyết xong bài toán và có thể kết thúc đồ thị ngay lập tức.\n"
+            "3. Ngược lại, nếu mục tiêu vẫn chưa được thực hiện xong và cần viết code, cấu hình hay kiểm thử, hãy thiết kế lộ trình phát triển bình thường theo hướng dẫn bên dưới.\n\n"
             "⚠️ QUY TẮC PHÂN PHỐI KỸ NĂNG VÀO LỘ TRÌNH (BẮT BUỘC):\n"
             "1. Hãy đối chiếu yêu cầu của lộ trình với danh mục kỹ năng hiện có trong hệ thống.\n"
             "2. Nếu một nhiệm vụ đòi hỏi quy trình kỹ thuật đặc thù (ví dụ: phát triển kèm viết test, thao tác Excel, cấu hình PRD), "
@@ -1781,7 +1623,6 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
         updated_tasks = getattr(decision, "updated_tasks", [])
         updated_task_type = getattr(decision, "task_type", task_type)
         
-        # Nếu LLM phân tích xong và trả về danh sách nhiệm vụ rỗng
         if not updated_tasks or not should_modify:
             proposal_message = AIMessage(
                 content="📋 [Hệ thống tự động duyệt qua: Kế hoạch hiện tại đã tối ưu, không cần cập nhật thêm]",
@@ -1790,7 +1631,6 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
             )
             return {"messages": [proposal_message],"active_skills": active_skills }
 
-        # Chuẩn hóa danh sách task
         refined_tasks = []
         for task_data in updated_tasks:
             task_obj = task_data if isinstance(task_data, Task) else Task(**task_data)
@@ -1804,17 +1644,13 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
         }
         
     except Exception as e:
-        # Cơ chế dự phòng khẩn cấp (Fail-Safe) khi LLM lỗi
         proposal_data = {
-            "action": "bypass_no_error", # Bỏ qua ngắt để không gây treo đồ thị
+            "action": "bypass_no_error",
             "explanation": f"Kích hoạt cơ chế tự phục hồi do lỗi hệ thống: {str(e)}",
             "task_type": task_type,
             "tasks": []
         }
         
-    # Tạo đóng gói phản hồi đồng nhất
-    # 🛡️ GIẢI PHÁP THEN CHỐT: Ghi nội dung text sạch vào content để hiển thị trên UI,
-    # cất cấu trúc JSON kỹ thuật vào additional_kwargs để phục vụ xử lý ngầm.
     proposal_message = AIMessage(
         content=f"🔄 **[Hệ thống đề xuất lộ trình hành động mới]**\n\n{proposal_data.get('explanation', 'Đang cập nhật lộ trình...')}",
         name="replanner_proposal",
@@ -1827,28 +1663,16 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
         "active_skills": active_skills 
     }
 
-
 def replanner_interrupt_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Nút ngắt duyệt kế hoạch thông minh (Human-in-the-Loop Gate).
-    Chỉ kích hoạt ngắt khi có kế hoạch thực sự, ẩn JSON điều khiển khỏi UI chat,
-    và tự động phân tích phản hồi tùy chỉnh của người dùng để cập nhật lộ trình.
-    """
     messages = state["messages"]
     plan = state["plan"]
     
-    # =====================================================================
-    # BƯỚC 1: TRÍCH XUẤT PAYLOAD PHÂN TÍCH NỘI BỘ (IDEMPOTENT EXTRACTION)
-    # =====================================================================
     proposal_payload = {}
     for msg in reversed(messages):
-        # Tìm tin nhắn chứa gói dữ liệu kế hoạch được đóng gói ẩn bởi replanner_node
         if getattr(msg, "name", None) == "replanner_proposal":
             proposal_payload = msg.additional_kwargs.get("proposal_payload", {})
             break
             
-    # Nếu không tìm thấy bất kỳ đề xuất nào từ nút replanner trước đó,
-    # bảo toàn kế hoạch hiện hành và đi tiếp
     if not proposal_payload:
         logger.warning("[Replanner Gate] Không tìm thấy dữ liệu đề xuất từ replanner_node.")
         return {
@@ -1860,12 +1684,7 @@ def replanner_interrupt_node(state: AgentState) -> Dict[str, Any]:
     action = proposal_payload.get("action", "bypass_no_error")
     proposed_tasks = proposal_payload.get("tasks", [])
     
-    # =====================================================================
-    # BƯỚC 2: TỰ ĐỘNG DUYỆT (AUTO-APPROVE BYPASS GUARD)
-    # Ngăn chặn tuyệt đối việc bắt người dùng duyệt bản kế hoạch rỗng
-    # =====================================================================
     if action in ["bypass_limit", "bypass_no_error"] or not proposed_tasks:
-        # Chuẩn bị lại danh sách nhiệm vụ từ kế hoạch cũ
         fallback_tasks = []
         for t in plan:
             fallback_tasks.append(t if isinstance(t, Task) else Task(**t))
@@ -1879,10 +1698,6 @@ def replanner_interrupt_node(state: AgentState) -> Dict[str, Any]:
             "messages": [AIMessage(content="⏭️ **[Tự động điều phối]**: Kế hoạch hiện tại đã tối ưu, hệ thống tự động hoàn tất pha duyệt.")]
         }
         
-    # =====================================================================
-    # BƯỚC 3: THIẾT LẬP GIAO DIỆN INTERRUPT PAYLOAD
-    # =====================================================================
-    # Payload này sẽ được serialization thành JSON và gửi trực tiếp lên giao diện Client/Studio
     interrupt_payload = {
         "type": "replanner_interrupt",
         "title": "📋 ĐÁNH GIÁ & PHÊ DUYỆT KẾ HOẠCH HÀNH ĐỘNG",
@@ -1896,21 +1711,12 @@ def replanner_interrupt_node(state: AgentState) -> Dict[str, Any]:
         )
     }
     
-    # KÍCH HOẠT NGẮT ĐỒ THỊ (LangGraph pauses here and waits for Command(resume=value))
     user_input = interrupt(interrupt_payload)
     
-    # =====================================================================
-    # BƯỚC 4: BỘ PHÂN TÍCH PHẢN HỒI ĐA TẦNG (DEFENSIVE RESPONSE PARSER)
-    # Chạy khi đồ thị được RESUME. Xử lý tất cả các kịch bản đầu vào từ UI.
-    # =====================================================================
-    
-    # Mặc định hóa phản hồi
     user_input_clean = ""
     if isinstance(user_input, str):
         user_input_clean = user_input.strip().lower()
     
-    # --- Kịch bản 4.1: Đồng ý mặc định (Approval Path) ---
-    # Người dùng gửi 'yes', 'approve', 'ok', hoặc chỉ ấn Enter (chuỗi rỗng / None)
     if user_input is None or user_input_clean in ["", "yes", "approve", "ok"]:
         refined_tasks = [Task(**t) for t in proposed_tasks]
         return {
@@ -1922,8 +1728,6 @@ def replanner_interrupt_node(state: AgentState) -> Dict[str, Any]:
             "messages": [AIMessage(content="✅ **[Kế hoạch được duyệt]** Áp dụng lộ trình phát triển và kiểm thử mới thành công.")]
         }
         
-    # --- Kịch bản 4.2: Từ chối / Bỏ qua (Skip/Decline Path) ---
-    # Người dùng không muốn thay đổi lộ trình, giữ nguyên kế hoạch hiện tại
     if user_input_clean in ["skip", "no", "cancel", "decline"]:
         fallback_tasks = []
         for t in plan:
@@ -1944,18 +1748,13 @@ def replanner_interrupt_node(state: AgentState) -> Dict[str, Any]:
             "messages": [AIMessage(content="⏭️ **[Người dùng bỏ qua kế hoạch mới]** Tiếp tục lộ trình thực thi cũ.")]
         }
         
-    # --- Kịch bản 4.3: Người dùng nhập Kế hoạch tùy chỉnh (Custom Task List Path) ---
-    # Giao diện frontend hoặc Studio có thể cho phép người dùng tùy chỉnh danh sách Tasks 
-    # và gửi về dưới dạng chuỗi JSON hoặc một cấu trúc dữ liệu mảng trực tiếp.
     custom_tasks_raw = []
     
-    # Nếu client gửi về một list/dict trực tiếp
     if isinstance(user_input, list):
         custom_tasks_raw = user_input
     elif isinstance(user_input, dict) and "tasks" in user_input:
         custom_tasks_raw = user_input["tasks"]
     elif isinstance(user_input, str):
-        # Thử nghiệm phân tích cú pháp chuỗi JSON nếu người dùng tự nhập tay cấu trúc mảng
         try:
             parsed = json.loads(user_input)
             if isinstance(parsed, list):
@@ -1965,7 +1764,6 @@ def replanner_interrupt_node(state: AgentState) -> Dict[str, Any]:
         except json.JSONDecodeError:
             pass
 
-    # Nếu phân tích ra được danh sách task tùy chỉnh hợp lệ
     if custom_tasks_raw:
         try:
             custom_tasks = [Task(**t) for t in custom_tasks_raw]
@@ -1981,10 +1779,6 @@ def replanner_interrupt_node(state: AgentState) -> Dict[str, Any]:
         except Exception as parse_err:
             logger.error(f"[Replanner Gate] Lỗi định dạng dữ liệu Task tùy chỉnh: {str(parse_err)}")
             
-    # --- Kịch bản 4.4: Phản hồi tự do (Free-text Feedback Path) ---
-    # Nếu người dùng không nhập đúng từ khóa điều hướng và cũng không phải JSON,
-    # mà nhập một phản hồi văn bản tự do (ví dụ: "Hãy làm thêm bước X trước bước Y"),
-    # chúng ta sẽ chuyển tiếp ý kiến phản hồi này làm tin nhắn hệ thống đưa ngược về Executor/Replanner
     logger.info(f"[Replanner Gate] Ghi nhận phản hồi văn bản tự do: {user_input}")
     feedback_message = HumanMessage(
         content=(
@@ -1994,7 +1788,6 @@ def replanner_interrupt_node(state: AgentState) -> Dict[str, Any]:
         )
     )
     
-    # Hoàn trả lại kế hoạch cũ để Replanner có thể xử lý điều chỉnh lại ở lượt tiếp theo
     fallback_tasks = [t if isinstance(t, Task) else Task(**t) for t in plan]
     return {
         "plan": fallback_tasks,
@@ -2002,7 +1795,6 @@ def replanner_interrupt_node(state: AgentState) -> Dict[str, Any]:
         "attempts": 0,
         "messages": [feedback_message]
     }
-
 
 def tool_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]
@@ -2042,7 +1834,6 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         "chrome_devtools_debugger": chrome_debugger_tool,
     }
 
-    # 🌟 2. TẢI ĐỘNG CÁC CÔNG CỤ MCP CHO CẢ LUỒNG THỰC THI (TOOL_NODE)
     try:
         from mcp_helper import MCPRegistryManager
         mcp_manager = MCPRegistryManager(ws)
@@ -2085,8 +1876,6 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
             result = f"Lỗi: Không tìm thấy công cụ '{tool_name}'."
         else:
             try:
-                # 🛡️ KIỂM TRA PHÒNG THỦ: Thực thi đồng bộ hoặc bất đồng bộ tùy theo loại công cụ
-                # Các công cụ MCP ngoài (Notion, ...) chạy async, ta dùng run_sync từ mcp_helper để gọi ainvoke
                 sync_tools = {
                     "read_files", "write_file", "apply_search_replace_patch", "list_directory", 
                     "run_terminal_command", "search_symbols_universal", "read_file_lines", 
@@ -2138,7 +1927,6 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
                     continue
                 current_content = safe_path.read_text(encoding="utf-8")
                 
-                # Chuẩn hóa khóa thành đường dẫn tương đối thống nhất từ workspace root
                 workspace_root = Path(ws).expanduser().resolve()
                 rel_path = str(safe_path.relative_to(workspace_root))
                 
@@ -2167,12 +1955,7 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
         "plan": updated_plan
     }
 
-
 def human_interaction_gate_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Node rào chắn tương tác người dùng chỉ dành cho mục đích làm rõ thông tin (Clarification Questions).
-    Đã loại bỏ hoàn toàn phần xử lý kế hoạch thủ công do vai trò này được chuyển giao hoàn toàn cho Replanner.
-    """
     messages = state["messages"]
     
     target_tool_msg = None
@@ -2192,7 +1975,6 @@ def human_interaction_gate_node(state: AgentState) -> Dict[str, Any]:
     except Exception:
         return {}
 
-    # Thực hiện ngắt đồ thị để đợi câu trả lời từ người dùng cho các câu hỏi
     user_input = interrupt(payload)
     
     feedback_content = f"### [Phản hồi của người dùng cho các câu hỏi]:\n{json.dumps(user_input, ensure_ascii=False)}"
@@ -2205,18 +1987,13 @@ def human_interaction_gate_node(state: AgentState) -> Dict[str, Any]:
         "messages": [feedback_message]
     }
 
-
 def tester_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Nút kiểm thử tĩnh. Đã nâng cấp cơ chế ép kiểu phòng thủ từ Checkpoint.
-    """
     modified_files = state.get("modified_files", [])
     attempts = state.get("attempts", 0)
     plan = state["plan"]
     ws = state.get("workspace_path", ".")
     last_executed_ids = state.get("last_executed_task_ids", [])
     
-    # 🌟 VÁ LỖI: Ép kiểu phòng thủ để tránh lỗi AttributeError từ checkpointer thô
     parsed_plan = []
     for t in plan:
         if isinstance(t, dict):
@@ -2320,7 +2097,6 @@ def tester_node(state: AgentState) -> Dict[str, Any]:
                 "messages": [AIMessage(content=f"{warning_msg}⚠️ [Vòng kiểm thử thất bại] Phát hiện lỗi ở mã nguồn sửa đổi:\n\n{combined_error}\n\n⚙️ Đang gửi trả trạng thái nhiệm vụ về 'pending' để tự động sửa chữa.")]
             }
         else:
-            # Lưu ý giữ lại thông tin lỗi và số lần thử để router bắt được
             return {
                 "error_logs": combined_error,
                 "attempts": attempts,
@@ -2335,8 +2111,11 @@ def tester_node(state: AgentState) -> Dict[str, Any]:
         "messages": [AIMessage(content=success_content)]
     }
 
-
 def synthesis_node(state: AgentState) -> Dict[str, Any]:
+    """
+    [CẬP NHẬT KIỂM SOÁT MIỀN TÀI LIỆU - DOMAIN GATE PROTECTION]
+    Nút tổng hợp tài liệu CONTEXT.md có cổng bảo vệ để tránh sinh tài liệu rác gây ảo giác.
+    """
     ws = state["workspace_path"]
     findings = state.get("step_findings", [])
     git_branch = state.get("git_branch", "no_git")
@@ -2346,6 +2125,26 @@ def synthesis_node(state: AgentState) -> Dict[str, Any]:
         
     compiled_data = "\n\n---\n\n".join(findings)
     
+    # 🌟 CỔNG BẢO VỆ CHỐNG ẢO GIÁC: Kiểm tra xem có phải tác vụ phi lập trình (Notion/Ops) hoặc sửa lỗi cục bộ không
+    is_non_coding = any(
+        kw in compiled_data.lower() or kw in str(state.get("messages", [])).lower()
+        for kw in ["notion", "figma", "jira", "trello", "google sheet", "excel", "devops", "ops", "tối ưu"]
+    )
+    is_localized_edit = any(
+        kw in compiled_data.lower() or "localized code edit" in compiled_data.lower()
+        for kw in ["sửa lỗi cục bộ", "chỉnh sửa file", "localized"]
+    )
+    
+    if is_non_coding:
+        return {
+            "messages": [AIMessage(content="⏭️ **[Bypass Synthesis]**: Phát hiện tác vụ Phi lập trình / Vận hành (Ops). Hệ thống tự động bỏ qua bước thiết lập `CONTEXT.md` để bảo vệ bối cảnh đồ thị sạch.")]
+        }
+        
+    if is_localized_edit and not (Path(ws) / "CONTEXT.md").exists():
+        return {
+            "messages": [AIMessage(content="⏭️ **[Bypass Synthesis]**: Phát hiện tác vụ chỉnh sửa tệp tin cục bộ. Bỏ qua việc tạo tệp `CONTEXT.md` mới để tối ưu bộ nhớ.")]
+        }
+
     synthesis_prompt = (
         "Bạn là một Kiến trúc sư Hệ thống chuyên nghiệp chuyên biên soạn tài liệu.\n"
         "Hãy tổng hợp toàn bộ thông tin khảo sát thô được ghi nhận ở các bước trước thành một tài liệu 'CONTEXT.md' duy nhất "
@@ -2395,7 +2194,6 @@ def synthesis_node(state: AgentState) -> Dict[str, Any]:
     except Exception as e:
         return {"messages": [AIMessage(content=f"Cảnh báo: Có lỗi xảy ra khi tổng hợp tệp CONTEXT.md: {str(e)}")]}
     return {}
-
 
 def commit_node(state: AgentState) -> Dict[str, Any]:
     ws = state["workspace_path"]

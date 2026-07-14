@@ -80,6 +80,7 @@ class MCPRegistryManager:
         if not isinstance(servers, dict):
             servers = {}
             return servers
+        return servers
 
     def build_client_config(self, raw_servers: Dict[str, Any]) -> Dict[str, Any]:
         """Chuẩn hóa cấu hình thành chuẩn của MultiServerMCPClient."""

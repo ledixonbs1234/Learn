@@ -72,6 +72,10 @@ class TaskTriage(BaseModel):
         default_factory=list,
         description="Danh sách các tên định danh kỹ năng phù hợp nhất từ thư viện .skills/."
     )
+    recommended_mcp_servers: List[str] = Field(
+        default_factory=list,
+        description="Danh sách tên các máy chủ MCP cần kích hoạt phục vụ cho yêu cầu hiện hành (ví dụ: ['devtools'] hoặc ['notion'])."
+    )
 
 class RuntimeVerificationResult(BaseModel):
     has_critical_error: bool = Field(description="True nếu phát hiện lỗi crash, exception nghiêm trọng.")
@@ -115,10 +119,19 @@ def reduce_findings(left: Union[List[str], None], right: Union[List[str], None])
         return right_list[1:]
     return left_list + right_list
 
-def reduce_file_registry(left: Dict[str, str], right: Dict[str, str]) -> Dict[str, str]:
+def reduce_file_registry(left: Dict[str, str], right: Dict[str, Optional[str]]) -> Dict[str, str]:
+    """
+    Hợp nhất bộ đệm file registry cấp độ Production.
+    Nếu một khóa trong `right` có giá trị là None, khóa đó sẽ bị xóa hoàn toàn khỏi registry (Eviction)
+    để giải phóng tài nguyên token.
+    """
     merged = dict(left or {})
     if right:
-        merged.update(right)
+        for k, v in right.items():
+            if v is None:
+                merged.pop(k, None)  # Thực hiện trục xuất khóa khỏi bộ đệm
+            else:
+                merged[k] = v
     return merged
 
 def reduce_summaries(left: List[str], right: List[str]) -> List[str]:
@@ -164,6 +177,7 @@ class AgentState(TypedDict):
     doubt_findings: str         # Lưu kết quả rà soát đối kháng
     doubt_attempts: int
     recommended_skills: List[str]
+    active_mcp_servers: List[str] # Lưu trữ danh sách máy chủ MCP hoạt động được AI phê duyệt
     completed_task_summaries: Annotated[List[str], reduce_summaries]
 
 class WebInteractionState(TypedDict):

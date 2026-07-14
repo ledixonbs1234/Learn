@@ -1154,11 +1154,12 @@ class QueryOpenWikiTool(BaseTool):
         try:
             # Chạy OpenWiki CLI ở chế độ One-shot (-p) để lấy phản hồi nhanh
             res = subprocess.run(
-                ["openwiki", "-p", agent_instruction],
+                ["openwiki", "-p", query],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
-                timeout=45
+                timeout=120,
+                shell=True  # Sử dụng shell để đảm bảo lệnh openwiki được tìm thấy trong PATH
             )
             
             if res.returncode == 0:

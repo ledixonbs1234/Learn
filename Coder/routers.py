@@ -61,30 +61,30 @@ def executor_router(state: AgentState) -> Literal["executor", "tool_node", "test
 def tester_router(state: AgentState) -> Literal["executor", "chrome_extension_debugger", "replanner", "doubt_reviewer", "commit"]:
     """
     Định tuyến từ Nút Kiểm thử tĩnh.
-    Nếu kiểm thử thành công, đồ thị bắt buộc đi qua Nút Phản biện đối kháng (doubt_reviewer).
+    Nếu kiểm thử thất bại, tự động đưa ra các quyết định quay lại sửa hoặc tái lập kế hoạch.
     """
     error = state.get("error_logs", "")
     attempts = state.get("attempts", 0)
     is_simple = state.get("is_simple", False)
     extension_path = state.get("extension_path", "")
     
-    # 1. Nếu có lỗi kiểm tra tĩnh (cú pháp/biên dịch) và chưa quá 3 lần thử -> Quay lại sửa code [1]
+    # 1. Nếu có lỗi kiểm tra tĩnh và chưa quá 3 lần thử -> Quay lại sửa code
     if error and attempts < 3:
         return "executor"
         
-    # 2. Nếu kiểm tra tĩnh ĐÃ THÀNH CÔNG:
+    # 2. Nếu có lỗi nhưng đã thử sửa quá 3 lần -> Chuyển giao bối cảnh lỗi về cho bộ điều phối Replanner
+    if error and attempts >= 3:
+        if is_simple:
+            return "commit"
+        return "replanner"
+        
+    # 3. Nếu kiểm tra tĩnh HOÀN TOÀN THÀNH CÔNG (không có lỗi):
     if not error:
         # Nếu là Chrome Extension: Chuyển sang kiểm thử động (runtime) trước
         if extension_path:
             return "chrome_extension_debugger"
         # Dự án thông thường: Chuyển thẳng sang bước Hoài nghi đối kháng
         return "doubt_reviewer"
-        
-    # 3. Các trường hợp lỗi nhưng đã vượt quá 3 lần thử sửa tự động
-    if is_simple:
-        return "commit"
-        
-    return "replanner"
 # 🌟 ĐỊNH TUYẾN MỚI THUỘC LUỒNG THẨM ĐỊNH ĐỐI KHÁNG (DOUBT FLOW)
 def doubt_router(state: AgentState) -> Literal["executor", "doubt_gate", "synthesis", "commit"]:
     """

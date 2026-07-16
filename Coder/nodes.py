@@ -1173,7 +1173,133 @@ def fluxmem_distillation_node(state: AgentState) -> Dict[str, Any]:
     except Exception as e:
         print(f"[Cảnh báo] Lỗi trong quá trình chưng cất quy trình toàn cục: {str(e)}")
         return {}
+def crawl_project_sources(workspace_path: Path) -> str:
+    """Quét đệ quy toàn bộ mã nguồn hợp lệ trong dự án, loại bỏ các file bị ignore."""
+    from config import GitIgnoreMatcher
+    matcher = GitIgnoreMatcher(workspace_path)
+    sources = []
+    
+    allowed_extensions = {
+        '.py', '.js', '.jsx', '.ts', '.tsx', '.dart', '.go', '.rs', '.java', 
+        '.cpp', '.h', '.hpp', '.cs', '.kt', '.swift', '.json', '.yaml', '.yml', 
+        '.md', '.html', '.css', '.toml', '.xml', '.gradle', '.bat', '.sh'
+    }
+    
+    try:
+        for root, dirs, files in os.walk(str(workspace_path)):
+            dirs[:] = [d for d in dirs if not matcher.is_ignored(Path(root) / d)]
+            
+            for file in files:
+                file_path = Path(root) / file
+                if matcher.is_ignored(file_path):
+                    continue
+                if file_path.suffix.lower() not in allowed_extensions:
+                    continue
+                try:
+                    content = file_path.read_text(encoding='utf-8', errors='replace')
+                    rel_path = file_path.relative_to(workspace_path).as_posix()
+                    sources.append(f"=== TỆP TIN: `{rel_path}` ===\n{content}\n")
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"[Cảnh báo Debugger] Lỗi duyệt thư mục: {str(e)}")
+        
+    return "\n\n".join(sources)
 
+
+def run_isolated_debugger_agent(workspace_path: str, user_query: str) -> str:
+    """Khởi chạy một Agent gỡ lỗi độc lập ở chế độ One-shot để đưa ra giải pháp sửa đổi tối ưu."""
+    from langchain_core.messages import SystemMessage, HumanMessage
+    from config import model
+    import re
+    
+    print("🤖 [Debugger Agent] Đang phân tích toàn bộ mã nguồn của dự án...")
+    sources_data = crawl_project_sources(Path(workspace_path))
+    
+    if not sources_data:
+        return "Không phát hiện mã nguồn hợp lệ hoặc thư mục dự án trống."
+        
+    prompt = (
+        "Bạn là một Chuyên Gia Gỡ Lỗi Độc Lập Hệ Thống (Isolated Debugger Agent).\n"
+        "Nhiệm vụ duy nhất của bạn là phân tích toàn bộ mã nguồn của dự án được cung cấp dưới đây, "
+        "đối chiếu với thông tin báo lỗi hoặc yêu cầu sửa lỗi từ người dùng, xác định chính xác nguyên nhân "
+        "và đưa ra giải pháp sửa lỗi chi tiết nhất có thể.\n\n"
+        "⚠️ QUY TẮC PHÂN TÍCH:\n"
+        "1. Xác định rõ ràng các tệp tin, lớp, hàm hoặc dòng mã gây ra lỗi.\n"
+        "2. Giải thích rõ ràng nguyên nhân tại sao lỗi xảy ra (logic lỗi, không khớp kiểu dữ liệu, runtime exception, v.v.).\n"
+        "3. Đưa ra phương án sửa chữa tối ưu dưới dạng mã nguồn chỉnh sửa cụ thể (đặc biệt khuyến khích viết theo khối SEARCH/REPLACE để Executor dễ dàng thực thi).\n"
+        "4. Chỉ xuất ra nội dung phân tích và mã nguồn sửa đổi trực tiếp, KHÔNG viết lời chào hỏi hay gọi bất kỳ công cụ nào.\n\n"
+        "=== MÃ NGUỒN TOÀN BỘ DỰ ÁN ===\n"
+        f"{sources_data}\n\n"
+        "=== YÊU CẦU SỬA LỖI HỆ THỐNG ===\n"
+        f"{user_query}\n\n"
+        "Hãy viết báo cáo gỡ lỗi và phương án sửa chữa chi tiết bằng tiếng Việt:"
+    )
+    
+    try:
+        response = model.invoke([
+            SystemMessage(content="Bạn đang thực hiện nhiệm vụ gỡ lỗi cô lập, một chu kỳ suy nghĩ duy nhất (One-shot debug)."),
+            HumanMessage(content=prompt)
+        ])
+        
+        cleaned_content = re.sub(r"<thinking>.*?</thinking>", "", response.content, flags=re.DOTALL)
+        cleaned_content = re.sub(r"<thought>.*?</thought>", "", cleaned_content, flags=re.DOTALL)
+        return cleaned_content.strip()
+    except Exception as e:
+        return f"Lỗi trong quá trình chạy Debugger Agent độc lập: {str(e)}"
+
+
+def isolated_debugger_node(state: AgentState) -> Dict[str, Any]:
+    """
+    Nút trung gian kiểm tra và chạy phân tích lỗi của dự án.
+    Nếu là yêu cầu liên quan đến lỗi, chạy gỡ lỗi cô lập và đưa thẳng báo cáo vào luồng tin nhắn hội thoại.
+    """
+    ws = state.get("workspace_path", ".")
+    messages = state.get("messages", [])
+    debugger_proposal = state.get("debugger_proposal", "")
+
+    # Đảm bảo không chạy lại nếu đề xuất đã tồn tại
+    if debugger_proposal:
+        return {}
+
+    user_query = ""
+    for msg in reversed(messages):
+        if msg.type == "human" or isinstance(msg, HumanMessage):
+            user_query = get_text_content_safely(msg.content)
+            break
+
+    # Phát hiện xem yêu cầu hiện tại có cần can thiệp gỡ lỗi hệ thống hay không
+    bug_keywords = ["lỗi", "error", "bug", "crash", "exception", "failed", "sửa lỗi", "fix", "hỏng"]
+    detailed_analysis = state.get("detailed_analysis", "")
+    error_logs = state.get("error_logs", "")
+
+    is_bug_fixing_task = (
+        any(kw in user_query.lower() for kw in bug_keywords) or 
+        any(kw in detailed_analysis.lower() for kw in bug_keywords) or
+        bool(error_logs)
+    )
+
+    if not is_bug_fixing_task:
+        return {"debugger_proposal": ""}
+
+    proposal_result = run_isolated_debugger_agent(ws, user_query or detailed_analysis or error_logs)
+    
+    # Chuyển đổi phương án thành một AIMessage hội thoại tự nhiên, 
+    # nó sẽ tự động được xếp cuối lịch sử hội thoại trước khi Executor chạy.
+    proposal_msg = AIMessage(
+        content=(
+            "=== [BẢN PHÂN TÍCH & PHƯƠNG ÁN SỬA LỖI TỐI ƯU CỦA TÔI] ===\n"
+            "Sau khi phân tích toàn bộ mã nguồn của dự án một cách độc lập, tôi đã xác định được nguyên nhân và đúc kết được phương án giải quyết tối ưu dưới đây:\n\n"
+            f"{proposal_result}\n\n"
+            "Bây giờ, tôi sẽ bắt đầu gọi các công cụ chỉnh sửa tệp tin thích hợp để áp dụng giải pháp này."
+        )
+    )
+
+    return {
+        "debugger_proposal": proposal_result,
+        "messages": [proposal_msg]
+    }
+        
 def executor_node(state: AgentState) -> Dict[str, Any]:
     ws = state.get("workspace_path", ".")
     plan = state.get("plan", [])
@@ -1183,6 +1309,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
     task_type = state.get("task_type", "development")
     extension_path = state.get("extension_path", "")
     active_skills = state.get("active_skills", {}) or {}
+    debugger_proposal = state.get("debugger_proposal", "")
 
     state_updates = {}
     git_branch = state.get("git_branch", "")
@@ -1485,7 +1612,7 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
     # 🌟 CẢI TIẾN QUAN TRỌNG: Gọi hàm thu gọn tin nhắn file cũ để làm sạch lịch sử trượt
     optimized_history = compact_historical_file_messages(messages)
 
-    # 🌟 CẢI TIẾN QUAN TRỌNG: Không còn registry_context_str nhồi nhét vào System Message nữa!
+    # Khởi tạo bối cảnh hệ thống sạch sẽ, không nhiễm độc System Prompt
     input_messages = [SystemMessage(content=system_instructions)]
 
     if workspace_context:
@@ -1499,9 +1626,6 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
     response = model_with_tools.invoke(input_messages + optimized_history)
     response = sanitize_llm_response_content(response)
     
-    # Phần quản lý trạng thái trả về giữ nguyên
-    # ...
-    # (Giữ nguyên phần logic xử lý response.tool_calls và return state_updates ở cuối hàm)
     if not response.tool_calls:
         if task_type == "analysis":
             findings = []
@@ -1520,7 +1644,8 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
                 "messages": [response],
                 "plan": updated_plan,
                 "last_executed_task_ids": list(eligible_ids),
-                "active_skills": active_skills
+                "active_skills": active_skills,
+                "debugger_proposal": debugger_proposal
             })
             if findings:
                 state_updates["step_findings"] = findings
@@ -1546,7 +1671,8 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
                     "messages": [response],
                     "plan": updated_plan,
                     "last_executed_task_ids": list(eligible_ids),
-                    "active_skills": active_skills
+                    "active_skills": active_skills,
+                    "debugger_proposal": debugger_proposal
                 })
                 return state_updates
             else:
@@ -1555,13 +1681,15 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
                 )
                 state_updates.update({
                     "messages": [response, warning_feedback],
-                    "active_skills": active_skills
+                    "active_skills": active_skills,
+                    "debugger_proposal": debugger_proposal
                 })
                 return state_updates
                 
     state_updates.update({
         "messages": [response],
-        "active_skills": active_skills
+        "active_skills": active_skills,
+        "debugger_proposal": debugger_proposal
     })
     return state_updates
 

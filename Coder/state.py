@@ -179,6 +179,7 @@ class AgentState(TypedDict):
     recommended_skills: List[str]
     active_mcp_servers: List[str] # Lưu trữ danh sách máy chủ MCP hoạt động được AI phê duyệt
     completed_task_summaries: Annotated[List[str], reduce_summaries]
+    debugger_proposal: str
 
 class WebInteractionState(TypedDict):
     workspace_path: str 

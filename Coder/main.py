@@ -33,13 +33,13 @@ builder.add_node("fluxmem_distillation", nodes.fluxmem_distillation_node)
 # ĐĂNG KÝ CÁC NÚT THẨM ĐỊNH ĐỐI KHÁNG
 builder.add_node("doubt_reviewer", nodes.doubt_reviewer_node)
 builder.add_node("doubt_gate", nodes.doubt_gate_node)
-
+builder.add_node("isolated_debugger", nodes.isolated_debugger_node)
 # =====================================================================
 # 2. THIẾT LẬP CÁC CẠNH NỐI CHÍNH (EDGES & ROUTERS)
 # =====================================================================
 builder.add_edge(START, "detect_and_triage")
-builder.add_edge("detect_and_triage", "executor")
-
+builder.add_edge("detect_and_triage", "isolated_debugger")
+builder.add_edge("isolated_debugger", "executor")
 # Định tuyến từ Executor
 builder.add_conditional_edges(
     "executor",

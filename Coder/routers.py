@@ -4,14 +4,18 @@ from typing import Literal
 from langchain_core.messages import AIMessage, HumanMessage
 from state import AgentState, Task
 
-def executor_router(state: AgentState) -> Literal["executor", "tool_node", "tester", "replanner", "synthesis", "context_compressor"]:
+def executor_router(state: AgentState) -> Literal["executor", "tool_node", "doubt_reviewer", "replanner", "synthesis", "context_compressor"]:
     messages = state["messages"]
     plan = state.get("plan", [])
     task_type = state.get("task_type", "development")
     
     if not messages:
         if state.get("is_simple"):
-            return "tester" if task_type == "development" else "synthesis"
+            if task_type == "development":
+                # 🌟 THAY ĐỔI: Đi thẳng tới doubt_reviewer thay vì kiểm tra extension_path
+                return "doubt_reviewer"
+            else:
+                return "synthesis"
         return "replanner"
           
     last_message = messages[-1]
@@ -24,19 +28,15 @@ def executor_router(state: AgentState) -> Literal["executor", "tool_node", "test
     if isinstance(last_message, HumanMessage) and "⚠️ Cảnh báo: Bạn chưa thực hiện chỉnh sửa" in str(last_message.content):
         return "executor"
 
-    # =====================================================================
-    # 2. CHỈNH SỬA TẠI ĐÂY: CHUYỂN PHA SANG ĐIỂM DỌN DẸP NGỮ CẢNH TRƯỚC KHI LẬP KẾ HOẠCH
-    # =====================================================================
-    # Kiểm tra xem nhiệm vụ khảo sát lính canh T_SURVEY đã hoàn thành chưa [1]
+    # 2. Chuyển pha sang điểm dọn dẹp ngữ cảnh trước khi lập kế hoạch [1]
     is_survey_transition = (
         len(plan) == 1 and 
         (plan[0].id if isinstance(plan[0], Task) else plan[0].get("id")) == "T_SURVEY" and
         (plan[0].status if isinstance(plan[0], Task) else plan[0].get("status")) == "completed"
     )
     
-    # Nếu T_SURVEY đã hoàn tất hoặc Executor ở pha analysis vừa dừng lại không gọi tool nữa
     if is_survey_transition or (task_type == "analysis" and not (isinstance(last_message, AIMessage) and last_message.tool_calls)):
-        return "context_compressor" # Thay vì chuyển thẳng tới "replanner", ta chuyển sang "context_compressor"
+        return "context_compressor"
 
     has_pending_tasks = any(
         (t.status if isinstance(t, Task) else t.get("status")) == "pending" 
@@ -44,8 +44,9 @@ def executor_router(state: AgentState) -> Literal["executor", "tool_node", "test
     )   
 
     # 3. Agent báo cáo đã xong lượt chạy và có file bị sửa đổi ở pha Development
+    # 🌟 THAY ĐỔI: Bỏ qua hoàn toàn debugger, chuyển thẳng tới doubt_reviewer
     if task_type == "development" and state.get("modified_files") and not has_pending_tasks:
-        return "tester"
+        return "doubt_reviewer"
         
     # 4. Tác vụ đơn giản không sửa code
     if state.get("is_simple"):
@@ -55,37 +56,9 @@ def executor_router(state: AgentState) -> Literal["executor", "tool_node", "test
     if not has_pending_tasks:
         return "synthesis"
         
-    # 6. Nếu vẫn còn nhiệm vụ tồn đọng -> Chuyển tiếp tới replanner để cập nhật hoặc điều phối tiếp
+    # 6. Nếu vẫn còn nhiệm vụ tồn đọng -> Chuyển tiếp tới replanner
     return "replanner"
 
-def tester_router(state: AgentState) -> Literal["executor", "chrome_extension_debugger", "replanner", "doubt_reviewer", "commit"]:
-    """
-    Định tuyến từ Nút Kiểm thử tĩnh.
-    Nếu kiểm thử thất bại, tự động đưa ra các quyết định quay lại sửa hoặc tái lập kế hoạch.
-    """
-    error = state.get("error_logs", "")
-    attempts = state.get("attempts", 0)
-    is_simple = state.get("is_simple", False)
-    extension_path = state.get("extension_path", "")
-    
-    # 1. Nếu có lỗi kiểm tra tĩnh và chưa quá 3 lần thử -> Quay lại sửa code
-    if error and attempts < 3:
-        return "executor"
-        
-    # 2. Nếu có lỗi nhưng đã thử sửa quá 3 lần -> Chuyển giao bối cảnh lỗi về cho bộ điều phối Replanner
-    if error and attempts >= 3:
-        if is_simple:
-            return "commit"
-        return "replanner"
-        
-    # 3. Nếu kiểm tra tĩnh HOÀN TOÀN THÀNH CÔNG (không có lỗi):
-    if not error:
-        # Nếu là Chrome Extension: Chuyển sang kiểm thử động (runtime) trước
-        if extension_path:
-            return "chrome_extension_debugger"
-        # Dự án thông thường: Chuyển thẳng sang bước Hoài nghi đối kháng
-        return "doubt_reviewer"
-# 🌟 ĐỊNH TUYẾN MỚI THUỘC LUỒNG THẨM ĐỊNH ĐỐI KHÁNG (DOUBT FLOW)
 def doubt_router(state: AgentState) -> Literal["executor", "doubt_gate", "synthesis", "commit"]:
     """
     Định tuyến sau khi Nút Hoài nghi đối kháng (doubt_reviewer) hoàn tất rà soát.
@@ -95,24 +68,11 @@ def doubt_router(state: AgentState) -> Literal["executor", "doubt_gate", "synthe
     
     # 1. Nếu không phát hiện nghi ngờ lỗi logic nào nghiêm trọng:
     if not findings:
-        # Tác vụ đơn giản -> Đi tới commit. Tác vụ phức tạp -> Tổng hợp tài liệu.
         return "commit" if is_simple else "synthesis"
         
     # 2. Nếu phát hiện lỗ hổng/nghi ngờ -> Chuyển sang Nút Ngắt để hỏi ý kiến người dùng
     return "doubt_gate"
-def debugger_router(state: AgentState) -> Literal["executor", "replanner", "doubt_reviewer", "synthesis"]:
-    """
-    Định tuyến từ Nút Kiểm thử động (Chrome DevTools).
-    """
-    runtime_error = state.get("error_logs", "")
-    is_simple = state.get("is_simple", False)
-    
-    # Nếu phát hiện lỗi crash runtime của Extension -> Đưa thông tin lỗi quay lại để sửa đổi
-    if runtime_error:
-        return "executor" if is_simple else "replanner"
-        
-    # Nếu chạy mượt mà không có lỗi: Bắt buộc chuyển sang bước Hoài nghi đối kháng trước khi đóng gói
-    return "doubt_reviewer"
+
 def replanner_router(state: AgentState) -> Literal["executor", "synthesis"]:
     plan = state["plan"]
     
@@ -129,12 +89,6 @@ def replanner_router(state: AgentState) -> Literal["executor", "synthesis"]:
 
 
 def tool_router(state: AgentState) -> Literal["executor", "human_interaction_gate", "fluxmem_distillation"]:
-    """
-    Định tuyến sau khi chạy công cụ.
-    - Chuyển hướng sang 'fluxmem_distillation' ngay lập tức nếu vừa hoàn thành một Task để chưng cất tri thức.
-    - Chuyển sang 'human_interaction_gate' nếu cần hỏi ý kiến người dùng.
-    - Mặc định quay về 'executor' để tiếp tục xử lý công cụ khác.
-    """
     messages = state["messages"]
     
     # Kiểm tra xem cuộc gọi công cụ gần nhất có chứa complete_agent_task không
@@ -146,7 +100,6 @@ def tool_router(state: AgentState) -> Literal["executor", "human_interaction_gat
             
     if last_ai_message and getattr(last_ai_message, "tool_calls", None):
         if any(tc["name"] == "complete_agent_task" for tc in last_ai_message.tool_calls):
-            # Kích hoạt chưng cất tri thức toàn cục trước khi nén RAM [CẢI TIẾN]
             return "fluxmem_distillation"
     
     # Kiểm tra yêu cầu tương tác người dùng
@@ -161,5 +114,19 @@ def tool_router(state: AgentState) -> Literal["executor", "human_interaction_gat
             except Exception:
                 pass
                 
-    return "executor"
+        return "executor"
+def debugger_router(state: AgentState) -> Literal["executor", "replanner", "doubt_reviewer", "synthesis"]:
+    """
+    Định tuyến từ Nút Kiểm thử động (Chrome DevTools).
+    """
+    runtime_error = state.get("error_logs", "")
+    is_simple = state.get("is_simple", False)
+    
+    # Nếu phát hiện lỗi crash runtime của Extension -> Đưa thông tin lỗi quay lại để sửa đổi
+    if runtime_error:
+        return "executor" if is_simple else "replanner"
+        
+    # Nếu chạy mượt mà không có lỗi: Bắt buộc chuyển sang bước Hoài nghi đối kháng trước khi đóng gói
+    return "doubt_reviewer"
+
 

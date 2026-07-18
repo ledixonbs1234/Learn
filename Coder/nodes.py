@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import json
+import mimetypes
 import os
 import platform
 import re
@@ -381,11 +383,27 @@ def triage_node_stateful(state: AgentState, catalog_summary: str, mcp_summary: s
     
     return triage_output
 
+
+def encode_image_to_data_uri(image_path: Path) -> str:
+    """Đọc ảnh từ đĩa cứng và chuyển đổi thành cấu trúc Base64 Data URI."""
+    if not image_path.exists() or not image_path.is_file():
+        raise FileNotFoundError(f"Không tìm thấy file ảnh tại: {image_path}")
+    
+    # Tự động nhận diện MIME type (ví dụ: image/png, image/jpeg)
+    mime_type, _ = mimetypes.guess_type(image_path)
+    if not mime_type:
+        mime_type = "image/png" # Fallback mặc định
+        
+    img_bytes = image_path.read_bytes()
+    encoded_string = base64.b64encode(img_bytes).decode("utf-8")
+    return f"data:{mime_type};base64,{encoded_string}"
+
 def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
     messages = state["messages"]
     user_msg = messages[-1]
     user_query_text = get_text_content_safely(user_msg.content)
     
+    # 1. Định vị Workspace an toàn
     random_hex = uuid.uuid4().hex[:8]
     temp_workspace_path = Path(tempfile.gettempdir()) / f"agent_{os.getpid()}_{random_hex}"
     temp_workspace_path.mkdir(parents=True, exist_ok=True)
@@ -417,6 +435,43 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         if existing_workspace:
             pivoted_msg = f"🔄 **[Kế thừa Workspace]**: Sử dụng lại thư mục làm việc hiện hành: `{existing_workspace}`\n"
 
+    # =====================================================================
+    # XỬ LÝ NHÚNG HÌNH ẢNH VÀO TIN NHẮN NGƯỜI DÙNG (MULTIMODAL UPDATE)
+    # =====================================================================
+    image_paths = state.get("image_paths", []) or []
+    updated_messages = []
+    
+    # Chỉ xử lý khi có danh sách ảnh đầu vào và tin nhắn cuối là HumanMessage
+    if image_paths and (user_msg.type == "human" or isinstance(user_msg, HumanMessage)):
+        # Tạo cấu trúc nội dung đa phương thức mới
+        multimodal_content = [{"type": "text", "text": user_query_text}]
+        
+        for path_str in image_paths:
+            try:
+                # Phân giải đường dẫn ảnh tương đối dựa trên workspace hoạt động
+                safe_img_path = sanitize_and_resolve_path(provisional_workspace, path_str)
+                if safe_img_path.exists() and safe_img_path.is_file():
+                    data_uri = encode_image_to_data_uri(safe_img_path)
+                    
+                    # Thêm phân đoạn ảnh vào cấu trúc Multimodal
+                    multimodal_content.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": data_uri,
+                            "detail": "low"  # 'low' giúp tiết kiệm token đáng kể nếu không cần phân tích điểm ảnh siêu nhỏ
+                        }
+                    })
+            except Exception as e:
+                print(f"[Cảnh báo hệ thống] Lỗi xử lý hình ảnh '{path_str}': {str(e)}")
+                
+        # Khởi tạo tin nhắn HumanMessage mới có ID trùng khớp với tin nhắn cũ để thực hiện ghi đè
+        updated_user_msg = HumanMessage(
+            content=multimodal_content,
+            id=user_msg.id  # ĐÂY LÀ ĐIỂM QUAN TRỌNG NHẤT
+        )
+        updated_messages.append(updated_user_msg)
+
+    # 2. Thực hiện quét kỹ năng và MCP cấu hình
     temp_state = state.copy()
     temp_state["workspace_path"] = provisional_workspace
     
@@ -542,13 +597,15 @@ def detect_and_triage_node(state: AgentState) -> Dict[str, Any]:
         f"🎯 **[Phân tích mục tiêu kỹ thuật]**:\n{detailed_analysis}"
     )
 
+    # 3. Trả về kết quả cập nhật trạng thái đồ thị
     return {
         "workspace_path": final_workspace,
         "plan": plan,
         "task_type": task_type,
         "is_simple": is_simple,
         "detailed_analysis": detailed_analysis,
-        "messages": [AIMessage(content=triage_info_msg)],
+        # Trả về updated_messages (chứa HumanMessage đè ID cũ) kèm theo tin nhắn AI mới phân tích
+        "messages": updated_messages + [AIMessage(content=triage_info_msg)],
         "error_logs": "",
         "attempts": 0,
         "modified_files": [],
@@ -869,65 +926,6 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
             )
         ]
     }
-
-def chrome_extension_debugger_node(state: AgentState) -> Dict[str, Any]:
-    ext_path = state.get("extension_path")
-    
-    if not ext_path:
-        return {"messages": [AIMessage(content="Bỏ qua gỡ lỗi: Không tìm thấy Extension Path.")]}
-
-    user_query = (
-        f"Hãy kết nối CDP vào Chrome, nạp Extension từ thư mục '{ext_path}', "
-        f"kiểm tra xem có bất kỳ thông báo lỗi console hoặc lỗi network request nào "
-        f"liên quan đến Extension hoạt động không."
-    )
-    
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-    if loop.is_running():
-        import nest_asyncio
-        nest_asyncio.apply()
-        
-    debug_raw_output = loop.run_until_complete(
-        run_agent_with_devtools_mcp(
-            model=model,
-            prompt_message=user_query,
-            chat_history=list(state.get("messages", []))
-        )
-    )
-    
-    structured_evaluator = model.with_structured_output(RuntimeVerificationResult, method="function_calling")
-    
-    system_prompt = (
-        "Bạn là một chuyên gia QA. Hãy đọc báo cáo gỡ lỗi trình duyệt và xác định xem "
-        "ứng dụng/extension có gặp lỗi runtime nghiêm trọng nào không (như crash, undefined variables, "
-        "failed to load resource, hoặc lỗi CORS)."
-    )
-    
-    try:
-        eval_result = structured_evaluator.invoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=f"Báo cáo gỡ lỗi thô:\n\n{debug_raw_output}")
-        ])
-        has_error = eval_result.has_critical_error
-        error_summary = eval_result.error_summary
-    except Exception:
-        has_error = False
-        error_summary = ""
-        
-    ret_state = {
-        "browser_console_logs": debug_raw_output,
-        "messages": [AIMessage(content=f"📋 **[Kết quả kiểm tra Runtime CDP]**:\n\n{debug_raw_output}")]
-    }
-    
-    if has_error:
-        ret_state["error_logs"] = f"❌ [Lỗi Runtime Trình Duyệt]: {error_summary}"
-        
-    return ret_state
 
 def context_compressor_node(state: AgentState) -> Dict[str, Any]:
     messages = state.get("messages", [])
@@ -1480,6 +1478,11 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             "1. Bạn ĐANG Ở PHA KHẢO SÁT. Nhiệm vụ của bạn chỉ là tìm hiểu hiện trạng, thu thập sự thật (facts) và viết tài liệu mô tả (nếu thuộc Nhóm B).\n"
             "2. TUYỆT ĐỐI KHÔNG tự ý viết kế hoạch triển khai (ví dụ: các bước sửa code tiếp theo), không đưa ra danh sách task cho pha sau, không viết code mẫu hoặc sửa file chạy thật của ứng dụng.\n"
             "3. Nếu bạn bắt đầu đưa ra kế hoạch thực thi hoặc sửa code, bạn đã vi phạm biên giới pha và sẽ làm sập hệ thống.\n\n"
+
+            "⚠️ QUY TẮC KHI THIẾU CÔNG CỤ TRUY CẬP TÀI NGUYÊN (BẮT BUỘC):\n"
+            "1. Khi bạn cần truy cập, kiểm tra, thao tác với một ứng dụng bên thứ ba (như Notion, Slack, Figma...) hoặc một tệp tin/thư mục cụ thể mà hệ thống KHÔNG cung cấp công cụ (tool) phù hợp để thực hiện.\n"
+            "2. TUYỆT ĐỐI KHÔNG tự mò mẫm, tự suy đoán cấu trúc dữ liệu hoặc giả lập kết quả.\n"
+            "3. Bạn BẮT BUỘC phải dừng lại và hỏi trực tiếp người dùng để xin thông tin, cung cấp tài liệu hoặc nhờ hỗ trợ thao tác thủ công.\n\n"
 
             "⚠️ HƯỚNG DẪN TRUY XUẤT TRI THỨC TOÀN CỤC (JUST-IN-TIME RETRIEVAL):\n"
             "1. Hệ thống tích hợp bộ nhớ tri thức toàn cục (Global Brain) lưu tại thư mục hệ thống: `~/.openwiki/wiki/`.\n"
@@ -2164,129 +2167,7 @@ def human_interaction_gate_node(state: AgentState) -> Dict[str, Any]:
         "messages": [feedback_message]
     }
 
-def tester_node(state: AgentState) -> Dict[str, Any]:
-    modified_files = state.get("modified_files", [])
-    attempts = state.get("attempts", 0)
-    plan = state["plan"]
-    ws = state.get("workspace_path", ".")
-    last_executed_ids = state.get("last_executed_task_ids", [])
-    
-    parsed_plan = []
-    for t in plan:
-        if isinstance(t, dict):
-            parsed_plan.append(Task(**t))
-        else:
-            parsed_plan.append(t)
-            
-    errors = []
-    warnings = []
-    workspace_root = Path(ws).expanduser().resolve()
-    
-    files_by_ext: Dict[str, List[Path]] = {}
-    for f_path_str in modified_files:
-        try:
-            p = Path(f_path_str).resolve()
-            if p.exists() and p.is_file():
-                ext = p.suffix.lower()
-                files_by_ext.setdefault(ext, []).append(p)
-                clear_compiler_cache(workspace_root, ext)
-        except Exception:
-            pass
 
-    for ext, files in files_by_ext.items():
-        if ext == ".py":
-            import sys
-            for f in files:
-                if f.name.startswith("test_") or f.name.endswith("_test.py"):
-                    code, output = execute_validation_cmd([sys.executable, str(f)], workspace_root)
-                    if code == -99:
-                        warnings.append(output)
-                    elif code != 0:
-                        errors.append(f"❌ [Lỗi Thực Thi Unit Test Python] tại tệp `{f.name}`:\n{clean_compiler_logs(output)}")
-                else:
-                    code, output = execute_validation_cmd([sys.executable, "-m", "py_compile", str(f)], workspace_root)
-                    if code == -99:
-                        warnings.append(output)
-                    elif code != 0:
-                        errors.append(f"❌ [Lỗi Cú Pháp Python] tại tệp `{f.name}`:\n{clean_compiler_logs(output)}")
-
-        elif ext == ".dart":
-            for f in files:
-                target_dir = find_nearest_config(f, "pubspec.yaml") or workspace_root
-                code, output = execute_validation_cmd(["dart", "analyze"], target_dir)
-                if code == -99:
-                    warnings.append(f"{output} (Bỏ qua kiểm tra tĩnh cho `{f.name}`)")
-                elif code != 0:
-                    errors.append(f"❌ [Lỗi Dart Analysis] tại sub-project `{target_dir.name}`:\n{clean_compiler_logs(output)}")
-                    break
-
-        elif ext in [".ts", ".tsx", ".js", ".jsx"]:
-            for f in files:
-                target_dir = find_nearest_config(f, "package.json") or workspace_root
-                if ext in [".ts", ".tsx"]:
-                    cmd = ["npx", "tsc", "--noEmit", "--skipLibCheck"]
-                    code, output = execute_validation_cmd(cmd, target_dir)
-                    if code == -99:
-                        warnings.append(f"{output} (Bỏ qua phân tích kiểu dữ liệu cho `{f.name}`)")
-                    elif code != 0:
-                        errors.append(f"❌ [Lỗi TypeScript Compile] tại `{target_dir.name}`:\n{clean_compiler_logs(output)}")
-                        break
-
-        elif ext == ".rs":
-            for f in files:
-                target_dir = find_nearest_config(f, "Cargo.toml") or workspace_root
-                code, output = execute_validation_cmd(["cargo", "check"], target_dir)
-                if code == -99:
-                    warnings.append(f"{output} (Bỏ qua biên dịch Rust cho `{f.name}`)")
-                elif code != 0:
-                    errors.append(f"❌ [Lỗi Biên Dịch Rust] tại `{target_dir.name}`:\n{clean_compiler_logs(output)}")
-                    break
-
-        elif ext == ".go":
-            for f in files:
-                target_dir = find_nearest_config(f, "go.mod") or workspace_root
-                code, output = execute_validation_cmd(["go", "vet", "./..."], target_dir)
-                if code == -99:
-                    warnings.append(f"{output} (Bỏ qua kiểm tra tĩnh Go cho `{f.name}`)")
-                elif code != 0:
-                    errors.append(f"❌ [Lỗi Tĩnh Go Vet] tại `{target_dir.name}`:\n{clean_compiler_logs(output)}")
-                    break
-
-    warning_msg = ""
-    if warnings:
-        warning_msg = "⚠️ **Cảnh báo môi trường:**\n" + "\n".join([f"- {w}" for w in warnings]) + "\n\n"
-
-    if errors:
-        combined_error = "\n\n---\n\n".join(errors)
-        
-        if attempts < 3:
-            updated_plan = []
-            for t in parsed_plan:
-                t_copy = t.model_copy()
-                if t_copy.id in last_executed_ids:
-                    t_copy.status = "pending"
-                updated_plan.append(t_copy)
-                
-            return {
-                "error_logs": combined_error,
-                "attempts": attempts + 1,
-                "plan": updated_plan,
-                "messages": [AIMessage(content=f"{warning_msg}⚠️ [Vòng kiểm thử thất bại] Phát hiện lỗi ở mã nguồn sửa đổi:\n\n{combined_error}\n\n⚙️ Đang gửi trả trạng thái nhiệm vụ về 'pending' để tự động sửa chữa.")]
-            }
-        else:
-            return {
-                "error_logs": combined_error,
-                "attempts": attempts,
-                "messages": [AIMessage(content=f"{warning_msg}❌ Đã vượt quá giới hạn {attempts} lần sửa lỗi tự động. Chuyển giao bối cảnh lỗi về cho bộ điều phối Replanner.")]
-            }
-                
-    success_content = f"{warning_msg}✅ [Vòng kiểm thử thành công] Toàn bộ mã nguồn đã vượt qua kiểm tra tĩnh."
-    return {
-        "error_logs": "",
-        "attempts": 0,
-        "modified_files": [],
-        "messages": [AIMessage(content=success_content)]
-    }
 
 def synthesis_node(state: AgentState) -> Dict[str, Any]:
     """

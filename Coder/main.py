@@ -21,10 +21,11 @@ builder.add_node("detect_and_triage", nodes.detect_and_triage_node)
 builder.add_node("executor", nodes.executor_node)  
 builder.add_node("tool_node", nodes.tool_node) 
 builder.add_node("human_interaction_gate", nodes.human_interaction_gate_node)
-builder.add_node("chrome_extension_debugger", nodes.chrome_extension_debugger_node)
+# 🌟 THAY ĐỔI: Xóa bỏ nút gỡ lỗi trình duyệt chrome_extension_debugger
+# builder.add_node("chrome_extension_debugger", nodes.chrome_extension_debugger_node)
+
 builder.add_node("replanner", nodes.replanner_node)
 builder.add_node("replanner_interrupt", nodes.replanner_interrupt_node) 
-builder.add_node("tester", nodes.tester_node)
 builder.add_node("synthesis", nodes.synthesis_node)
 builder.add_node("commit", nodes.commit_node)
 builder.add_node("context_compressor", nodes.context_compressor_node)
@@ -34,20 +35,23 @@ builder.add_node("fluxmem_distillation", nodes.fluxmem_distillation_node)
 builder.add_node("doubt_reviewer", nodes.doubt_reviewer_node)
 builder.add_node("doubt_gate", nodes.doubt_gate_node)
 builder.add_node("isolated_debugger", nodes.isolated_debugger_node)
+
 # =====================================================================
 # 2. THIẾT LẬP CÁC CẠNH NỐI CHÍNH (EDGES & ROUTERS)
 # =====================================================================
 builder.add_edge(START, "detect_and_triage")
 builder.add_edge("detect_and_triage", "isolated_debugger")
 builder.add_edge("isolated_debugger", "executor")
+
 # Định tuyến từ Executor
+# 🌟 THAY ĐỔI: Chỉ giữ lại các định tuyến mục tiêu hợp lệ, loại bỏ chrome_extension_debugger
 builder.add_conditional_edges(
     "executor",
     routers.executor_router,
     {
         "executor": "executor",
         "tool_node": "tool_node",                  
-        "tester": "tester",
+        "doubt_reviewer": "doubt_reviewer",
         "replanner": "replanner",
         "synthesis": "synthesis",
         "context_compressor": "context_compressor" 
@@ -68,30 +72,7 @@ builder.add_conditional_edges(
 )
 builder.add_edge("human_interaction_gate", "executor")
 
-# Định tuyến từ Tester
-builder.add_conditional_edges(
-    "tester", 
-    routers.tester_router, 
-    {
-        "executor": "executor",
-        "chrome_extension_debugger": "chrome_extension_debugger",
-        "doubt_reviewer": "doubt_reviewer",
-        "replanner": "replanner",   
-        "commit": "commit"                              
-    }
-)
-
-# Định tuyến từ Chrome Extension Debugger
-builder.add_conditional_edges(
-    "chrome_extension_debugger", 
-    routers.debugger_router, 
-    {
-        "executor": "executor",
-        "doubt_reviewer": "doubt_reviewer",
-        "replanner": "replanner",
-        "synthesis": "synthesis"
-    }
-)
+# 🌟 THAY ĐỔI: Xóa bỏ hoàn toàn định tuyến có điều kiện từ chrome_extension_debugger cũ
 
 # ĐỊNH TUYẾN SAU KHI PHÂN TÍCH ĐỐI KHÁNG XONG (DOUBT REVIEWER)
 builder.add_conditional_edges(

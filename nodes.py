@@ -1,4 +1,3 @@
-import asyncio
 import base64
 import json
 import mimetypes
@@ -15,9 +14,9 @@ from venv import logger
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langgraph.types import interrupt
 from config import find_project_root_heuristic, model, sanitize_and_resolve_path, fast_model, sanitize_tool_result_content
-from mcp_helper import run_agent_with_devtools_mcp
+from prompts_loader import load_prompt
 from skills_engine import AgentSkillsEngine
-from state import AgentState, PlanUpdate, RuntimeVerificationResult, TaskTriage, Task
+from state import AgentState, PlanUpdate, TaskTriage, Task
 from tools import (
     ActivateSkillTool, AskQuestionsTool, ChromeDebuggerTool, CompleteTaskTool, GitManager, QueryOpenWikiTool, ReadFileLinesTool, RunSkillScriptTool, SearchKeywordTool, UniversalSymbolSearchTool, WebAutonomousExecutorTool, WebInteractAndTestTool, WorkspaceTools, 
     ReadFilesTool, WriteAndRunScriptTool, WriteFileTool, ApplyPatchTool, 
@@ -344,32 +343,12 @@ def triage_node_stateful(state: AgentState, catalog_summary: str, mcp_summary: s
     user_msg = messages[-1]
     user_query_text = get_text_content_safely(user_msg.content)
 
-    system_prompt = (
-        "Bạn là một điều phối viên Agent thông minh cấp cao (Triage Supervisor).\n"
-        "Nhiệm vụ của bạn là phân tích yêu cầu mới của người dùng để phân loại chính xác hướng xử lý.\n\n"
-        "Bạn đã được cung cấp Lịch sử hội thoại gần nhất và Thông tin phiên hoạt động hiện tại.\n"
-        "Hãy tận dụng thông tin này để giải quyết các đại từ mơ hồ.\n\n"
-        "⚠️ QUY TẮC ĐÁNH GIÁ SỰ TRÔI LỆCH PHIÊN VÀ PHÂN LOẠI (BẮT BUỘC):\n"
-        "1. KIỂM TRA SỰ TIẾP NỐI (Follow-up Check)...\n"
-        "   - Nếu yêu cầu mới là một câu hỏi hỏi thêm, yêu cầu giải thích, hoặc yêu cầu chỉnh sửa dựa trên dự án "
-        "     đang mở trong phiên hoạt động hiện tại -> Đây là một câu hỏi TIẾP NỐI (Follow-up).\n"
-        "   - Đối với câu hỏi tiếp nối, bạn KHÔNG ĐƯỢC chọn task_type = 'clarify' (yêu cầu hỏi lại path). Hãy thiết lập "
-        "     task_type dựa trên bản chất yêu cầu ('analysis' nếu chỉ hỏi đáp giải thích, 'development' nếu yêu cầu sửa code).\n"
-        "2. KIỂM TRA YÊU CẦU ĐỘC LẬP MỚI (Context Shift):\n"
-        "   - Nếu người dùng đột ngột yêu cầu làm một việc hoàn toàn mới không liên quan đến thư mục hiện hành "
-        "     (ví dụ: đang quét desktop lại yêu cầu 'sửa lỗi app ở thư mục D:/project-abc'), hoặc yêu cầu tạo mới app "
-        "     nhưng không nói ở đâu -> Đặt task_type = 'clarify' để hệ thống hỏi lại đường dẫn mới.\n\n"
-        "⚠️ ÁNH XẠ KỸ NĂNG CHỦ ĐỘNG (TÙY CHỌN - KHÔNG BẮT BUỘC):\n"
-        "Dưới đây là danh sách các Kỹ năng kỹ thuật (Skills) khả dụng có sẵn trong hệ thống.\n"
-        "Nhiệm vụ của bạn là đối chiếu yêu cầu hiện tại của người dùng với mô tả và điều kiện kích hoạt (triggers) của từng Kỹ năng dưới đây.\n"
-        "Nếu yêu cầu của người dùng thực sự khớp với mục đích của một kỹ năng nào đó, bạn hãy điền tên kỹ năng đó vào trường 'recommended_skills'. Nếu không có kỹ năng nào thực sự khớp hoặc không cần thiết, bạn hoàn toàn có thể để trống trường này (mảng rỗng []).\n"
-        f"{catalog_summary}\n\n"
-        "⚠️ LỰA CHỌN MÁY CHỦ MCP PHÙ HỢP (BẮT BUỘC - TIẾT KIỆM TOKEN):\n"
-        "Dưới đây là danh sách các Máy chủ MCP ngoài hiện hành đang được tích hợp vào dự án của bạn.\n"
-        "Hãy đối chiếu mục tiêu công việc của người dùng. Nếu tác vụ đòi hỏi các công cụ từ máy chủ nào, bạn hãy đề xuất máy chủ đó "
-        "bằng cách ghi chính xác tên định danh máy chủ vào mảng 'recommended_mcp_servers' (ví dụ: ['devtools'] hoặc ['notion']). "
-        "Tuyệt đối KHÔNG đề xuất các máy chủ không liên quan để tránh làm tràn ngập bối cảnh bằng các công cụ thừa.\n"
-        f"{mcp_summary}"
+    # 🌟 CẢI TIẾN: Nạp system prompt từ file tĩnh chuyên biệt
+    system_prompt_template = load_prompt("triage_stateful.txt")
+    system_prompt = system_prompt_template.replace(
+        "{catalog_summary}", catalog_summary
+    ).replace(
+        "{mcp_summary}", mcp_summary
     )
 
     structured_llm = model.with_structured_output(TaskTriage, method="function_calling")
@@ -657,19 +636,10 @@ def doubt_reviewer_node(state: AgentState) -> Dict[str, Any]:
     if not artifact_code:
         return {"doubt_findings": ""}
 
-    adversarial_prompt = (
-        "Bạn là một kiểm toán viên mã nguồn đối kháng chuyên nghiệp (Adversarial Reviewer).\n"
-        "Nhiệm vụ của bạn là rà soát đoạn mã nguồn dưới đây và tìm ra ít nhất 3 điểm yếu kỹ thuật, "
-        "các giả định sai lầm, các trường hợp biên chưa được xử lý, hoặc nguy cơ bảo mật tiềm ẩn.\n\n"
-        "⚠️ YÊU CẦU NGHIÊM NGẶT:\n"
-        "- Chỉ tập trung chỉ ra lỗi logic thực tế, lỗ hổng cấu trúc hoặc rủi ro runtime.\n"
-        "- TUYỆT ĐỐI KHÔNG khen ngợi, không viết tóm tắt vô nghĩa.\n"
-        "- Định dạng câu trả lời bằng tiếng Việt, rõ ràng theo từng đầu dòng kèm chỉ dẫn file:dòng cụ thể.\n\n"
-        f"ARTIFACT MÃ NGUỒN CẦN THẨM ĐỊNH ({latest_file}):\n"
-        "```\n"
-        f"{artifact_code}\n"
-        "```"
-    )
+    adversarial_prompt_template = load_prompt("doubt_reviewer.txt")
+    adversarial_prompt = adversarial_prompt_template.replace(
+        "{latest_file}", latest_file
+    ) + "\n```\n" + artifact_code + "\n```"
 
     response = fast_model.invoke([
         SystemMessage(content="Bạn đang thực thi quy trình thẩm định đối kháng thuộc kỹ năng `doubt-driven-development`."),
@@ -855,28 +825,7 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
     
     structured_llm = model.with_structured_output(TaskTriage, method="function_calling")
     
-    system_prompt = (
-        "Bạn là một điều phối viên Agent thông minh cấp cao (Triage Supervisor).\n"
-        "Nhiệm vụ của bạn là phân tích yêu cầu của người dùng để xác định xem yêu cầu đó nên được xử lý qua luồng Fast-Track (Đơn giản) hay luồng Lập kế hoạch (Phức tạp).\n\n"
-        "Đồng thời, hãy viết một bản phân tích chi tiết vào thuộc tính 'detailed_analysis' để định hướng cho các Agent ở các bước sau. Bản phân tích này cần làm rõ:\n"
-        "1. Mục tiêu cốt lõi cuối cùng người dùng muốn đạt được.\n"
-        "2. Các tệp tin, thư mục hoặc phân hệ mã nguồn cụ thể có thể sẽ bị tác động hoặc cần đọc/sửa đổi.\n"
-        "3. Các ràng buộc về logic kỹ thuật, ngôn ngữ trình bày, hoặc các trường hợp biên cần lưu ý.\n"
-        "4. Gợi ý sơ bộ về phương pháp thực hiện tối ưu.\n\n"
-        "Hãy dựa trên các tiêu chí phân loại nghiêm ngặt sau để phân loại:\n\n"
-        "1. KIỂM TRA TÁC VỤ ĐƠN GIẢN (is_simple = True):\n"
-        "   - Tương tác Web trực tiếp: Các yêu cầu truy cập website, nhấp nút, điền form, chụp ảnh màn hình hoặc chạy thử JS trên một trang cụ thể (ví dụ: 'vào trang web abc.com và nhấn...').\n"
-        "   - Khảo sát hệ thống đơn giản: Đọc nội dung 1-2 tệp tin cụ thể, liệt kê thư mục, hoặc tìm kiếm symbol.\n"
-        "   - Thực thi Terminal trực tiếp: Chạy một lệnh terminal đơn lẻ.\n"
-        "   - Chỉnh sửa nhỏ: Sửa đổi nhanh chỉ một vài dòng mã hoặc ghi đè một tệp tin ngắn dưới 100 dòng.\n\n"
-        "2. KIỂM TRA TÁC VỤ PHỨC TẠP (is_simple = False):\n"
-        "   - Phát triển tính năng mới (Feature Development): Yêu cầu viết mới hoặc can thiệp chỉnh sửa logic phức tạp trên nhiều tệp tin nguồn khác nhau.\n"
-        "   - Sửa lỗi hệ thống diện rộng (Complex Bug Fixing): Đòi hỏi phải phân tích kiến trúc, tìm kiếm ký hiệu xuyên suốt mã nguồn trước khi sửa đổi.\n"
-        "   - Phân tích & Viết tài liệu tổng thể dự án: Khảo sát sâu toàn bộ workspace lớn.\n\n"
-        "⚠️ QUY TẮC CHỌN TASK_TYPE (RẤT QUAN TRỌNG):\n"
-        "   - Chọn 'analysis' CHỈ KHI yêu cầu thuần túy là đọc hiểu, giải thích cấu trúc mã nguồn, dịch thuật hoặc khảo sát tĩnh dự án (KHÔNG sửa đổi code, KHÔNG chạy lệnh terminal, và KHÔNG tương tác/chạy thử nghiệm trình duyệt web).\n"
-        "   - BẮT BUỘC CHỌN 'development' cho mọi trường hợp còn lại, bao gồm: Có viết/sửa code, chạy lệnh terminal, HOẶC cần khởi chạy trình duyệt web thật (Dynamic Web Testing) để nạp extension, tương tác web, kiểm tra hành vi runtime của ứng dụng."
-    )
+    system_prompt = load_prompt("triage_simple.txt")
     
     try:
         triage_output = structured_llm.invoke([
@@ -1217,21 +1166,11 @@ def run_isolated_debugger_agent(workspace_path: str, user_query: str) -> str:
     if not sources_data:
         return "Không phát hiện mã nguồn hợp lệ hoặc thư mục dự án trống."
         
-    prompt = (
-        "Bạn là một Chuyên Gia Gỡ Lỗi Độc Lập Hệ Thống (Isolated Debugger Agent).\n"
-        "Nhiệm vụ duy nhất của bạn là phân tích toàn bộ mã nguồn của dự án được cung cấp dưới đây, "
-        "đối chiếu với thông tin báo lỗi hoặc yêu cầu sửa lỗi từ người dùng, xác định chính xác nguyên nhân "
-        "và đưa ra giải pháp sửa lỗi chi tiết nhất có thể.\n\n"
-        "⚠️ QUY TẮC PHÂN TÍCH:\n"
-        "1. Xác định rõ ràng các tệp tin, lớp, hàm hoặc dòng mã gây ra lỗi.\n"
-        "2. Giải thích rõ ràng nguyên nhân tại sao lỗi xảy ra (logic lỗi, không khớp kiểu dữ liệu, runtime exception, v.v.).\n"
-        "3. Đưa ra phương án sửa chữa tối ưu dưới dạng mã nguồn chỉnh sửa cụ thể (đặc biệt khuyến khích viết theo khối SEARCH/REPLACE để Executor dễ dàng thực thi).\n"
-        "4. Chỉ xuất ra nội dung phân tích và mã nguồn sửa đổi trực tiếp, KHÔNG viết lời chào hỏi hay gọi bất kỳ công cụ nào.\n\n"
-        "=== MÃ NGUỒN TOÀN BỘ DỰ ÁN ===\n"
-        f"{sources_data}\n\n"
-        "=== YÊU CẦU SỬA LỖI HỆ THỐNG ===\n"
-        f"{user_query}\n\n"
-        "Hãy viết báo cáo gỡ lỗi và phương án sửa chữa chi tiết bằng tiếng Việt:"
+    prompt_template = load_prompt("isolated_debugger.txt")
+    prompt = prompt_template.replace(
+        "{sources_data}", sources_data
+    ).replace(
+        "{user_query}", user_query
     )
     
     try:
@@ -1457,62 +1396,11 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             search_keyword_tool, write_file, apply_patch, complete_task_tool, query_openwiki
         ] + mcp_tools
         
-        system_prompt = (
-            "=== ĐỊNH VỊ VAI TRÒ & PHÂN LOẠI TÁC VỤ KHẢO SÁT (ACTIVE DISCOVERY) ===\n"
-            "Bạn là Agent Khảo Sát Thích Ứng (Adaptive Discovery Agent).\n"
-            "Nhiệm vụ hiện tại:\n{tasks_str}\n"
-            f"Thư mục làm việc: {ws}\n\n"
-            
-            "⚠️ BƯỚC 1: XÁC ĐỊNH PHẠM VI KHẢO SÁT VÀ BIÊN GIỚI TÀI LIỆU (BẮT BUỘC):\n"
-            "Hãy phân tích yêu cầu hiện tại để tự động cấu hình phạm vi hoạt động của bạn:\n"
-            "- [NHÓM A] CHỈNH SỬA FILE CỤC BỘ / SỬA LỖI (Localized Code Edit):\n"
-            "  * Chỉ được phép quét, đọc đúng file cần sửa và các file import liên quan trực tiếp. Tuyệt đối KHÔNG đọc toàn bộ dự án.\n"
-            "  * TUYỆT ĐỐI KHÔNG viết PRD.md hay tạo ADRs mới. Chỉ cập nhật thông tin cực kỳ ngắn gọn vào CONTEXT.md nếu file này đã tồn tại sẵn.\n"
-            "- [NHÓM B] XÂY DỰNG TÍNH NĂNG MỚI / THAY ĐỔI LỚN (Macro Feature):\n"
-            "  * Được phép khảo sát diện rộng và viết/cập nhật `PRD.md`, `CONTEXT.md`, và các quyết định kiến trúc trong `docs/adr/`.\n"
-            "- [NHÓM C] TÁC VỤ PHI LẬP TRÌNH / VẬN HÀNH (Non-coding Ops - ví dụ: Tối ưu Notion, setup công cụ):\n"
-            "  * Tuyệt đối KHÔNG đọc mã nguồn, KHÔNG tạo các file code rác, và TUYỆT ĐỐI KHÔNG tạo `PRD.md`, `CONTEXT.md` hay `ADRs`.\n"
-            "  * Chỉ được phép khảo sát cấu trúc logic của ứng dụng mục tiêu (ví dụ: các trang, cơ sở dữ liệu Notion) và lưu thông tin dạng text hoặc sơ đồ vận hành gọn nhẹ (ví dụ: `NOTION_STRUCTURE.md`) nếu thực sự cần thiết.\n\n"
-
-            "⚠️ BIÊN GIỚI NGHIÊM NGẶT - CHỐNG TỰ Ý LẬP KẾ HOẠCH & SỬA CODE CHẠY THẬT (BẮT BUỘC):\n"
-            "1. Bạn ĐANG Ở PHA KHẢO SÁT. Nhiệm vụ của bạn chỉ là tìm hiểu hiện trạng, thu thập sự thật (facts) và viết tài liệu mô tả (nếu thuộc Nhóm B).\n"
-            "2. TUYỆT ĐỐI KHÔNG tự ý viết kế hoạch triển khai (ví dụ: các bước sửa code tiếp theo), không đưa ra danh sách task cho pha sau, không viết code mẫu hoặc sửa file chạy thật của ứng dụng.\n"
-            "3. Nếu bạn bắt đầu đưa ra kế hoạch thực thi hoặc sửa code, bạn đã vi phạm biên giới pha và sẽ làm sập hệ thống.\n\n"
-
-            "⚠️ QUY TẮC KHI THIẾU CÔNG CỤ TRUY CẬP TÀI NGUYÊN (BẮT BUỘC):\n"
-            "1. Khi bạn cần truy cập, kiểm tra, thao tác với một ứng dụng bên thứ ba (như Notion, Slack, Figma...) hoặc một tệp tin/thư mục cụ thể mà hệ thống KHÔNG cung cấp công cụ (tool) phù hợp để thực hiện.\n"
-            "2. TUYỆT ĐỐI KHÔNG tự mò mẫm, tự suy đoán cấu trúc dữ liệu hoặc giả lập kết quả.\n"
-            "3. Bạn BẮT BUỘC phải dừng lại và hỏi trực tiếp người dùng để xin thông tin, cung cấp tài liệu hoặc nhờ hỗ trợ thao tác thủ công.\n\n"
-
-            "⚠️ HƯỚNG DẪN TRUY XUẤT TRI THỨC TOÀN CỤC (JUST-IN-TIME RETRIEVAL):\n"
-            "1. Hệ thống tích hợp bộ nhớ tri thức toàn cục (Global Brain) lưu tại thư mục hệ thống: `~/.openwiki/wiki/`.\n"
-            "2. Trước khi tiến hành khảo sát, bạn BẮT BUỘC phải gọi công cụ `query_global_openwiki` để kiểm tra xem có quy trình hoặc lưu ý phòng ngừa lỗi liên quan đến nhiệm vụ này hay không.\n"
-            "3. Áp dụng chính xác các lưu ý này vào tài liệu khảo sát.\n\n"
-
-            "⚠️ QUY TẮC TỐI ƯU HÓA TOKEN BẰNG GỌI CÔNG CỤ SONG SONG (PARALLEL TOOL CALLING):\n"
-            "1. Bạn được KHUYẾN KHÍCH MẠNH MẼ gọi NHIỀU CÔNG CỤ CÙNG LÚC (Parallel Tool Calling) trong một lượt phản hồi nếu các công cụ đó độc lập hoặc phục vụ chung một nhiệm vụ hiện hành.\n"
-            "2. Ví dụ: Hãy gọi đồng thời nhiều cuộc gọi `read_file_lines` cho các tệp tin khác nhau, hoặc kết hợp `search_keyword` và `list_directory` trong cùng một turn để tiết kiệm token.\n\n"
-
-            "⚠️ QUY TẮC KÍCH HOẠT KỸ NĂNG (BẮT BUỘC):\n"
-            "1. Trước khi thực hiện hành động chuyên biệt có kỹ năng tương ứng trong danh sách '=== THƯ VIỆN KỸ NĂNG KHẢ DỤNG ===' mà chưa được kích hoạt, bạn BẮT BUỘC phải gọi công cụ `activate_agent_skill` để nạp hướng dẫn kỹ năng đó.\n"
-            "2. Khi kỹ năng đã hoạt động, tuân thủ tuyệt đối cấu trúc và quy trình được ghi rõ trong hướng dẫn kỹ năng đó. Tuyệt đối không tự suy diễn cấu trúc.\n\n"
-
-            "⚠️ QUY TẮC CÔ LẬP NHIỆM VỤ ĐƠN (SINGLE TASK ISOLATION - BẮT BUỘC):\n"
-            "1. Bạn CHỈ ĐƯỢC PHÉP tập trung thực hiện duy nhất (1) nhiệm vụ đang được liệt kê tại phần 'Nhiệm vụ hiện tại' ở trên (ví dụ: chỉ giải quyết T_SURVEY).\n"
-            "2. TUYỆT ĐỐI KHÔNG tự ý thực hiện tiếp các nhiệm vụ tiếp theo trong lộ trình (T1, T2...) mặc dù bạn có thể nhìn thấy chúng trong lịch sử trò chuyện.\n"
-            "3. Ngay sau khi hoàn thành xong nhiệm vụ được chỉ định, bạn BẮT BUỘC phải gọi công cụ 'complete_agent_task' để bàn giao kết quả và chuyển quyền điều phối về cho đồ thị Orchestrator dọn dẹp bộ nhớ.\n\n"
-
-            "⚠️ QUY TẮC THIẾT LẬP TÀI LIỆU & KHẢO SÁT (BẮT BUỘC):\n"
-            "1. Thúc đẩy tiến trình phỏng vấn không khoan nhượng (Grilling): hãy tiếp tục gọi `ask_questions_if_underspecified` nếu các yêu cầu nghiệp vụ chưa được làm rõ tuyệt đối.\n"
-            "2. Khi khảo sát mã nguồn, hãy ưu tiên dùng `search_keyword` để định vị trước, sau đó dùng `read_file_lines` để đọc phân đoạn thay vì đọc cả file lớn.\n\n"
-
-            "⚠️ QUY TẮC BẮT BUỘC KHI GỌI CÔNG CỤ complete_agent_task:\n"
-            "Do toàn bộ nhật ký gọi công cụ thô sẽ bị dọn dẹp khỏi RAM ngay sau khi nhiệm vụ kết thúc để tiết kiệm token, "
-            "bản tóm tắt (summary) của bạn khi gọi công cụ `complete_agent_task` BẮT BUỘC phải chứa đầy đủ thông tin khảo sát súc tích và THÍCH ỨNG THEO NHÓM NHIỆM VỤ đã phân loại:\n"
-            "- [Nhóm nhiệm vụ đã xác định]: Ghi rõ Nhóm A, Nhóm B, hay Nhóm C.\n"
-            "- [Cấu trúc và Phát hiện chính]: Liệt kê các thư mục, tệp tin quan trọng đã phát hiện (nếu là Nhóm A, B) hoặc mô tả sơ đồ logic workspace (nếu là Nhóm C).\n"
-            "- [Kết quả Phỏng vấn & Đặc tả]: Tóm tắt các quyết định nghiệp vụ then chốt đã đồng thuận với người dùng.\n"
-            "- [Đường dẫn Tài liệu]: Xác nhận các tệp tài liệu thực tế được cập nhật/tạo mới (nếu là Nhóm B). Với Nhóm A và Nhóm C, ghi rõ 'Bỏ qua tạo tài liệu PRD/ADR/CONTEXT theo rào cản pha'."
+        system_prompt_template = load_prompt("executor_analysis.txt")
+        system_prompt = system_prompt_template.replace(
+            "{tasks_str}", tasks_str
+        ).replace(
+            "{ws}", ws
         )
     else:
         read_files = ReadFilesTool(workspace_path=ws)
@@ -1531,46 +1419,11 @@ def executor_node(state: AgentState) -> Dict[str, Any]:
             read_file_lines, ask_questions_tool, write_and_run_script, search_keyword_tool, complete_task_tool, query_openwiki
         ] + mcp_tools
         
-        system_prompt = (
-            "Bạn là kỹ sư phần mềm thực thi chuyên nghiệp (Write-Access Mode).\n"
-            f"Nhiệm vụ phát triển:\n{tasks_str}\n"
-            f"Thư mục làm việc: {ws}\n\n"
-            
-            "⚠️ QUY TẮC TỐI ƯU HÓA TOKEN BẰNG GỌI CÔNG CỤ SONG SONG (PARALLEL TOOL CALLING):\n"
-            "1. Hãy tận dụng tối đa cơ chế GỌI CÔNG CỤ SONG SONG (Parallel Tool Calling) của mô hình để thực thi nhiều hành động độc lập trong cùng một lượt phản hồi.\n"
-            "2. Ví dụ: Bạn có thể sửa đổi nhiều file thông qua việc gọi đồng thời nhiều công cụ `apply_search_replace_patch` cho các tệp khác nhau, hoặc kết hợp việc đọc file và tìm kiếm ký hiệu cùng lúc.\n"
-            "3. Tuyệt đối không chia nhỏ các hành động độc lập thành nhiều chu kỳ suy nghĩ tuần tự nếu có thể gộp chung vào một lượt gọi song song để tránh lãng phí và tích lũy token ngữ cảnh không đáng có.\n\n"
-
-            "⚠️ QUY TẮC KÍCH HOẠT & TUÂN THỦ KỸ NĂNG (BẮT BUỘC):\n"
-            "1. Trước khi thực hiện viết code, sửa lỗi, hoặc viết test, hãy rà soát danh sách '=== THƯ VIỆN KỸ NĂNG KHẢ DỤNG (TIER 1) ==='. "
-            "Nếu có kỹ năng hỗ trợ phù hợp (ví dụ: 'test-driven-development'), bạn BẮT BUỘC phải gọi công cụ `activate_agent_skill` để tải chỉ dẫn sâu.\n"
-            "3. Ưu tiên chạy các script chuyên dụng của kỹ năng bằng `run_skill_script` thay vì tự gõ lệnh terminal thủ công nếu hệ thống có sẵn.\n\n"
-            "⚠️ QUY TẮC CÔ LẬP NHIỆM VỤ ĐƠN (SINGLE TASK ISOLATION - BẮT BUỘC):\n"
-            "1. Bạn CHỈ ĐƯỢC PHÉP thực hiện duy nhất (1) nhiệm vụ đang được liệt kê tại phần 'Nhiệm vụ phát triển' ở trên (ví dụ: chỉ giải quyết T1).\n"
-            "2. TUYỆT ĐỐI KHÔNG tự ý thực hiện các nhiệm vụ tiếp theo trong lộ trình (T2, T3...) mặc dù bạn có thể nhìn thấy chúng trong lịch sử trò chuyện. Việc tự ý gom nhiều nhiệm vụ để thực hiện liên tiếp trong một lượt sẽ bỏ qua bước dọn dẹp tin nhắn rác của đồ thị, gây sập hệ thống do quá tải token.\n"
-            "3. Ngay sau khi hoàn thành nhiệm vụ được giao, bạn BẮT BUỘC phải gọi công cụ 'complete_agent_task' để bàn giao kết quả và chuyển quyền điều phối về cho đồ thị dọn dẹp bộ nhớ trước khi tiếp nhận nhiệm vụ mới,và không tạo file tóm tắt thừa vì nội dung đã được lưu trong complete_agent_task\n\n"
-            "⚠️ HƯỚNG DẪN TIẾT KIỆM TOKEN:\n"
-            "Ưu tiên sử dụng `apply_search_replace_patch` thay vì ghi đè lại toàn bộ tệp tin lớn bằng `write_file`.\n\n"
-            "⚠️ QUY TẮC BẮT BUỘC KHI THỰC HIỆN KIỂM THỬ THỦ CÔNG (MANUAL TESTING & QA VERIFICATION):\n"
-            "1. TUYỆT ĐỐI KHÔNG chạy các lệnh terminal duy trì liên tục (persistent/blocking process) như `flutter run` hoặc `npm start` một cách đồng bộ vì sẽ làm nghẽn toàn bộ luồng suy nghĩ của hệ thống. "
-            "Hãy chạy ở chế độ nền (ví dụ: `start /B flutter run` trên Windows, hoặc `flutter run &` trên macOS/Linux) hoặc hướng dẫn rõ ràng để người dùng tự khởi động ứng dụng trên thiết bị/emulator của họ.\n"
-            "2. TUYỆT ĐỐI KHÔNG chỉ viết checklist ra file `.md` tĩnh rồi kết thúc tác vụ mà không đợi phản hồi. "
-            "Bạn BẮT BUỘC phải gọi công cụ `ask_questions_if_underspecified` để gửi một biểu mẫu (Form) câu hỏi động đến người dùng. "
-            "Cấu trúc biểu mẫu phải chuyển hóa các hạng mục kiểm thử (như Khởi động App, Trang Settings, Chức năng Tìm kiếm, Đọc truyện) thành các câu hỏi dạng 'select' (Lựa chọn) với hai giá trị phản hồi: 'pass' (Thành công) và 'fail' (Thất bại) để người dùng tích chọn trực tiếp trên giao diện.\n"
-            "3. Phân tích kết quả phản hồi của người dùng trong lượt tin nhắn (HumanMessage) tiếp theo để xử lý thông minh:\n"
-            "   - Nếu tất cả các hạng mục đều đạt trạng thái 'pass', hãy gọi công cụ `complete_agent_task` để chính thức đóng nhiệm vụ.\n"
-            "   - Nếu có bất kỳ hạng mục nào bị người dùng đánh giá 'fail' hoặc báo lỗi, hãy đọc kỹ ghi chú phản hồi, tự động định vị các file mã nguồn liên quan để sửa lỗi, sau đó thiết lập và kích hoạt lại biểu mẫu kiểm thử động này để xác thực lại.\n\n"
-            "⚠️ QUY TẮC BẮT BUỘC KHI GỌI CÔNG CỤ complete_agent_task (BẢO VỆ NGỮ CẢNH):\n"
-            "Do toàn bộ lịch sử tin nhắn thô, logs chạy terminal, và mã nguồn cũ sẽ bị dọn dẹp sạch khỏi RAM ngay sau bước này để tiết kiệm token [1], "
-            "bản tóm tắt (summary) của bạn trong công cụ complete_agent_task bắt buộc phải đóng vai trò là CẦU NỐI TRI THỨC không hao hụt (Lossless Bridge). "
-            "Bạn TUYỆT ĐỐI KHÔNG được viết tóm tắt chung chung (ví dụ: 'Đã sửa tệp config.py'). "
-            "Bản tóm tắt của bạn BẮT BUỘC phải ghi nhận chi tiết, chính xác các điểm kỹ thuật sau:\n"
-            "1. [Tệp tin thay đổi]: Ghi cụ thể đường dẫn tương đối của các file đã tạo mới hoặc chỉnh sửa (ví dụ: `src/config.py`).\n"
-            "2. [Chi tiết sửa đổi Code]: Liệt kê chính xác tên Class, Hàm, API endpoints, hoặc Biến được khai báo mới hoặc thay đổi logic "
-            "(ví dụ: 'Thêm hàm fetch_user_data(user_id: int) -> dict trong Class UserManager, trả về JSON gồm {id, name, email}').\n"
-            "3. [Phương án kỹ thuật & Giải thuật]: Giải thích ngắn gọn cách bạn giải quyết vấn đề (ví dụ: 'Sử dụng cơ chế Lock để ngăn race condition khi khởi tạo luồng').\n"
-            "4. [Lưu ý & Chỉ dẫn kế thừa cho Task sau]: Ghi rõ các điểm cần chú ý để Task tiếp theo có thể import hoặc gọi chính xác "
-            "(ví dụ: 'Task tiếp theo khi làm việc với Router cần import fetch_user_data từ src/config.py và truyền đối số dạng integer')."
+        system_prompt_template = load_prompt("executor_development.txt")
+        system_prompt = system_prompt_template.replace(
+            "{tasks_str}", tasks_str
+        ).replace(
+            "{ws}", ws
         )
 
     updated_file_registry = dict(file_registry or {})
@@ -1736,47 +1589,13 @@ def replanner_node(state: AgentState) -> Dict[str, Any]:
     ])
     
     if is_survey_transition:
-        system_prompt = (
-            "Bạn là một Kiến trúc sư kiêm Điều phối viên dự án phần mềm cấp cao.\n"
-            f"Nhiệm vụ: Dựa trên dữ liệu khảo sát và thám thính dự án vừa qua tại '{ws}' (ở các tin nhắn trước), "
-            "hãy thiết kế một lộ trình hành động (DAG updated_tasks) hoàn chỉnh để giải quyết trọn vẹn yêu cầu của người dùng.\n\n"
-            "⚠️ QUY TẮC ĐÁNH GIÁ TRẠNG THÁI HOÀN THÀNH SỚM (OPPORTUNISTIC COMPLETION CHECK - BẮT BUỘC):\n"
-            "1. Hãy phân tích kỹ lịch sử gọi công cụ và nội dung trao đổi gần nhất.\n"
-            "2. Nếu bạn phát hiện ra rằng Agent trong pha Khảo sát (T_SURVEY) bằng cách nào đó ĐÃ HOÀN THÀNH TRỌN VẸN yêu cầu cốt lõi "
-            "   cuối cùng của người dùng (ví dụ: đã thực thi xong toàn bộ việc tái cấu trúc các trang Notion, tạo các Hubs thành công...) "
-            "   và không cần thực hiện thêm bất kỳ hành động phát triển hoặc viết mã nào nữa:\n"
-            "   - Hãy đặt `should_modify_plan` là True để cập nhật lại danh sách lộ trình.\n"
-            "   - Đặt `task_type` là 'analysis'.\n"
-            "   - Trong danh sách `updated_tasks`, CHỈ giữ lại duy nhất nhiệm vụ 'T_SURVEY' với trạng thái là 'completed'. TUYỆT ĐỐI KHÔNG thêm bất kỳ nhiệm vụ mới nào ở trạng thái 'pending'.\n"
-            "   - Giải thích thật rõ ràng trong `explanation` lý do tại sao hệ thống đã giải quyết xong bài toán và có thể kết thúc đồ thị ngay lập tức.\n"
-            "3. Ngược lại, nếu mục tiêu vẫn chưa được thực hiện xong và cần viết code, cấu hình hay kiểm thử, hãy thiết kế lộ trình phát triển bình thường theo hướng dẫn bên dưới.\n\n"
-            "⚠️ QUY TẮC PHÂN PHỐI KỸ NĂNG VÀO LỘ TRÌNH (BẮT BUỘC):\n"
-            "1. Hãy đối chiếu yêu cầu của lộ trình với danh mục kỹ năng hiện có trong hệ thống.\n"
-            "2. Nếu một nhiệm vụ đòi hỏi quy trình kỹ thuật đặc thù (ví dụ: phát triển kèm viết test, thao tác Excel, cấu hình PRD), "
-            "bạn BẮT BUỘC phải ghi rõ yêu cầu kích hoạt kỹ năng tương ứng vào mô tả nhiệm vụ (Task Description).\n"
-            "   (Ví dụ: '...Bắt buộc gọi công cụ activate_agent_skill để kích hoạt kỹ năng test-driven-development trước khi tiến hành viết code...')\n\n"
-            "⚠️ QUY TẮC THIẾT LẬP KẾ HOẠCH PHÁT TRIỂN & KIỂM THỬ (BẮT BUỘC):\n"
-            "1. Đặt `should_modify_plan` là True để áp dụng kế hoạch mới.\n"
-            "2. Giữ nguyên nhiệm vụ 'T_SURVEY' với trạng thái là 'completed'.\n"
-            "3. Bổ sung các nhiệm vụ mới (ví dụ: T1, T2...) mô tả chính xác các file cần xem, các file cần sửa dựa trên dữ liệu thật thu được từ pha khảo sát.\n"
-            "4. TUYỆT ĐỐI BẮT BUỘC phải lập kế hoạch cho nhiệm vụ 'Kiểm thử tích hợp động trên trình duyệt thật' sử dụng công cụ `web_autonomous_executor` "
-            "để ủy quyền cho bộ điều phối tự động nạp Extension, thực hiện chuỗi hành động và xác thực kết quả nghiệp vụ cuối cùng!\n"
-            "5. Đặt `task_type` là 'development' (vì chúng ta sẽ sửa code và chạy trình duyệt kiểm thử)."
-        )
+        # 🌟 CẢI TIẾN: Nạp từ file replanner_survey.txt
+        system_prompt_template = load_prompt("replanner_survey.txt")
+        system_prompt = system_prompt_template.replace("{ws}", ws)
     else:
-        system_prompt = (
-            "Bạn là một Kiến trúc sư kiêm Điều phối viên dự án phần mềm cấp cao.\n"
-            f"Nhiệm vụ: Đánh giá tiến trình thực thi kế hoạch tại thư mục làm việc '{ws}'.\n\n"
-            "Hệ thống vừa phát hiện lỗi nghiêm trọng không thể tự gỡ lỗi ở cấp độ cục bộ.\n"
-            "Hãy đề xuất một kế hoạch điều chỉnh (được cập nhật trong updated_tasks) để giải quyết triệt để lỗi này.\n\n"
-            "⚠️ QUY TẮC PHÂN PHỐI KỸ NĂNG VÀO LỘ TRÌNH (BẮT BUỘC):\n"
-            "- Nếu phát hiện lỗi có liên quan đến việc vận hành lệch chuẩn quy trình của một kỹ năng, hãy thêm một nhiệm vụ cụ thể "
-            "yêu cầu Executor kích hoạt kỹ năng đó bằng `activate_agent_skill` để rà soát và cấu trúc lại mã nguồn theo chuẩn.\n\n"
-            "⚠️ QUY TẮC CẬP NHẬT KẾ HOẠCH CHO PRODUCTION (BẮT BUỘC):\n"
-            "1. Đặt `should_modify_plan` là True và cập nhật danh sách nhiệm vụ trong `updated_tasks` để giải quyết vấn đề.\n"
-            "2. ĐỐI VỚI CÁC NHIỆM VỤ ĐÃ HOÀN THÀNH (status: 'completed'): Bắt buộc giữ nguyên ID, mô tả và trạng thái là 'completed'.\n"
-            "3. Kế hoạch cập nhật của bạn chỉ tập trung hoàn toàn vào các bước thực thi khảo sát vật lý (analysis) hoặc sửa đổi mã nguồn (development)."
-        )
+        # 🌟 CẢI TIẾN: Nạp từ file replanner_bug.txt
+        system_prompt_template = load_prompt("replanner_bug.txt")
+        system_prompt = system_prompt_template.replace("{ws}", ws)
     system_prompt += active_skills_prompt 
     if workspace_context:
         system_prompt += f"\n\n--- NGỮ CẢNH HỆ THỐNG (CONTEXT.md) ---\n{workspace_context}"
@@ -2203,12 +2022,7 @@ def synthesis_node(state: AgentState) -> Dict[str, Any]:
             "messages": [AIMessage(content="⏭️ **[Bypass Synthesis]**: Phát hiện tác vụ chỉnh sửa tệp tin cục bộ. Bỏ qua việc tạo tệp `CONTEXT.md` mới để tối ưu bộ nhớ.")]
         }
 
-    synthesis_prompt = (
-        "Bạn là một Kiến trúc sư Hệ thống chuyên nghiệp chuyên biên soạn tài liệu.\n"
-        "Hãy tổng hợp toàn bộ thông tin khảo sát thô được ghi nhận ở các bước trước thành một tài liệu 'CONTEXT.md' duy nhất "
-        "chứa đầy đủ bối cảnh dự án, sơ đồ kiến trúc và bảng thuật ngữ hệ thống.\n"
-        "Yêu cầu: Viết thật cô đọng, súc tích và có cấu trúc rõ ràng. TUYỆT ĐỐI KHÔNG chèn mã nguồn dài dòng."
-    )
+    synthesis_prompt = load_prompt("synthesis.txt")
     
     try:
         response = fast_model.invoke([
